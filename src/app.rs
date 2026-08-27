@@ -2328,6 +2328,20 @@ struct PendingMoveSourceMismatch {
     current: crate::mod_project::MoveSourceSnapshot,
 }
 
+/// What one **Sync Edits Into Source** run did, and — more usefully — what it would not do.
+#[derive(Clone)]
+struct SyncReportWindow {
+    fighter: String,
+    move_name: String,
+    /// Individual argument/timing writes that reached the file.
+    changed: usize,
+    /// Files actually rewritten.
+    files: Vec<PathBuf>,
+    /// Every refusal, verbatim: structural edits, ambiguous sites, conflicts. Each of these is
+    /// an edit the user made that is still only in the editor.
+    notes: Vec<String>,
+}
+
 #[derive(Default)]
 struct LiveApplyReport {
     restored_moves: usize,
@@ -2596,6 +2610,14 @@ pub struct VisionaryApp {
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
+    /// The last **Sync Edits Into Source** result, while its report window is open.
+    ///
+    /// Sync refuses far more than it writes — every structural edit is reported rather than
+    /// guessed at — and those refusals used to be joined into the one-line status strip, which
+    /// truncates and is overwritten by the next thing that happens. An edit that did not reach
+    /// the file is exactly what the user needs to read, so it gets a window it has to be
+    /// dismissed from.
+    sync_report: Option<SyncReportWindow>,
     /// The linked project's own scripts for the move whose mirror fetch is in flight, waiting
     /// to be merged back over it. `None` whenever no project defines the move, or when the
     /// project defines enough of it that no fetch was needed.
@@ -2618,6 +2640,12 @@ pub struct VisionaryApp {
     /// Extra roots holding modded content — added-character mods and slot-add packs. Each
     /// has the same `fighter/<name>/…` + `effect/fighter/<name>/…` layout as the data root.
     extra_roots: Vec<PathBuf>,
+    /// The costume slot currently previewed in the viewport for the selected fighter. A mod
+    /// that adds a slot-specific moveset (e.g. a custom character skinned over an existing
+    /// fighter's higher costume slot) has model, motion, and moves that only exist under that
+    /// slot's own `cNN` directory, so this must be switchable independent of the fighter's
+    /// base slot.
+    selected_costume_slot: u8,
     /// Fighters the user has forgotten from the sidebar. Their source files remain on disk;
     /// this is the persisted roster filter used by the right-click "Forget fighter" action.
     forgotten_fighters: BTreeSet<String>,
@@ -2970,6 +2998,8 @@ impl VisionaryApp {
             show_edit_log: false,
             export_dir: saved_export_dir,
             extra_roots: saved_mod_roots,
+            selected_costume_slot: 0,
+            sync_report: None,
             forgotten_fighters: load_forgotten_fighters(),
             current_eff_path: None,
             recent_effs: load_recent_effs(),
@@ -3300,9 +3330,6 @@ impl VisionaryApp {
                 } else {
                     slots
                 };
-                let base = format!("c{:02}", slots.first().copied().unwrap_or(0));
-                let motion_dir = fighter_path.join("motion").join("body").join(&base);
-                let model_dir = fighter_path.join("model").join("body").join(&base);
                 let display_name = fighter_display_name(&name);
                 let source = if root_idx == 0 && self.state.data_root.is_some() {
                     crate::data::FighterSource::DataRoot
@@ -3310,19 +3337,10 @@ impl VisionaryApp {
                     crate::data::FighterSource::ModRoot
                 };
 
-                // Prefer the effect folder from whichever root actually has one.
-                let effect_dir = roots
-                    .iter()
-                    .map(|r| r.join("effect").join("fighter").join(&name))
-                    .find(|d| d.is_dir());
-
                 let entry = crate::data::FighterEntry {
                     name,
                     display_name,
                     param_path,
-                    motion_dir,
-                    model_dir,
-                    effect_dir,
                     slots,
                     fighter_dir: fighter_path,
                     source,
@@ -3596,6 +3614,26 @@ impl VisionaryApp {
         if self.source_mismatch_prompt.is_some() {
             return;
         }
+        let base_slot = self.state.fighters[idx].base_slot();
+        self.select_fighter_slot(idx, base_slot);
+    }
+
+    /// Switch the previewed costume slot on the currently selected fighter without changing
+    /// which fighter is selected. A slot-add mod's model, motion, and moves live entirely
+    /// under its own `cNN` directory, so re-running the fighter load against that slot is the
+    /// only way to preview it — [`select_fighter`] always loads the fighter's base slot.
+    fn select_costume_slot(&mut self, idx: usize, slot: u8) {
+        if self.state.selected_fighter != Some(idx) || self.source_mismatch_prompt.is_some() {
+            return;
+        }
+        self.select_fighter_slot(idx, slot);
+    }
+
+    /// Load fighter `idx`'s model, motion, moves, and hurtbox data from costume slot `slot`
+    /// rather than assuming the fighter's base slot. Shared by [`select_fighter`] (base slot)
+    /// and [`select_costume_slot`] (an explicitly chosen slot).
+    fn select_fighter_slot(&mut self, idx: usize, slot: u8) {
+        self.selected_costume_slot = slot;
         self.commit_current_edits();
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
@@ -3625,13 +3663,84 @@ impl VisionaryApp {
         self.current_anim_path = None;
 
         let fighter = &self.state.fighters[idx];
-        let model_dir = fighter.model_dir.clone();
-        let motion_dir = fighter.motion_dir.clone();
+        let requested = format!("c{slot:02}");
+        let roots = self.all_roots();
+        let name = fighter.name.clone();
+        let all_slots = fighter.slots.clone();
+
+        // A slot-add mod frequently lives in a DIFFERENT mod root than the fighter's vanilla
+        // dump or its own other costumes, and its model or its moveset can each be missing
+        // from the requested slot independently (a costume commonly ships its own model but
+        // shares a moveset, or vice versa). `fighter.fighter_dir` is fixed to whichever root
+        // first claimed the fighter's name, so it cannot be trusted here — resolve model and
+        // motion independently across every root, each falling back to the nearest OTHER slot
+        // that has one rather than jumping straight to the fighter's lowest vanilla slot.
+        let (model_dir, resolved_model_slot) = crate::data::resolve_costume_root(
+            &roots,
+            &name,
+            "model",
+            "body",
+            "model.nusktb",
+            slot,
+            &all_slots,
+        )
+        .map(|(root, found_slot)| {
+            let dir = root
+                .join("fighter")
+                .join(&name)
+                .join("model")
+                .join("body")
+                .join(format!("c{found_slot:02}"));
+            (dir, found_slot)
+        })
+        .unwrap_or_else(|| {
+            (
+                fighter.fighter_dir.join("model").join("body").join(&requested),
+                slot,
+            )
+        });
+        let (motion_dir, resolved_motion_slot) = crate::data::resolve_costume_root(
+            &roots,
+            &name,
+            "motion",
+            "body",
+            "motion_list.bin",
+            slot,
+            &all_slots,
+        )
+        .map(|(root, found_slot)| {
+            let dir = root
+                .join("fighter")
+                .join(&name)
+                .join("motion")
+                .join("body")
+                .join(format!("c{found_slot:02}"));
+            (dir, found_slot)
+        })
+        .unwrap_or_else(|| {
+            (
+                fighter.fighter_dir.join("motion").join("body").join(&requested),
+                slot,
+            )
+        });
         self.current_default_eyelid_path = find_default_eyelid_nuanmb(&motion_dir);
-        // A mod may not ship c00 at all, so weapon lookups follow the fighter's own base
-        // slot rather than assuming slot 0 exists.
-        let base_slot = fighter.base_slot();
-        let model_root = fighter.fighter_dir.join("model");
+        // Mirror the renderer's own weapon-part discovery (see `renderer::load_model`): derive
+        // the model root from wherever the resolved body model actually came from, so a
+        // costume's weapon parts are read from the same root as its body.
+        let model_root = model_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| fighter.fighter_dir.join("model"));
+        // Likewise for sibling motion parts (Kirby copy-ability donors, weapon/helper motion):
+        // derive the fighter directory from wherever the resolved moveset actually came from,
+        // rather than the fighter's original owning root.
+        let motion_fighter_dir = motion_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| fighter.fighter_dir.clone());
 
         // Set skel path and eagerly load bone names for the dropdown
         let skel = model_dir.join("model.nusktb");
@@ -3656,9 +3765,10 @@ impl VisionaryApp {
                     continue;
                 }
                 // The weapon's slot set can differ from the body's, so fall back to any slot
-                // it does have rather than giving up when the base slot is missing.
+                // it does have rather than giving up when the resolved body slot is missing.
                 let part_dir = entry.path();
-                let Some(weapon_skel_path) = crate::data::find_part_skel(&part_dir, base_slot)
+                let Some(weapon_skel_path) =
+                    crate::data::find_part_skel(&part_dir, resolved_model_slot)
                 else {
                     continue;
                 };
@@ -3686,19 +3796,24 @@ impl VisionaryApp {
 
         // The desktop no longer simulates or renders particles. Keep the selected fighter's
         // effect file queued for the editor; live preview is provided by slight_replica in game.
-        let eff_path = fighter
-            .effect_dir
-            .as_ref()
-            .map(|d| d.join(format!("ef_{}.eff", fighter.name)))
+        // A costume slot's own recolour/effect file (`ef_<name>_cNN.eff`) wins over the base
+        // file when the previewed slot ships one, and either is searched across every root —
+        // a mod's own effect file commonly lives in a different root than the vanilla dump's.
+        let eff_dirs: Vec<PathBuf> = roots
+            .iter()
+            .map(|r| r.join("effect").join("fighter").join(&name))
+            .filter(|d| d.is_dir())
+            .collect();
+        let eff_path = eff_dirs
+            .iter()
+            .map(|dir| dir.join(format!("ef_{name}_{requested}.eff")))
+            .find(|p| p.exists())
             .or_else(|| {
-                self.state.data_root.as_ref().map(|root| {
-                    root.join("effect")
-                        .join("fighter")
-                        .join(&fighter.name)
-                        .join(format!("ef_{}.eff", fighter.name))
-                })
-            })
-            .filter(|path| path.exists());
+                eff_dirs
+                    .iter()
+                    .map(|dir| dir.join(format!("ef_{name}.eff")))
+                    .find(|p| p.exists())
+            });
         self.current_eff_path = eff_path.clone();
         if let Some(path) = eff_path {
             self.eff_editor.queue_load(&path);
@@ -3706,8 +3821,8 @@ impl VisionaryApp {
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
         let labels = self.state.labels.clone();
-        let fighter_dir = fighter.fighter_dir.clone();
-        let base_slot = fighter.base_slot();
+        let fighter_dir = motion_fighter_dir;
+        let base_slot = resolved_motion_slot;
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
         self.state.status = "Loading moves...".to_string();
@@ -4305,10 +4420,36 @@ impl VisionaryApp {
             .as_ref()
             .filter(|buffer| buffer.move_name == move_name)
             .map(SourceBuffer::category);
-        let show_category =
-            |category: &str| only_category.is_none_or(|selected| selected == category);
-
+        let (functions, report) = self.generated_functions_for_move(only_category);
         let mut out = String::new();
+        for (_, emitted) in functions {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&emitted);
+        }
+        (out, report)
+    }
+
+    /// This move's generated functions, one per ACMD category, as the export would write them.
+    ///
+    /// `only` restricts the set to a single category — what the preview pane wants, so it shows
+    /// the code for the script the user has open rather than the whole move. Passing `None`
+    /// yields every category that has anything to write, which is what
+    /// [`Self::write_generated_into_source`] needs.
+    ///
+    /// The verification report covers exactly the categories returned, so a caller can never act
+    /// on code that was not checked.
+    fn generated_functions_for_move(
+        &self,
+        only: Option<&str>,
+    ) -> (Vec<(&'static str, String)>, crate::acmd_verify::Report) {
+        let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) else {
+            return (Vec::new(), Default::default());
+        };
+        let show_category = |category: &str| only.is_none_or(|selected| selected == category);
+
+        let mut functions: Vec<(&'static str, String)> = Vec::new();
         let mut report = crate::acmd_verify::Report::default();
 
         let has_hitbox_script =
@@ -4321,13 +4462,10 @@ impl VisionaryApp {
             };
             let emitted = crate::acmd::preview_game_fn(&script, &move_name);
             crate::acmd_verify::verify_move(&move_name, &script, &emitted, &mut report);
-            out.push_str(&emitted);
+            functions.push(("game", emitted));
         }
 
         if show_category("effect") && !self.state.effects.is_empty() {
-            if !out.is_empty() {
-                out.push('\n');
-            }
             let tweaks: Vec<crate::mod_project::LiveTweak> = self
                 .live_overrides
                 .tweaked()
@@ -4356,7 +4494,7 @@ impl VisionaryApp {
                 &residue,
                 &mut report,
             );
-            out.push_str(&emitted);
+            functions.push(("effect", emitted));
         }
 
         // Sounds, but only once one has been edited. An unedited script is not exported — the
@@ -4367,9 +4505,6 @@ impl VisionaryApp {
             .current_move_key()
             .is_some_and(|key| self.state.sound_script_edits.contains_key(&key));
         if show_category("sound") && sound_edited {
-            if !out.is_empty() {
-                out.push('\n');
-            }
             let emitted = crate::acmd::preview_sound_fn(&self.state.sound_script, &move_name);
             crate::acmd_verify::verify_sound_move(
                 &move_name,
@@ -4377,15 +4512,12 @@ impl VisionaryApp {
                 &emitted,
                 &mut report,
             );
-            out.push_str(&emitted);
+            functions.push(("sound", emitted));
         }
         let expression_edited = self
             .current_move_key()
             .is_some_and(|key| self.state.expression_script_edits.contains_key(&key));
         if show_category("expression") && expression_edited {
-            if !out.is_empty() {
-                out.push('\n');
-            }
             let emitted =
                 crate::acmd::preview_expression_fn(&self.state.expression_script, &move_name);
             crate::acmd_verify::verify_expression_move(
@@ -4394,9 +4526,9 @@ impl VisionaryApp {
                 &emitted,
                 &mut report,
             );
-            out.push_str(&emitted);
+            functions.push(("expression", emitted));
         }
-        (out, report)
+        (functions, report)
     }
 
     /// Keep the source editor and the editor panels showing the same move.
@@ -5822,11 +5954,26 @@ impl VisionaryApp {
             files.len(),
             if files.len() == 1 { "" } else { "s" },
         );
+        // The refusals used to be joined onto the end of this line. The strip holds one line and
+        // the next action overwrites it, so an edit that never reached the file was reported
+        // where it could not be read. The line now says only how many there were; the window
+        // below says what they are and what to do about them.
         if !notes.is_empty() {
-            status.push_str(" — ");
-            status.push_str(&notes.join("; "));
+            status.push_str(&format!(
+                " — {} edit(s) not written; see Sync report",
+                notes.len()
+            ));
         }
         self.state.status = status;
+        if !notes.is_empty() {
+            self.sync_report = Some(SyncReportWindow {
+                fighter: fighter.clone(),
+                move_name: move_name.clone(),
+                changed,
+                files: files.clone(),
+                notes: notes.clone(),
+            });
+        }
         if changed > 0 {
             // The written values are now the pristine ones; re-reading also refreshes the
             // spans the next sync will target.
@@ -5909,6 +6056,104 @@ impl VisionaryApp {
     /// the values immediately afterwards, through the same code every other edit goes through.
     /// Splitting it that way means creation never has to know what an edit is, and the value
     /// write never has to know the function is new.
+    /// Replace this move's functions in the linked project with the code the export would write.
+    ///
+    /// The companion to [`Self::sync_edits_to_source`], for the edits that one refuses. Sync
+    /// rewrites argument values in place and reports every structural change — a spawn added or
+    /// removed, a macro swapped, a call retimed across a branch — because it will not guess at a
+    /// layout it did not author. That is the right default, and it leaves no way at all to get an
+    /// added call into your own project short of copying it out of the preview by hand.
+    ///
+    /// This writes the regenerated function whole instead, so structural edits land. The trade is
+    /// stated plainly in the confirmation and in the report: within these functions the generated
+    /// code replaces what was there, comments and formatting included. Nothing outside them is
+    /// touched, and the project's own name for each function is kept so its registration still
+    /// points at code.
+    ///
+    /// Verification runs first and a blocker refuses the whole write. The same check gates an
+    /// export, and code that will not build or that ships numbers other than the ones on screen
+    /// is worse in a source file than in a mod folder — it is the copy the user keeps.
+    fn write_generated_into_source(&mut self) {
+        if self.acmd_src.is_none() {
+            return;
+        }
+        let (Some(fighter), Some(move_entry)) = (
+            self.state
+                .selected_fighter
+                .and_then(|i| self.state.fighters.get(i)),
+            self.state.selected_move.as_ref(),
+        ) else {
+            return;
+        };
+        let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
+
+        let (functions, report) = self.generated_functions_for_move(None);
+        if functions.is_empty() {
+            self.state.status =
+                format!("{fighter}/{move_name} has nothing generated to write into source.");
+            return;
+        }
+        if report.has_blockers() {
+            self.state.status = format!(
+                "Refused to write {fighter}/{move_name} into source — the generated code did \
+                 not pass verification; see the Generated pane."
+            );
+            return;
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut written = 0usize;
+
+        // A category the move is edited in but the project has no home for is created first,
+        // from the mirror's own text, so there is a function of the user's own to overwrite.
+        self.create_missing_scripts(&fighter, &move_name, &mut files, &mut notes);
+
+        for (prefix, emitted) in functions {
+            let script_name = crate::acmd::acmd_script_name(prefix, &move_name);
+            let Some(index) = self.acmd_src.as_ref() else {
+                break;
+            };
+            match crate::acmd_src::overwrite_script(index, &fighter, &script_name, &emitted) {
+                Ok(Some(file)) => {
+                    files.push(file);
+                    written += 1;
+                    // Every span past the replacement has moved, and the next category may live
+                    // in the same file.
+                    self.rebuild_acmd_index();
+                }
+                Ok(None) => {}
+                Err(e) => notes.push(e.to_string()),
+            }
+        }
+
+        files.sort();
+        files.dedup();
+        self.state.status = format!(
+            "Wrote {written} generated function{} into {} file{}{}",
+            if written == 1 { "" } else { "s" },
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" — {} not written; see Sync report", notes.len())
+            },
+        );
+        if !notes.is_empty() {
+            self.sync_report = Some(SyncReportWindow {
+                fighter,
+                move_name,
+                changed: written,
+                files,
+                notes,
+            });
+        }
+        if written > 0 {
+            self.rescan_acmd_source();
+        }
+    }
+
     fn create_missing_scripts(
         &mut self,
         fighter: &str,
@@ -6326,6 +6571,93 @@ impl VisionaryApp {
         self.fetching_acmd = false;
     }
 
+    /// What the last sync wrote, and every edit it refused to write.
+    ///
+    /// Source write-back is deliberately narrow: it rewrites argument *values* and bounded,
+    /// unambiguous timing blocks, and reports everything else rather than guessing at a layout
+    /// it did not author. That makes the refusals the common case rather than the exception —
+    /// adding a spawn, renaming a graphic, moving a call into a branch are all structural — so
+    /// they need somewhere they can actually be read. Structural edits are not lost: the mod
+    /// and developer exports apply them in full, which is what the footer says.
+    fn draw_sync_report_window(&mut self, ctx: &egui::Context) {
+        let Some(report) = self.sync_report.clone() else {
+            return;
+        };
+        let mut open = true;
+        let mut dismiss = false;
+        egui::Window::new("Sync report")
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{}/{}", report.fighter, report.move_name))
+                        .strong(),
+                );
+                ui.add_space(2.0);
+                if report.changed == 0 {
+                    ui.label("Nothing was written into your project.");
+                } else {
+                    ui.label(format!(
+                        "Wrote {} value change{} into {} file{}:",
+                        report.changed,
+                        if report.changed == 1 { "" } else { "s" },
+                        report.files.len(),
+                        if report.files.len() == 1 { "" } else { "s" },
+                    ));
+                    for file in &report.files {
+                        ui.label(
+                            egui::RichText::new(format!("   {}", file.display()))
+                                .small()
+                                .color(egui::Color32::GRAY),
+                        );
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} edit(s) stayed in the editor:",
+                        report.notes.len()
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(240, 200, 100)),
+                );
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for note in &report.notes {
+                            ui.label(format!("• {note}"));
+                            ui.add_space(2.0);
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Source syncing only retunes calls your project already has — it will \
+                         not invent a place to put a call you added, or rewrite a branch it did \
+                         not author. Structural edits are not lost: Mod → Export Mod Folder and \
+                         Export Developer Files both apply them in full.",
+                    )
+                    .small()
+                    .color(egui::Color32::LIGHT_GRAY),
+                );
+                ui.add_space(6.0);
+                if ui.button("Close").clicked() {
+                    dismiss = true;
+                }
+            });
+        if !open || dismiss {
+            self.sync_report = None;
+        }
+    }
+
     fn draw_capture_debug_window(&mut self, ctx: &egui::Context) {
         let rows = self.game_link.capture_debug();
         let mut by_kind: BTreeMap<i32, Vec<crate::game_link::CaptureDebugSnapshot>> =
@@ -6536,6 +6868,7 @@ impl VisionaryApp {
         let mut save = false;
         let mut revert = false;
         let mut sync = false;
+        let mut overwrite = false;
 
         // Both are read off `self` before the closure takes its mutable borrow of the open
         // buffer. Generating is cheap, but only pay for it when a pane is actually showing it.
@@ -6739,6 +7072,20 @@ impl VisionaryApp {
                     {
                         sync = true;
                     }
+                    if ui
+                        .button("Save generated into source")
+                        .on_hover_text(
+                            "Replace this move's functions in your project with the generated \
+                             code, so added or removed calls land too — the edits Sync reports \
+                             instead of writing. Within these functions the generated code \
+                             REPLACES what is there, comments and formatting included. Nothing \
+                             else in the file is touched, and your own name for each function \
+                             is kept.",
+                        )
+                        .clicked()
+                    {
+                        overwrite = true;
+                    }
                 });
             }
 
@@ -6823,6 +7170,9 @@ impl VisionaryApp {
         }
         if sync {
             self.sync_edits_to_source();
+        }
+        if overwrite {
+            self.write_generated_into_source();
         }
     }
 
@@ -7741,6 +8091,40 @@ impl VisionaryApp {
             self.forget_fighter(&fighter);
         } else if restore_forgotten {
             self.restore_forgotten_fighters();
+        }
+
+        // Costume slot picker: the viewport and move list only ever show ONE slot's data, and
+        // a slot-add mod's model or moveset lives entirely under a slot other than the
+        // fighter's base one, so it needs its own switch rather than being folded into the
+        // fighter list above.
+        if let Some(idx) = self.state.selected_fighter {
+            let slots = self.state.fighters[idx].slots.clone();
+            if slots.len() > 1 {
+                ui.separator();
+                sidebar_section_heading(
+                    ui,
+                    "Costume slot",
+                    "Which costume's model, motion, and moves are loaded into the viewport and \
+                     move list. A slot-add mod's own model or moveset only exists under its own \
+                     slot here.",
+                );
+                let current = self.selected_costume_slot;
+                let mut chosen = None;
+                ui.horizontal_wrapped(|ui| {
+                    for slot in slots {
+                        if ui
+                            .selectable_label(slot == current, format!("c{slot:02}"))
+                            .clicked()
+                            && slot != current
+                        {
+                            chosen = Some(slot);
+                        }
+                    }
+                });
+                if let Some(slot) = chosen {
+                    self.select_costume_slot(idx, slot);
+                }
+            }
         }
 
         ui.separator();
@@ -15762,6 +16146,17 @@ impl VisionaryApp {
                 .map(|r| r.fighter_display.clone())
                 .unwrap_or_else(|| fighter.clone());
             fm.acmd = moves.clone();
+        }
+        // Scope every fighter's edits to the slot-add mod they were made against, if any. This
+        // is recorded per fighter rather than derived at export time because the export runs
+        // from a saved project, which may be reopened with different roots configured — or
+        // none.
+        let roots = self.all_roots();
+        let data_root = self.state.data_root.clone();
+        let previewed = self.selected_costume_slot;
+        for (fighter, fm) in project.fighters.iter_mut() {
+            fm.costume_slots =
+                crate::data::mod_costume_slots(&roots, fighter, previewed, data_root.as_deref());
         }
         let effect_keys: std::collections::BTreeSet<&String> = self
             .state
@@ -29858,6 +30253,8 @@ impl eframe::App for VisionaryApp {
             self.perf.end("capture_debug_window", t);
         }
 
+        self.draw_sync_report_window(&ctx);
+
         self.credits.show(&ctx);
 
         // Top menu bar: File / Windows / Mod + status
@@ -30072,6 +30469,23 @@ impl eframe::App for VisionaryApp {
                         .clicked()
                     {
                         self.sync_edits_to_source();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.acmd_src.is_some(),
+                            egui::Button::new("Save Generated Into Source"),
+                        )
+                        .on_hover_text(
+                            "Replace this move's functions in your linked project with the \
+                             generated code, so added or removed calls land too — the edits \
+                             Sync reports instead of writing. Within those functions the \
+                             generated code REPLACES what is there, comments and formatting \
+                             included; nothing else in the file is touched.",
+                        )
+                        .clicked()
+                    {
+                        self.write_generated_into_source();
                         ui.close();
                     }
                 });

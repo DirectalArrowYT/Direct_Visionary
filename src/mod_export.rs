@@ -186,12 +186,20 @@ pub fn source_project(project: &ModProjectFile) -> Result<Option<GeneratedSource
     {
         return Ok(None);
     }
-    let built = crate::acmd::build_mod_project_full_with_expression(
+    // Slot-add movesets install for their own costumes only; see `FighterMod::costume_slots`.
+    let costumes: HashMap<String, Vec<u8>> = project
+        .fighters
+        .iter()
+        .filter(|(_, fighter)| !fighter.costume_slots.is_empty())
+        .map(|(name, fighter)| (name.clone(), fighter.costume_slots.clone()))
+        .collect();
+    let built = crate::acmd::build_mod_project_full_with_costumes(
         &acmd_edits,
         &effect_edits,
         &sound_edits,
         &expression_edits,
         &tweaks,
+        &costumes,
         &plugin_name(project),
     );
 

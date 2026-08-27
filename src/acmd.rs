@@ -4184,6 +4184,30 @@ pub(crate) fn plain_spawn_fallback_tail(spawn_func: &str) -> Option<&'static [&'
     }
 }
 
+/// Spawn macros whose transform arguments are declared as whole numbers rather than `ToF32`.
+///
+/// Nearly every spawn macro in `smash_script` is generic over `ToF32`, so `2` and `2.0` both
+/// compile and the emitter can write floats throughout. `EFFECT_FLW_POS_NO_STOP` is the
+/// exception: it is declared with concrete `u64` parameters, so a float literal is a hard
+/// compile error rather than a coercion. Emitting its transform as floats produced a mod that
+/// could not build.
+///
+/// This is a property of the macro's Rust signature, not of the engine — the values reach the
+/// same Lua stack either way — so it belongs here, at the point where the text is written.
+pub fn effect_spawn_takes_whole_transform(spawn_func: &str) -> bool {
+    spawn_func == "EFFECT_FLW_POS_NO_STOP"
+}
+
+/// Format one transform argument for a macro declared with whole-number parameters.
+///
+/// Returns `None` when the value has a fractional part, which that macro cannot express.
+/// Rounding here would ship a number other than the one on screen, so the caller reports it
+/// instead — see the verification pass, which refuses the export rather than letting it
+/// through silently.
+pub(crate) fn whole_num(value: f32) -> Option<String> {
+    (value.is_finite() && value.fract() == 0.0).then(|| format!("{}", value.trunc() as i64))
+}
+
 fn emit_spawn_call(call: &crate::data::EffectCall, indent: &str) -> String {
     if let Some(control) = &call.control {
         return emit_effect_control(control, indent);
@@ -4207,15 +4231,27 @@ fn emit_spawn_call(call: &crate::data::EffectCall, indent: &str) -> String {
     let [x, y, z] = call.offset;
     // The macros take rotation as zr, yr, xr, not in [x, y, z] order.
     let [rx, ry, rz] = call.rotation;
+    // `EFFECT_FLW_POS_NO_STOP` is declared with whole-number parameters; a float literal will
+    // not compile against it. A fractional value cannot be written there at all, so it falls
+    // back to the float spelling and the verification pass refuses the export and names it,
+    // rather than rounding the number the user set.
+    let whole = effect_spawn_takes_whole_transform(&call.spawn_func);
+    let fmt = |value: f32| {
+        if whole {
+            whole_num(value).unwrap_or_else(|| num(value))
+        } else {
+            num(value)
+        }
+    };
     let transform = format!(
         "{}, {}, {}, {}, {}, {}, {}",
-        num(x),
-        num(y),
-        num(z),
-        num(rz),
-        num(ry),
-        num(rx),
-        num(call.scale)
+        fmt(x),
+        fmt(y),
+        fmt(z),
+        fmt(rz),
+        fmt(ry),
+        fmt(rx),
+        fmt(call.scale)
     );
 
     let Some(source_tail) = call
@@ -4933,6 +4969,34 @@ pub fn build_mod_project_full_with_expression(
     live_tweaks: &[crate::mod_project::LiveTweak],
     plugin_name: &str,
 ) -> ModProject {
+    build_mod_project_full_with_costumes(
+        edits,
+        effect_edits,
+        sound_edits,
+        expression_edits,
+        live_tweaks,
+        &std::collections::HashMap::new(),
+        plugin_name,
+    )
+}
+
+/// Like [`build_mod_project_full_with_expression`], with each fighter's scripts scoped to the
+/// costume slots of the slot-add mod they belong to.
+///
+/// `costumes` — fighter name → its slots. A fighter absent from the map, or present with an
+/// empty list, installs for every costume exactly as before: that is the right behaviour for a
+/// fighter's own moveset, and the only safe one for a project saved before the scope was
+/// recorded. A moveset skinned onto a vanilla fighter's spare slots needs the opposite, because
+/// installing it unscoped replaces the move on the vanilla character too.
+pub fn build_mod_project_full_with_costumes(
+    edits: &[(String, String, crate::data::AcmdScript)],
+    effect_edits: &[EffectExport],
+    sound_edits: &[(String, String, crate::data::AcmdScript)],
+    expression_edits: &[(String, String, crate::data::AcmdScript)],
+    live_tweaks: &[crate::mod_project::LiveTweak],
+    costumes: &std::collections::HashMap<String, Vec<u8>>,
+    plugin_name: &str,
+) -> ModProject {
     use std::collections::HashMap;
 
     let tweaks: HashMap<u64, crate::mod_project::LiveTweak> = live_tweaks
@@ -5082,6 +5146,22 @@ pub fn main() {{
         let moves = &by_fighter[fighter];
 
         // src/{fighter}/mod.rs
+        //
+        // A slot-add moveset is scoped to its own costumes. Without this the agent installs
+        // over every costume of the fighter it is skinned onto, so the vanilla character loses
+        // the move too — the mod works and breaks the base game in the same step.
+        let costume_scope = costumes
+            .get(*fighter)
+            .filter(|slots| !slots.is_empty())
+            .map(|slots| {
+                let list = slots
+                    .iter()
+                    .map(|slot| slot.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("    agent.set_costume(vec![{list}]);\n")
+            })
+            .unwrap_or_default();
         files.push(GeneratedFile {
             rel_path: format!("src/{module}/mod.rs"),
             contents: format!(
@@ -5089,11 +5169,12 @@ pub fn main() {{
 
 pub fn install() {{
     let agent = &mut smashline::Agent::new("{fighter}");
-    acmd::install(agent);
+{costume_scope}    acmd::install(agent);
     agent.install();
 }}
 "#,
                 fighter = fighter,
+                costume_scope = costume_scope,
             ),
         });
 
@@ -5386,6 +5467,74 @@ pub(crate) mod tests {
     /// A round-trip oracle cannot show this. An unmodelled line is kept as `Raw` and emitted
     /// verbatim, so it round-trips *perfectly* — every export test was green on
     /// `FT_MOTION_RATE` both before and after it was given a parse arm. Green means "nothing
+    /// `EFFECT_FLW_POS_NO_STOP` is declared `(…, unk: u64, …, unk7: u64, unk8: bool)` while every
+    /// other spawn macro in its family is generic over `ToF32`. Emitting its transform as floats
+    /// produced `expected u64, found floating-point number` — a mod that would not build, written
+    /// into a user's own source file by "Save generated into source".
+    #[test]
+    fn the_whole_number_spawn_macro_round_trips_as_integers() {
+        let source = r#"unsafe extern "C" fn effect_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new("edge_attack_dash_hit"), Hash40::new("handr"), 2, 1, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let script = parse_effect_script(source);
+        let (calls, residue) = script.to_effect_calls_and_residue();
+        let emitted = preview_effect_fn(&calls, "attack_s3_s", &[], &residue);
+        assert!(
+            emitted.contains(
+                "macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new(\"edge_attack_dash_hit\"), \
+                 Hash40::new(\"handr\"), 2, 1, 0, 0, 0, 0, 1, true);"
+            ),
+            "{emitted}"
+        );
+        // No float literal anywhere in that call — the whole point.
+        let line = emitted
+            .lines()
+            .find(|line| line.contains("EFFECT_FLW_POS_NO_STOP"))
+            .expect("the call is emitted");
+        assert!(!line.contains(".0"), "{line}");
+
+        // Its generic siblings keep the float spelling they have always had.
+        let follow = source.replace("EFFECT_FLW_POS_NO_STOP", "EFFECT_FLW_POS");
+        let script = parse_effect_script(&follow);
+        let (calls, residue) = script.to_effect_calls_and_residue();
+        let emitted = preview_effect_fn(&calls, "attack_s3_s", &[], &residue);
+        assert!(emitted.contains("2.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, true"), "{emitted}");
+    }
+
+    /// A fractional value has no spelling in a whole-number macro. Rounding it would ship a
+    /// number other than the one on screen, so the export is refused and says so.
+    #[test]
+    fn a_fractional_transform_on_a_whole_number_macro_is_refused() {
+        let source = r#"unsafe extern "C" fn effect_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new("edge_attack_dash_hit"), Hash40::new("handr"), 2, 1, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let script = parse_effect_script(source);
+        let (mut calls, residue) = script.to_effect_calls_and_residue();
+        calls[0].scale = 1.5;
+        let emitted = preview_effect_fn(&calls, "attack_s3_s", &[], &residue);
+        let mut report = crate::acmd_verify::Report::default();
+        crate::acmd_verify::verify_effect_move(
+            "attack_s3_s",
+            &calls,
+            &emitted,
+            &[],
+            None,
+            &residue,
+            &mut report,
+        );
+        assert!(report.has_blockers());
+        let summary = report.blocker_summary();
+        assert!(summary.contains("whole numbers"), "{summary}");
+    }
+
     /// broke", never "the new family works".
     #[test]
     fn a_motion_rate_call_parses_to_a_typed_statement_and_not_to_raw() {

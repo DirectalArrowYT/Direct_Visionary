@@ -338,6 +338,7 @@ pub fn verify_effect_move(
 ) {
     check_effect_fidelity(subject, calls, emitted, tweaks, report);
     check_effect_values(subject, calls, report);
+    check_whole_transforms(subject, calls, report);
     // The carried lines travel on the calls themselves, so a project saved and reloaded still
     // reports them. `residue` is the half that cannot: it belongs to a frame rather than a call,
     // and it is passed alongside for the same reason `lost` is. Both are saved with the project
@@ -1290,6 +1291,48 @@ fn check_excute_values(subject: &str, stmt: &ExcuteStmt, report: &mut Report) {
     }
 }
 
+/// A spawn macro declared with whole-number parameters cannot carry a fractional transform.
+///
+/// `EFFECT_FLW_POS_NO_STOP` takes `u64` rather than being generic over `ToF32` like the rest of
+/// its family, so the emitter writes its transform as integers. A value with a fractional part
+/// has no spelling there: writing a float will not compile, and rounding would ship a number
+/// other than the one on screen. Both are worse than stopping, so this is a blocker that names
+/// the value and the way out — the **Spawn command** dropdown moves the call to a family that
+/// can hold it.
+fn check_whole_transforms(subject: &str, calls: &[EffectCall], report: &mut Report) {
+    for call in calls.iter().filter(|call| !call.disabled) {
+        if !crate::acmd::effect_spawn_takes_whole_transform(&call.spawn_func) {
+            continue;
+        }
+        if call.color.is_some() || call.control.is_some() || call.raw_line.is_some() {
+            continue;
+        }
+        let [x, y, z] = call.offset;
+        let [rx, ry, rz] = call.rotation;
+        for (what, value) in [
+            ("x", x),
+            ("y", y),
+            ("z", z),
+            ("z rotation", rz),
+            ("y rotation", ry),
+            ("x rotation", rx),
+            ("size", call.scale),
+        ] {
+            if crate::acmd::whole_num(value).is_none() {
+                report.blocker(
+                    subject,
+                    format!(
+                        "spawn {} on frame {}: {} takes whole numbers, so {what} {value} cannot \
+                         be written — round it, or use the Spawn command dropdown to move this \
+                         call to a family that accepts fractions.",
+                        call.effect_name, call.active_start, call.spawn_func,
+                    ),
+                );
+            }
+        }
+    }
+}
+
 fn check_effect_values(subject: &str, calls: &[EffectCall], report: &mut Report) {
     for call in calls
         .iter()
@@ -2037,6 +2080,57 @@ mod tests {
 
     /// Two move names that differ only by punctuation collapse onto one function name, which
     /// parses fine and then fails to compile. Catching it needs a name check, not a syntax one.
+    /// A moveset skinned onto a vanilla fighter's spare costume slots must install for those
+    /// slots only. Exported unscoped, the agent replaces the move on the vanilla character too:
+    /// the mod works and breaks the base game in the same step.
+    #[test]
+    fn a_slot_scoped_moveset_installs_for_its_own_costumes_only() {
+        let body = format!("    if macros::is_excute(agent) {{\n        {ATTACK}\n    }}");
+        let edits = vec![("eflame".into(), "attack_s3_s".into(), script(&body))];
+        let mut costumes = std::collections::HashMap::new();
+        costumes.insert("eflame".to_string(), vec![80u8, 81]);
+        let project = crate::acmd::build_mod_project_full_with_costumes(
+            &edits,
+            &[],
+            &[],
+            &[],
+            &[],
+            &costumes,
+            "shigaraki_plugin",
+        );
+        let mod_rs = project
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/mod.rs"))
+            .expect("the fighter module is generated");
+        assert!(
+            mod_rs.contents.contains("agent.set_costume(vec![80, 81]);"),
+            "{}",
+            mod_rs.contents
+        );
+        // The scope is added around the install, not in place of it.
+        assert!(mod_rs.contents.contains("acmd::install(agent);"));
+        assert!(mod_rs.contents.contains("agent.install();"));
+        // Scoping must not disturb the checks the export already has to pass.
+        let report = verify_export(&project, &edits, &[], &[], &[], &Default::default());
+        assert!(!report.has_blockers(), "{}", messages(&report));
+    }
+
+    /// A fighter's own moveset, and every project saved before the scope was recorded, keeps
+    /// installing for every costume.
+    #[test]
+    fn an_unscoped_moveset_still_installs_for_every_costume() {
+        let body = format!("    if macros::is_excute(agent) {{\n        {ATTACK}\n    }}");
+        let edits = vec![("mario".into(), "attack_air_n".into(), script(&body))];
+        let project = build_mod_project(&edits, "plain_plugin");
+        let mod_rs = project
+            .files
+            .iter()
+            .find(|file| file.rel_path.ends_with("/mod.rs"))
+            .expect("the fighter module is generated");
+        assert!(!mod_rs.contents.contains("set_costume"), "{}", mod_rs.contents);
+    }
+
     #[test]
     fn two_moves_that_generate_the_same_function_are_refused() {
         let body = format!("    if macros::is_excute(agent) {{\n        {ATTACK}\n    }}");
