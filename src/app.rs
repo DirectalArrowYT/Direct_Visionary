@@ -13462,30 +13462,43 @@ impl VisionaryApp {
                     .small()
                     .color(Color32::GRAY),
                 );
+                ui.label(
+                    RichText::new(
+                        "An oriented quad turned edge-on is invisible, not sideways — if an                          effect vanishes, try Camera facing for its type.",
+                    )
+                    .small()
+                    .color(Color32::from_rgb(230, 190, 90)),
+                );
                 for kind in used {
                     let index = kind.clamp(0, 7) as usize;
-                    let current = self.effect_quad_planes.0[index].min(3) as usize;
+                    let current = self.effect_quad_planes.planes[index].min(3) as usize;
                     ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("Type {kind}"))
-                                .small()
-                                .strong(),
-                        );
+                        ui.label(RichText::new(format!("Type {kind}")).small().strong());
                         egui::ComboBox::from_id_salt(("quad_plane", kind))
+                            .width(110.0)
                             .selected_text(crate::eff_runtime::QuadPlanes::NAMES[current])
                             .show_ui(ui, |ui| {
                                 for (value, label) in
                                     crate::eff_runtime::QuadPlanes::NAMES.iter().enumerate()
                                 {
                                     let mut chosen = current;
-                                    if ui
-                                        .selectable_value(&mut chosen, value, *label)
-                                        .clicked()
-                                    {
-                                        self.effect_quad_planes.0[index] = value as u32;
+                                    if ui.selectable_value(&mut chosen, value, *label).clicked() {
+                                        self.effect_quad_planes.planes[index] = value as u32;
                                     }
                                 }
                             });
+                        // Degrees, matching the spawn's own rotation units.
+                        for (axis, slot) in ["X", "Y", "Z"].iter().zip(0..3) {
+                            ui.add(
+                                egui::DragValue::new(
+                                    &mut self.effect_quad_planes.offsets[index][slot],
+                                )
+                                .speed(5.0)
+                                .range(-180.0..=180.0)
+                                .prefix(format!("{axis} "))
+                                .suffix("°"),
+                            );
+                        }
                     });
                 }
             });

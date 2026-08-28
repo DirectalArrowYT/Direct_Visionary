@@ -497,13 +497,26 @@ pub struct PendingTexture {
 /// derivable from the file — which plane is right is something you can see and the data cannot
 /// tell you — so the mapping is a setting rather than a constant, and the viewport lets it be
 /// changed while looking at the effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QuadPlanes(pub [u32; 8]);
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuadPlanes {
+    pub planes: [u32; 8],
+    /// Extra turn applied to an oriented quad, per type, in degrees (X, Y, Z).
+    ///
+    /// Several effects come out a quarter or half turn off in a way the plane alone cannot
+    /// express -- MIIGUNNER_ATK_SHOT_S and RIDLEY_SMASH_BOMB both want +90 on Y, and
+    /// SYS_ATTACK_ARC wants +90 on Z. Whether that is a basis difference or a convention this
+    /// does not model yet, it is measurable by eye and not readable from the file, so it is a
+    /// setting until it is understood well enough to be a constant.
+    pub offsets: [[f32; 3]; 8],
+}
 
 impl Default for QuadPlanes {
     fn default() -> Self {
         // Everything oriented starts in local XY; type 0 stays camera-facing.
-        Self([0, 1, 1, 1, 1, 1, 1, 1])
+        Self {
+            planes: [0, 1, 1, 1, 1, 1, 1, 1],
+            offsets: [[0.0; 3]; 8],
+        }
     }
 }
 
@@ -511,8 +524,21 @@ impl QuadPlanes {
     pub const NAMES: [&'static str; 4] = ["Camera facing", "Local XY", "Local XZ", "Local ZY"];
 
     pub fn plane_for(&self, billboard_type: i64) -> u32 {
-        let index = billboard_type.clamp(0, 7) as usize;
-        self.0[index].min(3)
+        self.planes[billboard_type.clamp(0, 7) as usize].min(3)
+    }
+
+    /// The per-type extra turn, as a quaternion.
+    pub fn offset_for(&self, billboard_type: i64) -> glam::Quat {
+        let [x, y, z] = self.offsets[billboard_type.clamp(0, 7) as usize];
+        if x == 0.0 && y == 0.0 && z == 0.0 {
+            return glam::Quat::IDENTITY;
+        }
+        glam::Quat::from_euler(
+            glam::EulerRot::XYZ,
+            x.to_radians(),
+            y.to_radians(),
+            z.to_radians(),
+        )
     }
 }
 
@@ -657,7 +683,10 @@ pub fn build_particle_batches(
                     call_rotation.y.to_radians(),
                     call_rotation.z.to_radians(),
                 );
-                let orientation = bone_rotation * call_turn * emitter_rotation;
+                let orientation = bone_rotation
+                    * call_turn
+                    * emitter_rotation
+                    * planes.offset_for(sim.billboard_type);
                 // The ACMD call's own offset is in the effect's local frame, as is the
                 // emitter's; both ride through the bone's rotation to reach world space.
                 // The emitter's own offset is inside the effect's rotated frame; the call's is
@@ -2304,6 +2333,31 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
                 }
             }
         }
+    }
+
+    /// The per-type turn must apply in the units it is labelled with, and only to its own type.
+    #[test]
+    fn the_per_type_turn_is_in_degrees_and_type_scoped() {
+        let mut planes = QuadPlanes::default();
+        assert_eq!(planes.offset_for(5), glam::Quat::IDENTITY);
+
+        planes.offsets[5] = [0.0, 90.0, 0.0];
+        let turned = planes.offset_for(5) * glam::Vec3::X;
+        // A quarter turn about Y takes +X to -Z.
+        assert!(
+            (turned - glam::Vec3::new(0.0, 0.0, -1.0)).length() < 1e-5,
+            "a 90 degree Y turn produced {turned:?}"
+        );
+        // Untouched types stay untouched — a global turn would move every effect at once.
+        assert_eq!(planes.offset_for(3), glam::Quat::IDENTITY);
+        assert_eq!(planes.offset_for(0), glam::Quat::IDENTITY);
+
+        // Degrees, like the spawn arguments they sit beside.
+        planes.offsets[3] = [0.0, 0.0, 1.0];
+        let nudge = (planes.offset_for(3) * glam::Vec3::X)
+            .angle_between(glam::Vec3::X)
+            .to_degrees();
+        assert!(nudge < 1.5, "one degree of turn moved {nudge} degrees");
     }
 
     /// Why the smoke effects still read as squares.
