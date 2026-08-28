@@ -82,6 +82,14 @@ pub struct EmitterSim {
     /// file's descriptor table -- it is not an index, and treating it as one finds the wrong
     /// mesh or none.
     pub primitive_id: Option<u64>,
+    /// The emitter's own offset from the effect's origin, and its orientation.
+    ///
+    /// Ignored until now, which stacked every emitter of an effect at one point: SYS_TURN_SMOKE
+    /// separates its five emitters by up to 2 units front-to-back, and collapsing them together
+    /// turns a cloud into a single blob.
+    pub translation: glam::Vec3,
+    /// Euler rotation, radians. EDGE_ATTACK_DASH_HIT turns two of its emitters 90 degrees.
+    pub rotation: glam::Vec3,
     pub color0: Vec<ColorKey>,
     pub alpha0: Vec<ColorKey>,
 }
@@ -114,6 +122,8 @@ pub struct Slots {
     velocity_random: Option<usize>,
     scale: [Option<usize>; 3],
     primitive_id: Option<usize>,
+    translation: [Option<usize>; 3],
+    rotation: [Option<usize>; 3],
     pattern_cells: Option<usize>,
     pattern_frequency: Option<usize>,
     pattern_table: Vec<Option<usize>>,
@@ -160,6 +170,16 @@ impl Slots {
                 at("emitter_info.scale_z"),
             ],
             primitive_id: at("particle_data.primitive_id"),
+            translation: [
+                at("emitter_info.trans_x"),
+                at("emitter_info.trans_y"),
+                at("emitter_info.trans_z"),
+            ],
+            rotation: [
+                at("emitter_info.rotate_x"),
+                at("emitter_info.rotate_y"),
+                at("emitter_info.rotate_z"),
+            ],
             pattern_cells: at("emitter_static.tex_pattern_anim0.num"),
             pattern_frequency: at("emitter_static.tex_pattern_anim0.frequency"),
             pattern_table: (0..32)
@@ -208,6 +228,8 @@ impl EmitterSim {
                     _ => None,
                 }
             }),
+            translation: vec3(&slots.translation),
+            rotation: vec3(&slots.rotation),
             rate: get(slots.rate).unwrap_or(1.0).max(0.0),
             rate_random: get(slots.rate_random).unwrap_or(0.0),
             interval: get(slots.interval).unwrap_or(0.0).max(0.0),
@@ -588,6 +610,8 @@ mod tests {
             pattern_frequency: 1.0,
             sheet_cells: 0,
             primitive_id: None,
+            translation: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
             color0: Vec::new(),
             alpha0: Vec::new(),
         }

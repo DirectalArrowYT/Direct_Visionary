@@ -433,6 +433,10 @@ pub struct LiveEffect {
     /// runs on — an effect spawned on frame 12 and one spawned on frame 40 look the same five
     /// frames in, and the emitter data is written in those terms.
     pub age: f32,
+    /// The ACMD call's own offset from the bone, in the effect's local frame. Scripts place
+    /// effects off the joint constantly -- a hit flash at the end of a sword, smoke under a
+    /// foot -- so dropping it puts every effect exactly on the joint instead.
+    pub offset: glam::Vec3,
 }
 
 /// A texture the renderer needs but does not have yet, decoded ready to upload.
@@ -484,7 +488,7 @@ pub fn build_particle_batches(
     let mut decoded: std::collections::HashSet<TextureKey> = std::collections::HashSet::new();
     let slots = crate::eff_sim::Slots::new();
 
-    for LiveEffect { name, bone, tint, alpha, age } in live {
+    for LiveEffect { name, bone, tint, alpha, age, offset: call_offset } in live {
         let Ok(resolved) = resolver.resolve(name) else {
             continue;
         };
@@ -493,7 +497,10 @@ pub fn build_particle_batches(
         let Some(matrix) = lookup_bone(bone_matrices, bone) else {
             continue;
         };
-        let origin = matrix.col(3).truncate();
+        // The whole bone matrix, not just its translation. A bone's rotation is part of where
+        // an effect points: taking only the position leaves every effect axis-aligned in world
+        // space no matter how the limb it hangs off is turned.
+        let (_, bone_rotation, _) = matrix.to_scale_rotation_translation();
 
         let file = resolved.file.clone();
         let Some(loaded) = resolver.loaded(&file) else {
@@ -551,6 +558,20 @@ pub fn build_particle_batches(
                 // The emitter's own seed. Two emitters with identical settings must not
                 // produce identically jittered particles stacked on each other, which is what
                 // seeding by the effect alone would do.
+                // Where this emitter sits and how it is turned, relative to the bone. Ignoring
+                // it stacks every emitter of an effect at one point -- SYS_TURN_SMOKE separates
+                // its five by up to 2 units, and collapsed together they are a blob rather than
+                // a cloud.
+                let emitter_rotation = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    sim.rotation.x,
+                    sim.rotation.y,
+                    sim.rotation.z,
+                );
+                let orientation = bone_rotation * emitter_rotation;
+                // The ACMD call's own offset is in the effect's local frame, as is the
+                // emitter's; both ride through the bone's rotation to reach world space.
+                let origin = matrix.transform_point3(*call_offset + sim.translation);
                 let seed = (part.set_idx as u64) << 32 ^ (emitter_index as u64) << 8 ^ index as u64;
                 let particle_age = age - part.start_frame as f32;
                 if particle_age < 0.0 {
@@ -595,7 +616,7 @@ pub fn build_particle_batches(
                     };
                     for particle in simulated {
                         mesh_batches[batch_index].instances.push(ParticleInstance {
-                            position: (origin + particle.offset).to_array(),
+                            position: (origin + orientation * particle.offset).to_array(),
                             size: particle.size,
                             color: [
                                 particle.color[0] * tint[0],
@@ -605,6 +626,7 @@ pub fn build_particle_batches(
                             ],
                             rotation: particle.rotation,
                             uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
+                            orientation: orientation.to_array(),
                             _padding: [0.0; 3],
                         });
                     }
@@ -630,7 +652,7 @@ pub fn build_particle_batches(
                 };
                 for particle in simulated {
                     batches[batch_index].instances.push(ParticleInstance {
-                        position: (origin + particle.offset).to_array(),
+                        position: (origin + orientation * particle.offset).to_array(),
                         size: particle.size,
                         color: [
                             particle.color[0] * tint[0],
@@ -640,6 +662,7 @@ pub fn build_particle_batches(
                         ],
                         rotation: particle.rotation,
                         uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
+                        orientation: orientation.to_array(),
                         _padding: [0.0; 3],
                     });
                 }
@@ -882,6 +905,7 @@ mod tests {
             tint: [1.0, 1.0, 1.0],
             alpha: 1.0,
             age: 4.0,
+            offset: glam::Vec3::ZERO,
         }];
         let (effects, _) =
             build_particle_batches(
@@ -956,6 +980,7 @@ mod tests {
             tint: [1.0, 1.0, 1.0],
             alpha: 1.0,
             age: 4.0,
+            offset: glam::Vec3::ZERO,
         }];
         let (none_effects, _) =
             build_particle_batches(
@@ -1686,6 +1711,7 @@ mod tests {
             tint: [1.0, 1.0, 1.0],
             alpha: 1.0,
             age: 4.0,
+            offset: glam::Vec3::ZERO,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver,
@@ -1734,6 +1760,131 @@ EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,             
                 batch.mesh.descriptor
             );
         }
+    }
+
+    /// Emitter transforms and multi-texture use, on the effects being looked at.
+    ///
+    /// Particles are currently placed at the bone with no orientation at all: the emitter's own
+    /// translation and rotation are ignored, as is the second and third sampler. This measures
+    /// whether that is actually costing anything before either is built.
+    #[test]
+    fn emitter_transforms_and_extra_samplers() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(
+            Some(root.join("effect/fighter/edge/ef_edge.eff")),
+            Vec::new(),
+            Some(EffectResolver::common_eff_path(&root)),
+        );
+        let table = crate::eff_attrs::table();
+        let at = |id: &str| table.iter().position(|a| a.id == id);
+        let trans = [at("emitter_info.trans_x"), at("emitter_info.trans_y"), at("emitter_info.trans_z")];
+        let rot = [at("emitter_info.rotate_x"), at("emitter_info.rotate_y"), at("emitter_info.rotate_z")];
+        let tex1 = at("sampler1.texture_id");
+        let tex2 = at("sampler2.texture_id");
+        let blend1 = at("combiner.texture1_color_blend");
+        let blend2 = at("combiner.texture2_color_blend");
+        let process = at("combiner.color_combiner_process");
+
+        for name in ["EDGE_ATTACK_DASH_HIT", "SYS_TURN_SMOKE"] {
+            let Ok(resolved) = resolver.resolve(name) else { continue };
+            let file = resolved.file.clone();
+            let parts = resolved.parts.clone();
+            let Some(loaded) = resolver.loaded(&file) else { continue };
+            println!("
+=== {name} ===");
+            for part in &parts {
+                let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
+                for emitter in set.emitters.iter().take(7) {
+                    let f = |slot: Option<usize>| -> f32 {
+                        match emitter.attrs.get(slot.unwrap_or(usize::MAX)).and_then(|a| a.as_ref()) {
+                            Some(crate::eff_attrs::AttrValue::Float(v)) => *v,
+                            Some(crate::eff_attrs::AttrValue::Int(v)) => *v as f32,
+                            Some(crate::eff_attrs::AttrValue::UInt(v)) => *v as f32,
+                            None => 0.0,
+                        }
+                    };
+                    let t = [f(trans[0]), f(trans[1]), f(trans[2])];
+                    let r = [f(rot[0]), f(rot[1]), f(rot[2])];
+                    let moved = t.iter().any(|v| v.abs() > 1e-4);
+                    let turned = r.iter().any(|v| v.abs() > 1e-4);
+                    println!(
+                        "  '{}' trans={:?}{} rot={:?}{} tex1={} tex2={} blend=({},{}) proc={}",
+                        emitter.name,
+                        t, if moved { " <-- offset" } else { "" },
+                        r, if turned { " <-- rotated" } else { "" },
+                        f(tex1) as i64, f(tex2) as i64,
+                        f(blend1) as i64, f(blend2) as i64, f(process) as i64,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Emitters must land where their own transform puts them, not all on the bone.
+    ///
+    /// SYS_TURN_SMOKE separates its five emitters by up to 2 units front-to-back. Collapsed
+    /// onto one point they are a blob; spread out they are a cloud. This is the difference.
+    #[test]
+    fn emitters_are_spread_by_their_own_transforms() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(EffectResolver::common_eff_path(&root)));
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+
+        let bone_at = glam::Vec3::new(5.0, 12.0, -3.0);
+        let mut bones = std::collections::HashMap::new();
+        bones.insert("Top".to_string(), glam::Mat4::from_translation(bone_at));
+
+        let live = vec![LiveEffect {
+            name: "SYS_TURN_SMOKE".into(),
+            bone: "top".into(),
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            age: 3.0,
+            offset: glam::Vec3::ZERO,
+        }];
+        let (effects, _) = build_particle_batches(
+            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, &bones, &live,
+        );
+
+        let positions: Vec<glam::Vec3> = effects
+            .batches
+            .iter()
+            .flat_map(|batch| batch.instances.iter())
+            .chain(effects.mesh_batches.iter().flat_map(|b| b.instances.iter()))
+            .map(|instance| glam::Vec3::from(instance.position))
+            .collect();
+        assert!(!positions.is_empty(), "SYS_TURN_SMOKE placed nothing");
+
+        // The emitters sit up to 2 units apart, so the cloud must occupy more than a point.
+        let span = positions.iter().fold(0.0f32, |worst, a| {
+            positions
+                .iter()
+                .fold(worst, |worst, b| worst.max((*a - *b).length()))
+        });
+        println!(
+            "
+SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
+            positions.len()
+        );
+        assert!(
+            span > 1.0,
+            "every emitter landed on the same point — the cloud is a blob ({span})"
+        );
+
+        // And the whole thing still hangs off the bone rather than the origin.
+        let centre = positions.iter().copied().sum::<glam::Vec3>() / positions.len() as f32;
+        assert!(
+            (centre - bone_at).length() < 25.0,
+            "the cloud drifted away from its bone: centre {centre:?} vs bone {bone_at:?}"
+        );
     }
 
     /// Why the smoke effects still read as squares.

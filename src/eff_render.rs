@@ -40,6 +40,13 @@ pub struct ParticleInstance {
     /// Effect textures are sprite sheets, so a particle showing all of one is showing every
     /// frame of its animation at once — which is what makes a smoke puff read as a square.
     pub uv_rect: [f32; 4],
+    /// World orientation as a quaternion (x, y, z, w).
+    ///
+    /// Used by the mesh path only. A billboard is camera-facing by definition, but a mesh has
+    /// a real orientation: the bone it hangs off turns, and the emitter itself can be rotated
+    /// (EDGE_ATTACK_DASH_HIT turns two of its emitters 90 degrees). Drawing every ring
+    /// axis-aligned in world space puts them at the wrong angle to the fighter.
+    pub orientation: [f32; 4],
     pub _padding: [f32; 3],
 }
 
@@ -131,6 +138,7 @@ struct Instance {
     @location(2) color: vec4<f32>,
     @location(3) rotation: f32,
     @location(4) uv_rect: vec4<f32>,
+    @location(7) orientation: vec4<f32>,
 };
 
 struct VertexOut {
@@ -176,11 +184,19 @@ struct MeshVertexIn {
     @location(6) uv: vec2<f32>,
 };
 
+fn rotate_by(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    // v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
 @vertex
 fn vs_mesh(vertex: MeshVertexIn, instance: Instance) -> VertexOut {
     // A mesh keeps its own orientation in world space -- that is the whole reason it is a mesh
-    // and not a billboard. Only scale and position come from the particle.
-    let world = instance.position + vertex.position * instance.size;
+    // and not a billboard. Scale and position come from the particle; the orientation carries
+    // the bone's rotation and the emitter's own.
+    let local = rotate_by(instance.orientation, vertex.position * instance.size);
+    let world = instance.position + local;
 
     var out: VertexOut;
     out.clip_position = camera.view_projection * vec4<f32>(world, 1.0);
@@ -283,6 +299,11 @@ impl ParticleRenderer {
                     format: wgpu::VertexFormat::Float32x4,
                     offset: 36,
                     shader_location: 4,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 52,
+                    shader_location: 7,
                 },
             ],
         };
@@ -701,9 +722,10 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, color), 16);
         assert_eq!(offset_of!(ParticleInstance, rotation), 32);
         assert_eq!(offset_of!(ParticleInstance, uv_rect), 36);
+        assert_eq!(offset_of!(ParticleInstance, orientation), 52);
         // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
         // every instance after the first.
-        assert_eq!(size_of::<ParticleInstance>(), 64);
+        assert_eq!(size_of::<ParticleInstance>(), 80);
         assert_eq!(align_of::<ParticleInstance>(), 4);
     }
 

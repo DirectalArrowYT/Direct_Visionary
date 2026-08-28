@@ -3644,6 +3644,9 @@ impl VisionaryApp {
                 // Age since this call fired, which is what the emitter data is written in
                 // terms of.
                 age: frame.saturating_sub(call.active_start) as f32,
+                // Scripts place effects off the joint constantly -- a flash at a sword tip,
+                // smoke under a foot -- so this is not usually zero.
+                offset: glam::Vec3::from(call.offset),
             })
             .collect()
     }
