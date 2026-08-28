@@ -47,12 +47,12 @@ pub struct ParticleInstance {
     /// (EDGE_ATTACK_DASH_HIT turns two of its emitters 90 degrees). Drawing every ring
     /// axis-aligned in world space puts them at the wrong angle to the fighter.
     pub orientation: [f32; 4],
-    /// The emitter's `billboard_type`. Zero means camera-facing; anything else means the quad
-    /// has a real orientation in the world and must use it.
+    /// Which plane this quad lies in: 0 camera-facing, 1 local XY, 2 local XZ, 3 local ZY.
     ///
-    /// SYS_ATTACK_ARC is type 3, and drawn camera-facing it lies flat no matter which way the
-    /// swing goes — an arc that does not follow the attack.
-    pub billboard_type: u32,
+    /// Resolved from the emitter's `billboard_type` before it reaches here. Only type 0 is
+    /// known to mean camera-facing; the rest are a mapping the user can change at runtime,
+    /// because which plane is right is a thing you can see and the data does not say.
+    pub plane: u32,
     pub _padding: [f32; 2],
 }
 
@@ -145,7 +145,7 @@ struct Instance {
     @location(3) rotation: f32,
     @location(4) uv_rect: vec4<f32>,
     @location(7) orientation: vec4<f32>,
-    @location(8) billboard_type: u32,
+    @location(8) plane: u32,
 };
 
 struct VertexOut {
@@ -185,11 +185,14 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     // the local XY plane. That is a placeholder, not a reading of what they mean.
     var right = camera.camera_right.xyz;
     var up = camera.camera_up.xyz;
-    if (instance.billboard_type == 5u) {
-        right = rotate_by(instance.orientation, vec3<f32>(0.0, 0.0, 1.0));
-        up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
-    } else if (instance.billboard_type != 0u) {
+    if (instance.plane == 1u) {
         right = rotate_by(instance.orientation, vec3<f32>(1.0, 0.0, 0.0));
+        up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
+    } else if (instance.plane == 2u) {
+        right = rotate_by(instance.orientation, vec3<f32>(1.0, 0.0, 0.0));
+        up = rotate_by(instance.orientation, vec3<f32>(0.0, 0.0, 1.0));
+    } else if (instance.plane == 3u) {
+        right = rotate_by(instance.orientation, vec3<f32>(0.0, 0.0, 1.0));
         up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
     }
     let offset = right * spun.x * instance.size + up * spun.y * instance.size;
@@ -755,7 +758,7 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, rotation), 32);
         assert_eq!(offset_of!(ParticleInstance, uv_rect), 36);
         assert_eq!(offset_of!(ParticleInstance, orientation), 52);
-        assert_eq!(offset_of!(ParticleInstance, billboard_type), 68);
+        assert_eq!(offset_of!(ParticleInstance, plane), 68);
         // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
         // every instance after the first.
         assert_eq!(size_of::<ParticleInstance>(), 80);

@@ -2615,6 +2615,10 @@ pub struct VisionaryApp {
     effect_resolver: crate::eff_runtime::EffectResolver,
     /// Extracted primitive geometry for effects that draw a mesh rather than a quad.
     effect_meshes: crate::eff_mesh::MeshLibrary,
+    /// Which plane each billboard type draws in. Only type 0 (camera-facing) is known; the
+    /// rest are adjustable because the right answer is visible in the viewport and absent
+    /// from the file.
+    effect_quad_planes: crate::eff_runtime::QuadPlanes,
     /// Effect textures whose format Visionary cannot decode. Remembered so the failure is
     /// reported once rather than retried on every frame the effect is on screen.
     undecodable_textures: std::collections::HashSet<crate::eff_render::TextureKey>,
@@ -3009,6 +3013,7 @@ impl VisionaryApp {
             selected_costume_slot: 0,
             effect_resolver: crate::eff_runtime::EffectResolver::default(),
             effect_meshes: crate::eff_mesh::MeshLibrary::default(),
+            effect_quad_planes: crate::eff_runtime::QuadPlanes::default(),
             undecodable_textures: std::collections::HashSet::new(),
             sync_report: None,
             forgotten_fighters: load_forgotten_fighters(),
@@ -13413,6 +13418,79 @@ impl VisionaryApp {
             });
     }
 
+    /// Which plane each billboard type draws its quads in.
+    ///
+    /// The file says a billboard TYPE and nothing about what the type means. Only 0 is certain
+    /// — it faces the camera. For the rest, whether a quad should lie in the effect's local XY,
+    /// XZ or ZY plane is a thing that is obvious on screen and absent from the data, so it is
+    /// exposed here rather than guessed at in the shader: an oriented quad in the wrong plane
+    /// is edge-on and invisible, which looks like the effect failing to draw at all.
+    ///
+    /// Only the types this move actually uses are listed, so the choice stays in front of the
+    /// effect it changes.
+    fn draw_quad_plane_controls(&mut self, ui: &mut Ui) {
+        let mut used: Vec<i64> = Vec::new();
+        let names: Vec<String> = self
+            .state
+            .effects
+            .iter()
+            .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
+            .map(|call| call.effect_name.clone())
+            .filter(|name| !name.is_empty() && name != "null")
+            .collect();
+        for name in &names {
+            if let Ok(summary) = self.effect_resolver.describe(name) {
+                for kind in summary.billboard_types {
+                    if !used.contains(&kind) {
+                        used.push(kind);
+                    }
+                }
+            }
+        }
+        if used.is_empty() {
+            return;
+        }
+        used.sort_unstable();
+
+        egui::CollapsingHeader::new("Quad orientation")
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Effect files record a billboard type but not what it means. Type 0 is                          camera-facing; for the rest, pick the plane that looks right — a quad                          in the wrong plane is edge-on and looks like it is not drawing.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                for kind in used {
+                    let index = kind.clamp(0, 7) as usize;
+                    let current = self.effect_quad_planes.0[index].min(3) as usize;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("Type {kind}"))
+                                .small()
+                                .strong(),
+                        );
+                        egui::ComboBox::from_id_salt(("quad_plane", kind))
+                            .selected_text(crate::eff_runtime::QuadPlanes::NAMES[current])
+                            .show_ui(ui, |ui| {
+                                for (value, label) in
+                                    crate::eff_runtime::QuadPlanes::NAMES.iter().enumerate()
+                                {
+                                    let mut chosen = current;
+                                    if ui
+                                        .selectable_value(&mut chosen, value, *label)
+                                        .clicked()
+                                    {
+                                        self.effect_quad_planes.0[index] = value as u32;
+                                    }
+                                }
+                            });
+                    });
+                }
+            });
+    }
+
     fn draw_effects_panel(&mut self, ui: &mut Ui) {
         let current = self.state.current_frame;
 
@@ -13444,6 +13522,7 @@ impl VisionaryApp {
         // viewport is showing a flat quad because the effect is flat quads, or because it is
         // geometry the renderer cannot draw yet — and those look identical on screen.
         self.draw_effect_content_summary(ui);
+        self.draw_quad_plane_controls(ui);
 
         ui.separator();
 
@@ -31358,6 +31437,7 @@ impl eframe::App for VisionaryApp {
                                         &was_failed,
                                         &mesh_resident,
                                         &mut self.effect_meshes,
+                                        self.effect_quad_planes,
                                         &bones,
                                         &live,
                                     );

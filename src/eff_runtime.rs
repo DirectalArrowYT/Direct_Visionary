@@ -486,6 +486,31 @@ pub struct PendingTexture {
 }
 
 /// Everything one frame of effects needs handed to the GPU.
+/// Which plane each `billboard_type` draws its quads in, indexed by type.
+///
+/// Type 0 is camera-facing and certain. The rest are not documented anywhere and are not
+/// derivable from the file — which plane is right is something you can see and the data cannot
+/// tell you — so the mapping is a setting rather than a constant, and the viewport lets it be
+/// changed while looking at the effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuadPlanes(pub [u32; 8]);
+
+impl Default for QuadPlanes {
+    fn default() -> Self {
+        // Everything oriented starts in local XY; type 0 stays camera-facing.
+        Self([0, 1, 1, 1, 1, 1, 1, 1])
+    }
+}
+
+impl QuadPlanes {
+    pub const NAMES: [&'static str; 4] = ["Camera facing", "Local XY", "Local XZ", "Local ZY"];
+
+    pub fn plane_for(&self, billboard_type: i64) -> u32 {
+        let index = billboard_type.clamp(0, 7) as usize;
+        self.0[index].min(3)
+    }
+}
+
 #[derive(Default)]
 pub struct FrameEffects {
     pub batches: Vec<crate::eff_render::ParticleBatch>,
@@ -509,6 +534,7 @@ pub fn build_particle_batches(
     failed: &dyn Fn(&crate::eff_render::TextureKey) -> bool,
     mesh_uploaded: &dyn Fn(&crate::eff_mesh::MeshKey) -> bool,
     meshes: &mut crate::eff_mesh::MeshLibrary,
+    planes: QuadPlanes,
     bone_matrices: &std::collections::HashMap<String, glam::Mat4>,
     live: &[LiveEffect],
 ) -> (
@@ -689,7 +715,7 @@ pub fn build_particle_batches(
                             rotation: particle.rotation,
                             uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                             orientation: orientation.to_array(),
-                            billboard_type: sim.billboard_type.max(0) as u32,
+                            plane: planes.plane_for(sim.billboard_type),
                             _padding: [0.0; 2],
                         });
                     }
@@ -726,7 +752,7 @@ pub fn build_particle_batches(
                         rotation: particle.rotation,
                         uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                         orientation: orientation.to_array(),
-                        billboard_type: sim.billboard_type.max(0) as u32,
+                        plane: planes.plane_for(sim.billboard_type),
                         _padding: [0.0; 2],
                     });
                 }
@@ -975,7 +1001,7 @@ mod tests {
         let (effects, _) =
             build_particle_batches(
                 &mut resolver, &|_| false, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &live);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &live);
         // Both of this effect's emitters draw a primitive, so its particles arrive as mesh
         // batches rather than quads. The two paths are checked together: what matters is that
         // the effect produced placed, textured particles, not which pipeline draws them.
@@ -1029,7 +1055,7 @@ mod tests {
         let (again_effects, _) =
             build_particle_batches(
                 &mut resolver, &|k| *k == key, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &live);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &live);
         assert!(
             again_effects
                 .pending_textures
@@ -1051,7 +1077,7 @@ mod tests {
         let (none_effects, _) =
             build_particle_batches(
                 &mut resolver, &|_| false, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &missing);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &missing);
         let none: Vec<usize> = none_effects
             .batches
             .iter()
@@ -1786,6 +1812,7 @@ mod tests {
             &|_| false,
             &|_| false,
             &mut meshes,
+            QuadPlanes::default(),
             &bones,
             &live,
         );
@@ -1919,7 +1946,7 @@ EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,             
             rotation: glam::Vec3::ZERO,
         }];
         let (effects, _) = build_particle_batches(
-            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, &bones, &live,
+            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, QuadPlanes::default(), &bones, &live,
         );
 
         let positions: Vec<glam::Vec3> = effects
@@ -2172,7 +2199,7 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
                 rotation,
             }];
             let (effects, _) = build_particle_batches(
-                &mut resolver, &|_| false, &|_| false, &|_| false, meshes, &bones, &live,
+                &mut resolver, &|_| false, &|_| false, &|_| false, meshes, QuadPlanes::default(), &bones, &live,
             );
             effects
                 .batches
