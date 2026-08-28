@@ -13316,6 +13316,79 @@ impl VisionaryApp {
         }
     }
 
+    /// One row per distinct effect this move spawns, saying what it is made of.
+    ///
+    /// Sits above the call list rather than inside it because it describes the effect DATA a
+    /// name resolves to, which is shared by every call that spawns it — repeating it per call
+    /// would say the same thing several times for a move that spawns one effect repeatedly.
+    fn draw_effect_content_summary(&mut self, ui: &mut Ui) {
+        let mut names: Vec<String> = self
+            .state
+            .effects
+            .iter()
+            .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
+            .map(|call| call.effect_name.clone())
+            .filter(|name| !name.is_empty() && name != "null")
+            .collect();
+        names.sort();
+        names.dedup();
+        if names.is_empty() {
+            return;
+        }
+
+        egui::CollapsingHeader::new(format!("Effect contents ({})", names.len()))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(
+                        "What each spawned name resolves to in the effect files. Emitter count \
+                         is what the viewport draws one quad each for today.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                for name in names {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(&name).strong().small());
+                        match self.effect_resolver.describe(&name) {
+                            Ok(summary) => {
+                                ui.label(
+                                    RichText::new(summary.headline())
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                )
+                                .on_hover_text(format!(
+                                    "Emitter sets: {}\nBillboard orientation types present: {:?}\n\
+                                     Billboard types are orientation modes (camera-facing, \
+                                     axis-aligned, velocity-aligned), not a mesh/quad switch.",
+                                    summary.set_names.join(", "),
+                                    summary.billboard_types,
+                                ));
+                            }
+                            Err(crate::eff_runtime::ResolveFailure::UnknownName) => {
+                                ui.label(
+                                    RichText::new("not in this fighter's eff or ef_common")
+                                        .small()
+                                        .color(Color32::from_rgb(230, 160, 90)),
+                                )
+                                .on_hover_text(
+                                    "No effect file on the search path has an entry by this \
+                                     name, so nothing can be drawn for it.",
+                                );
+                            }
+                            Err(crate::eff_runtime::ResolveFailure::NoEmitterSet) => {
+                                ui.label(
+                                    RichText::new("entry exists but reaches no emitter set")
+                                        .small()
+                                        .color(Color32::from_rgb(230, 160, 90)),
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
     fn draw_effects_panel(&mut self, ui: &mut Ui) {
         let current = self.state.current_frame;
 
@@ -13342,6 +13415,12 @@ impl VisionaryApp {
             .on_hover_text(
                 "Reveal optional rate, camera, WorkModule, tint, alpha, and scale overrides",
             );
+
+        // What each spawned name actually IS. A name alone says nothing about whether the
+        // viewport is showing a flat quad because the effect is flat quads, or because it is
+        // geometry the renderer cannot draw yet — and those look identical on screen.
+        self.draw_effect_content_summary(ui);
+
         ui.separator();
 
         let has_effect_data =

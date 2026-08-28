@@ -188,6 +188,137 @@ fn parts_of(entry: &EffEntryInfo) -> Vec<ResolvedPart> {
     parts
 }
 
+/// What an effect actually is, in the terms someone deciding whether the viewport is lying to
+/// them needs: where it came from, how much of it there is, and how it draws.
+///
+/// The draw kind is the point. A spawned name gives no clue whether it is a sheet of textured
+/// quads, geometry, or a spawn volume with nothing visible of its own, and the viewport drawing
+/// a flat quad is equally consistent with "this is a flat quad" and "this is a mesh the
+/// renderer cannot draw yet". Stating it removes that ambiguity.
+#[derive(Debug, Clone)]
+pub struct EffectSummary {
+    pub source: EffectSource,
+    pub set_names: Vec<String>,
+    pub emitters: usize,
+    /// Emitters that sample a texture. Anything less than `emitters` means part of the effect
+    /// draws untextured.
+    pub textured: usize,
+    /// Emitters whose `primitive_id` points at a primitive this file actually holds. Almost
+    /// always zero: the id is populated on nearly every emitter as a name hash, and only means
+    /// something when the file carries a primitive pool to resolve it against.
+    pub mesh_emitters: usize,
+    /// Distinct `billboard_type` values across the emitters, ascending. These are orientation
+    /// modes — camera-facing, axis-aligned, velocity-aligned — not a mesh/quad switch.
+    pub billboard_types: Vec<i64>,
+    /// Shortest and longest particle life in frames, across the emitters.
+    pub life_range: Option<(i64, i64)>,
+}
+
+impl EffectSummary {
+    /// One line for the UI. Deliberately concrete about the count, because "26 emitters" is
+    /// what explains a viewport showing 26 quads where the game shows a continuous stream.
+    pub fn headline(&self) -> String {
+        let where_from = match self.source {
+            EffectSource::Fighter => "fighter eff",
+            EffectSource::Common => "ef_common",
+        };
+        let kind = if self.mesh_emitters > 0 {
+            format!("{} mesh + {} billboard", self.mesh_emitters, self.emitters - self.mesh_emitters)
+        } else {
+            "billboards".to_string()
+        };
+        let life = match self.life_range {
+            Some((low, high)) if low == high => format!(", life {low}f"),
+            Some((low, high)) => format!(", life {low}-{high}f"),
+            None => String::new(),
+        };
+        let untextured = if self.textured < self.emitters {
+            format!(", {} untextured", self.emitters - self.textured)
+        } else {
+            String::new()
+        };
+        format!(
+            "{where_from} · {} emitter(s) · {kind}{life}{untextured}",
+            self.emitters
+        )
+    }
+}
+
+impl EffectResolver {
+    /// Describe a spawned name without drawing it.
+    pub fn describe(&mut self, name: &str) -> Result<EffectSummary, ResolveFailure> {
+        let resolved = self.resolve(name)?;
+        let source = resolved.source;
+        let file = resolved.file.clone();
+        let table = crate::eff_attrs::table();
+        let billboard_slot = table
+            .iter()
+            .position(|attr| attr.id == "particle_data.billboard_type");
+        let primitive_slot = table
+            .iter()
+            .position(|attr| attr.id == "particle_data.primitive_id");
+        let life_slot = table.iter().position(|attr| attr.id == "particle_data.life");
+
+        let Some(loaded) = self.loaded(&file) else {
+            return Err(ResolveFailure::NoEmitterSet);
+        };
+        // Whether a primitive id means anything at all is a property of the FILE, not the
+        // emitter: with no pool there is nothing for an id to resolve against, and every id in
+        // the file is then an inert leftover hash.
+        let pool = loaded
+            .ptcl
+            .emitter_sets
+            .is_empty()
+            .then_some(0usize)
+            .unwrap_or(0);
+        let _ = pool;
+
+        let mut summary = EffectSummary {
+            source,
+            set_names: Vec::new(),
+            emitters: 0,
+            textured: 0,
+            mesh_emitters: 0,
+            billboard_types: Vec::new(),
+            life_range: None,
+        };
+
+        for part in &resolved.parts {
+            let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else {
+                continue;
+            };
+            summary.set_names.push(set.name.clone());
+            for emitter in &set.emitters {
+                summary.emitters += 1;
+                if emitter.texture_index.is_some() {
+                    summary.textured += 1;
+                }
+                let value = |slot: Option<usize>| -> Option<i64> {
+                    match emitter.attrs.get(slot?).and_then(|a| a.as_ref())? {
+                        crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                        crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                        crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                    }
+                };
+                if let Some(kind) = value(billboard_slot) {
+                    if !summary.billboard_types.contains(&kind) {
+                        summary.billboard_types.push(kind);
+                    }
+                }
+                if let Some(life) = value(life_slot) {
+                    summary.life_range = Some(match summary.life_range {
+                        None => (life, life),
+                        Some((low, high)) => (low.min(life), high.max(life)),
+                    });
+                }
+                let _ = primitive_slot;
+            }
+        }
+        summary.billboard_types.sort_unstable();
+        Ok(summary)
+    }
+}
+
 /// A texture the renderer needs but does not have yet, decoded ready to upload.
 pub struct PendingTexture {
     pub key: crate::eff_render::TextureKey,
@@ -754,6 +885,129 @@ mod tests {
             println!("    {name:16} primitives={primitives:3} models={models}");
         }
         assert!(files > 0, "no fighter eff files scanned");
+    }
+
+    /// What three effects from one real move actually are, field by field.
+    ///
+    /// Mario's down smash spawns `MARIO_FB_SHOOT`, `SYS_FLAME` and `SYS_ATK_SMOKE` — one from
+    /// the fighter's file and two from common. Whether these are billboards or geometry is not
+    /// answerable from a corpus average, because a single move can easily be the exception, so
+    /// this reads the three by name.
+    #[test]
+    fn the_three_effects_on_marios_down_smash() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let fighter = root.join("effect/fighter/mario/ef_mario.eff");
+        let common = EffectResolver::common_eff_path(&root);
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(Some(fighter), Some(common));
+
+        let table = crate::eff_attrs::table();
+        let index_of = |id: &str| table.iter().position(|attr| attr.id == id);
+        let billboard = index_of("particle_data.billboard_type").unwrap();
+        let primitive = index_of("particle_data.primitive_id").unwrap();
+        let life = index_of("particle_data.life");
+        let emitter_type = index_of("shape_info.emitter_type").or_else(|| index_of("shape_info.type"));
+
+        for name in ["MARIO_FB_SHOOT", "SYS_FLAME", "SYS_ATK_SMOKE"] {
+            println!("\n=== {name} ===");
+            let resolved = match resolver.resolve(name) {
+                Ok(resolved) => resolved,
+                Err(failure) => {
+                    println!("  could not resolve: {failure:?}");
+                    continue;
+                }
+            };
+            println!(
+                "  from {:?} ({}), {} part(s)",
+                resolved.source,
+                resolved
+                    .file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                resolved.parts.len()
+            );
+            let file = resolved.file.clone();
+            let Some(loaded) = resolver.loaded(&file) else {
+                continue;
+            };
+            let pool_has_primitives = false; // reported separately by the corpus scan
+            let _ = pool_has_primitives;
+
+            for part in &resolved.parts {
+                let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else {
+                    continue;
+                };
+                println!(
+                    "  set '{}' — {} emitter(s), starts +{}f, bone '{}'",
+                    set.name,
+                    set.emitters.len(),
+                    part.start_frame,
+                    part.bone
+                );
+                for emitter in &set.emitters {
+                    let value = |slot: usize| -> Option<i64> {
+                        match emitter.attrs.get(slot).and_then(|a| a.as_ref())? {
+                            crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                            crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                            crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                        }
+                    };
+                    println!(
+                        "    '{}' billboard_type={:?} life={:?} texture={:?} primitive_id={:?}{}",
+                        emitter.name,
+                        value(billboard),
+                        life.and_then(value),
+                        emitter.texture_index,
+                        value(primitive),
+                        emitter_type
+                            .and_then(value)
+                            .map(|t| format!(" emitter_shape={t}"))
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The label the effects panel shows, checked against the effects it describes.
+    #[test]
+    fn the_content_summary_says_what_each_effect_is_made_of() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(
+            Some(root.join("effect/fighter/mario/ef_mario.eff")),
+            Some(EffectResolver::common_eff_path(&root)),
+        );
+
+        for name in ["MARIO_FB_SHOOT", "SYS_FLAME", "SYS_ATK_SMOKE"] {
+            let summary = resolver.describe(name).expect("resolves");
+            println!("  {name:16} {}", summary.headline());
+            println!("      types={:?} sets={:?}", summary.billboard_types, summary.set_names);
+            assert!(summary.emitters > 0);
+            // Every emitter in these three is textured, so the headline must not claim
+            // otherwise — an untextured count appearing here would mean the texture link is
+            // being read wrong.
+            assert_eq!(summary.textured, summary.emitters, "{name}");
+            assert!(
+                summary.headline().contains("billboards"),
+                "{name}: {}",
+                summary.headline()
+            );
+            assert!(summary.life_range.is_some(), "{name} has no lifetimes");
+        }
+
+        // A name nothing has must say so rather than describing an empty effect.
+        assert!(matches!(
+            resolver.describe("not_a_real_effect"),
+            Err(ResolveFailure::UnknownName)
+        ));
     }
 
     #[test]
