@@ -581,6 +581,181 @@ mod tests {
         );
     }
 
+    /// How much of the real data is a mesh rather than a billboard.
+    ///
+    /// The slice draws every emitter as a camera-facing quad, which is right for the majority
+    /// of effects and wrong for the rest — Toolbox shows plenty of effects carrying actual
+    /// geometry. There are two separate mechanisms and they need telling apart before either
+    /// is built: an entry can spawn an **external model** alongside its particles, and an
+    /// individual emitter can draw its particles **as a primitive** from the eff's own BFRES
+    /// pool. This counts both so the next stage is sized from the data instead of an
+    /// impression.
+    #[test]
+    fn how_much_of_the_corpus_draws_meshes_rather_than_billboards() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+
+        let table = crate::eff_attrs::table();
+        let primitive_attr = table
+            .iter()
+            .position(|attr| attr.id == "particle_data.primitive_id")
+            .expect("the attribute table exposes primitive_id");
+        let shape_primitive_attr = table
+            .iter()
+            .position(|attr| attr.id == "shape_info.primitive_index")
+            .expect("the attribute table exposes shape_info.primitive_index");
+
+        for relative in [
+            "effect/fighter/mario/ef_mario.eff",
+            "effect/system/common/ef_common.eff",
+        ] {
+            let path = root.join(relative);
+            let bytes = std::fs::read(&path).expect("read eff");
+            let raw = effect_library::NamcoEffectFile::load(&bytes).expect("parse eff");
+            let loaded = load_effect(&path).expect("load eff");
+
+            // `primitive_id` is populated on every emitter whether or not it means anything —
+            // the attribute's own documentation says it is "only meaningful when this eff
+            // holds it". So the pool is the gate: no primitives in the file means no emitter
+            // in it draws a mesh, regardless of what the id says.
+            let primitives = match raw.ptcl_file.as_ref().and_then(|ptcl| ptcl.primitives.as_ref())
+            {
+                None => {
+                    println!("\n=== {relative} ===");
+                    println!("  primitive pool               : absent");
+                    0
+                }
+                Some(list) => {
+                    println!("\n=== {relative} ===");
+                    println!("  primitive pool               : {} entries", list.len());
+                    list.len()
+                }
+            };
+            println!(
+                "  external model names         : {:?}",
+                raw.external_model_names
+            );
+
+            let with_model = loaded
+                .entries
+                .iter()
+                .filter(|entry| entry.model.is_some())
+                .count();
+
+            // `billboard_type` is the discriminator that actually decides how a particle is
+            // drawn. Reported as a distribution rather than a boolean: guessing which values
+            // mean "mesh" and counting matches is how the first two attempts at this produced
+            // numbers that contradicted the primitive pool.
+            let billboard_attr = table
+                .iter()
+                .position(|attr| attr.id == "particle_data.billboard_type")
+                .expect("the attribute table exposes billboard_type");
+
+            let mut emitters = 0usize;
+            let mut textured = 0usize;
+            let mut billboard_hist: std::collections::BTreeMap<i64, usize> =
+                std::collections::BTreeMap::new();
+            let mut primitive_ids: std::collections::BTreeSet<i64> =
+                std::collections::BTreeSet::new();
+            for set in &loaded.ptcl.emitter_sets {
+                for emitter in &set.emitters {
+                    emitters += 1;
+                    if emitter.texture_index.is_some() {
+                        textured += 1;
+                    }
+                    let value = |index: usize| -> Option<i64> {
+                        match emitter.attrs.get(index).and_then(|a| a.as_ref())? {
+                            crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                            crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                            crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                        }
+                    };
+                    if let Some(kind) = value(billboard_attr) {
+                        *billboard_hist.entry(kind).or_default() += 1;
+                    }
+                    if let Some(id) = value(primitive_attr) {
+                        primitive_ids.insert(id);
+                    }
+                }
+            }
+
+            println!("  entries spawning a model     : {with_model} of {}", loaded.entries.len());
+            println!("  emitters                     : {emitters}");
+            println!("    sampling a texture         : {textured}");
+            println!("    billboard_type histogram   : {billboard_hist:?}");
+            println!("    distinct primitive_id      : {primitive_ids:?}");
+            let _ = (primitives, shape_primitive_attr);
+            assert!(emitters > 0);
+        }
+    }
+
+    /// Corpus-wide answer to "how much of this is geometry rather than billboards".
+    ///
+    /// Two files is not enough to base a renderer on, and the question decides the whole shape
+    /// of the next stage: if effects are mostly meshes then the billboard pass is a detour, and
+    /// if they are mostly billboards then mesh support is a special case to add later. Scans
+    /// every fighter's eff and reports the primitive pools and model references it finds.
+    #[test]
+    fn how_much_of_every_fighter_eff_is_geometry() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let fighter_root = root.join("effect/fighter");
+        let Ok(dirs) = std::fs::read_dir(&fighter_root) else {
+            eprintln!("no {}", fighter_root.display());
+            return;
+        };
+
+        let mut files = 0usize;
+        let mut with_primitives = 0usize;
+        let mut total_primitives = 0usize;
+        let mut total_models = 0usize;
+        let mut worst: Vec<(String, usize, usize)> = Vec::new();
+
+        for dir in dirs.flatten().take(90) {
+            let name = dir.file_name().to_string_lossy().to_string();
+            let path = dir.path().join(format!("ef_{name}.eff"));
+            if !path.exists() {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(raw) = effect_library::NamcoEffectFile::load(&bytes) else {
+                continue;
+            };
+            files += 1;
+            let primitives = raw
+                .ptcl_file
+                .as_ref()
+                .and_then(|ptcl| ptcl.primitives.as_ref())
+                .map(|list| list.len())
+                .unwrap_or(0);
+            let models = raw.external_model_names.len();
+            if primitives > 0 {
+                with_primitives += 1;
+            }
+            total_primitives += primitives;
+            total_models += models;
+            if primitives > 0 || models > 1 {
+                worst.push((name, primitives, models));
+            }
+        }
+
+        println!("\n=== every fighter eff ===");
+        println!("  files scanned                : {files}");
+        println!("  files with a primitive pool  : {with_primitives}");
+        println!("  primitives across all files  : {total_primitives}");
+        println!("  external model refs (total)  : {total_models}");
+        worst.sort_by_key(|(_, primitives, _)| std::cmp::Reverse(*primitives));
+        println!("  files carrying geometry:");
+        for (name, primitives, models) in worst.iter().take(15) {
+            println!("    {name:16} primitives={primitives:3} models={models}");
+        }
+        assert!(files > 0, "no fighter eff files scanned");
+    }
+
     #[test]
     fn an_emitter_set_exposes_what_a_runtime_needs() {
         let Some(root) = root() else {
