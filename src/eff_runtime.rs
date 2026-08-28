@@ -422,6 +422,11 @@ pub fn build_particle_batches(
                 }
 
                 let sim = crate::eff_sim::EmitterSim::read(emitter, &slots);
+                // The sheet layout needs the texture's real size, which lives with the pool
+                // rather than with the emitter — so the grid is worked out here, where both
+                // are in hand, and the simulation only says which cell.
+                let (columns, rows) =
+                    crate::eff_sim::sheet_grid(info.width, info.height, sim.pattern_cells);
                 // The emitter's own seed. Two emitters with identical settings must not
                 // produce identically jittered particles stacked on each other, which is what
                 // seeding by the effect alone would do.
@@ -463,6 +468,7 @@ pub fn build_particle_batches(
                             particle.color[3] * alpha,
                         ],
                         rotation: particle.rotation,
+                        uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                         _padding: [0.0; 3],
                     });
                 }
@@ -1075,6 +1081,78 @@ mod tests {
             resolver.describe("not_a_real_effect"),
             Err(ResolveFailure::UnknownName)
         ));
+    }
+
+    /// How a sprite sheet is divided into cells, read off emitters whose texture size is known.
+    ///
+    /// The viewport currently maps 0..1 UV across the whole texture, so an effect whose texture
+    /// is a strip of animation frames draws every frame at once — which is exactly why a smoke
+    /// puff reads as a square. The division is not documented, so it is inferred here by
+    /// putting the candidate fields next to the texture's real dimensions and looking for the
+    /// combination that divides it into square cells.
+    #[test]
+    fn how_effect_sprite_sheets_are_divided() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(
+            Some(root.join("effect/fighter/mario/ef_mario.eff")),
+            Some(EffectResolver::common_eff_path(&root)),
+        );
+
+        let table = crate::eff_attrs::table();
+        let at = |id: &str| table.iter().position(|attr| attr.id == id);
+        let repeat = at("texture_anim0.repeat");
+        let anim_type = at("texture_anim0.pattern_anim_type");
+        let pat_num = at("emitter_static.tex_pattern_anim0.num");
+        let pat_freq = at("emitter_static.tex_pattern_anim0.frequency");
+        let pat_slots: Vec<Option<usize>> = (0..8)
+            .map(|i| at(&format!("emitter_static.tex_pattern_anim0.table[{i}]")))
+            .collect();
+
+        for name in ["SYS_ATK_SMOKE", "SYS_FLAME", "MARIO_FB_SHOOT"] {
+            let Ok(resolved) = resolver.resolve(name) else {
+                continue;
+            };
+            let file = resolved.file.clone();
+            let parts = resolved.parts.clone();
+            let Some(loaded) = resolver.loaded(&file) else {
+                continue;
+            };
+            println!("\n=== {name} ===");
+            for part in &parts {
+                let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else {
+                    continue;
+                };
+                for emitter in set.emitters.iter().take(6) {
+                    let value = |slot: Option<usize>| -> Option<i64> {
+                        match emitter.attrs.get(slot?).and_then(|a| a.as_ref())? {
+                            crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                            crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                            crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                        }
+                    };
+                    let size = emitter
+                        .texture_index
+                        .and_then(|i| loaded.ptcl.bntx_textures.get(i as usize))
+                        .map(|t| (t.tex_name.clone(), t.width, t.height));
+                    let slots: Vec<i64> =
+                        pat_slots.iter().filter_map(|s| value(*s)).collect();
+                    println!(
+                        "  '{}' tex={:?} repeat={:?} anim_type={:?} pat_num={:?} freq={:?} slots={:?}",
+                        emitter.name,
+                        size,
+                        value(repeat),
+                        value(anim_type),
+                        value(pat_num),
+                        value(pat_freq),
+                        slots,
+                    );
+                }
+            }
+        }
     }
 
     #[test]

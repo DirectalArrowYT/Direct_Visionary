@@ -36,6 +36,10 @@ pub struct ParticleInstance {
     pub color: [f32; 4],
     /// Rotation about the view axis, radians.
     pub rotation: f32,
+    /// Which part of the texture this particle samples: (offset_u, offset_v, scale_u, scale_v).
+    /// Effect textures are sprite sheets, so a particle showing all of one is showing every
+    /// frame of its animation at once — which is what makes a smoke puff read as a square.
+    pub uv_rect: [f32; 4],
     pub _padding: [f32; 3],
 }
 
@@ -102,6 +106,7 @@ struct Instance {
     @location(1) size: f32,
     @location(2) color: vec4<f32>,
     @location(3) rotation: f32,
+    @location(4) uv_rect: vec4<f32>,
 };
 
 struct VertexOut {
@@ -127,7 +132,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
 
     var out: VertexOut;
     out.clip_position = camera.view_projection * vec4<f32>(instance.position + offset, 1.0);
-    out.uv = corner * 0.5 + 0.5;
+    // Map the quad into this particle's cell of the sheet rather than across the whole image.
+    out.uv = (corner * 0.5 + 0.5) * instance.uv_rect.zw + instance.uv_rect.xy;
     out.color = instance.color;
     return out;
 }
@@ -229,6 +235,11 @@ impl ParticleRenderer {
                     format: wgpu::VertexFormat::Float32,
                     offset: 32,
                     shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 36,
+                    shader_location: 4,
                 },
             ],
         };
@@ -476,9 +487,10 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, size), 12);
         assert_eq!(offset_of!(ParticleInstance, color), 16);
         assert_eq!(offset_of!(ParticleInstance, rotation), 32);
-        // 48, not 36: the padding exists so the stride stays 16-byte aligned. Dropping it
-        // would silently misalign every instance after the first.
-        assert_eq!(size_of::<ParticleInstance>(), 48);
+        assert_eq!(offset_of!(ParticleInstance, uv_rect), 36);
+        // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
+        // every instance after the first.
+        assert_eq!(size_of::<ParticleInstance>(), 64);
         assert_eq!(align_of::<ParticleInstance>(), 4);
     }
 

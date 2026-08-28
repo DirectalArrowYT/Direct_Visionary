@@ -67,6 +67,13 @@ pub struct EmitterSim {
     /// gives every particle in the game the same size, because emitters are nearly all 1.0.
     pub scale_keys: Vec<(f32, glam::Vec3)>,
     pub billboard_type: i64,
+    /// Number of cells the emitter's texture is divided into. Zero or one means the texture is
+    /// a single image and the particle uses all of it.
+    pub pattern_cells: u32,
+    /// Cell index to show at each step of the pattern animation.
+    pub pattern_table: Vec<i32>,
+    /// Frames each pattern step lasts.
+    pub pattern_frequency: f32,
     pub color0: Vec<ColorKey>,
     pub alpha0: Vec<ColorKey>,
 }
@@ -98,6 +105,9 @@ pub struct Slots {
     diffusion: [Option<usize>; 3],
     velocity_random: Option<usize>,
     scale: [Option<usize>; 3],
+    pattern_cells: Option<usize>,
+    pattern_frequency: Option<usize>,
+    pattern_table: Vec<Option<usize>>,
     num_scale_keys: Option<usize>,
     scale_keys: Vec<[Option<usize>; 4]>,
     billboard_type: Option<usize>,
@@ -140,6 +150,11 @@ impl Slots {
                 at("emitter_info.scale_y"),
                 at("emitter_info.scale_z"),
             ],
+            pattern_cells: at("emitter_static.tex_pattern_anim0.num"),
+            pattern_frequency: at("emitter_static.tex_pattern_anim0.frequency"),
+            pattern_table: (0..32)
+                .map(|i| at(&format!("emitter_static.tex_pattern_anim0.table[{i}]")))
+                .collect(),
             num_scale_keys: at("emitter_static.num_scale_keys"),
             scale_keys: (0..8)
                 .map(|i| {
@@ -214,6 +229,13 @@ impl EmitterSim {
                     })
                     .collect()
             },
+            pattern_cells: get(slots.pattern_cells).unwrap_or(0.0).max(0.0) as u32,
+            pattern_frequency: get(slots.pattern_frequency).unwrap_or(1.0).max(1.0),
+            pattern_table: slots
+                .pattern_table
+                .iter()
+                .filter_map(|slot| get(*slot).map(|v| v as i32))
+                .collect(),
             billboard_type: emitter
                 .attrs
                 .get(slots.billboard_type.unwrap_or(usize::MAX))
@@ -258,6 +280,8 @@ pub struct SimParticle {
     pub size: f32,
     pub color: [f32; 4],
     pub rotation: f32,
+    /// Which cell of the emitter's sprite sheet this particle is showing right now.
+    pub cell: u32,
 }
 
 /// Sample a keyframe list at a normalised age.
@@ -321,6 +345,60 @@ fn sample_scale(keys: &[(f32, glam::Vec3)], age: f32, life: f32) -> glam::Vec3 {
         previous = *key;
     }
     previous.1
+}
+
+/// How a sprite sheet of `cells` frames is laid out across a `width`×`height` texture.
+///
+/// The format stores the cell COUNT but not the grid, so the grid has to be inferred. The
+/// constraint that pins it down is that cells are square: effect sheets are grids of equal
+/// square frames, so the right layout is the smallest grid whose cells come out square and
+/// which has room for every frame. Checked against real textures — `ef_cmn_fire00` at 512²
+/// with 16 cells is 4×4 of 128px, `ef_cmn_impact11` at 256×128 with 5 is 4×2 of 64px, and
+/// `ef_cmn_fireimpact04` at 256×768 with 8 is 2×6 of 128px — none of which a naive "N across"
+/// or fixed 4×4 would get right.
+///
+/// A grid can hold more cells than the animation uses (12 frames in a 4×4 sheet is common), so
+/// the fit is `columns * rows >= cells`, not equality.
+pub fn sheet_grid(width: u32, height: u32, cells: u32) -> (u32, u32) {
+    if cells <= 1 || width == 0 || height == 0 {
+        return (1, 1);
+    }
+    // Square cells means width/columns == height/rows, so the grid's aspect matches the
+    // texture's. Walk column counts and keep the first that fits.
+    let mut best = (cells.max(1), 1);
+    for columns in 1..=64u32 {
+        // Cells sit on whole pixels. Without this, a 128px sheet of 5 frames "fits" a 3×3 grid
+        // of 42.67px cells — square, large enough, and not how any sheet is actually cut.
+        if width % columns != 0 {
+            continue;
+        }
+        let cell_width = width / columns;
+        if cell_width == 0 || height % cell_width != 0 {
+            continue;
+        }
+        let rows = height / cell_width;
+        if rows > 0 && columns * rows >= cells {
+            best = (columns, rows);
+            break;
+        }
+    }
+    best
+}
+
+/// UV rectangle for one cell: (offset_u, offset_v, scale_u, scale_v).
+pub fn cell_uv(cell: u32, columns: u32, rows: u32) -> [f32; 4] {
+    if columns <= 1 && rows <= 1 {
+        return [0.0, 0.0, 1.0, 1.0];
+    }
+    let index = cell % (columns * rows).max(1);
+    let column = index % columns;
+    let row = index / columns;
+    [
+        column as f32 / columns as f32,
+        row as f32 / rows as f32,
+        1.0 / columns as f32,
+        1.0 / rows as f32,
+    ]
 }
 
 /// Cap on particles produced by one emitter in one evaluation.
@@ -412,6 +490,17 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             1.0
         };
 
+        // Which frame of the sheet this particle is on. The table is the sequence of cells;
+        // stepping it by age is what makes a smoke puff billow instead of showing every frame
+        // of its animation at once.
+        let cell = if sim.pattern_cells > 1 && !sim.pattern_table.is_empty() {
+            let step = (age / sim.pattern_frequency.max(1.0)) as usize;
+            let entry = sim.pattern_table[step.min(sim.pattern_table.len() - 1)];
+            entry.max(0) as u32 % sim.pattern_cells
+        } else {
+            0
+        };
+
         let curve = sample_scale(&sim.scale_keys, age, life);
         particles.push(SimParticle {
             offset,
@@ -420,6 +509,7 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             size: (curve.x.max(curve.y) * sim.scale.x.max(sim.scale.y)).max(0.01),
             color: [color[0], color[1], color[2], alpha * fade],
             rotation: hashed(seed, id ^ 0x61) * std::f32::consts::TAU,
+            cell,
         });
     }
     particles
@@ -448,6 +538,9 @@ mod tests {
             scale: glam::Vec3::ONE,
             scale_keys: Vec::new(),
             billboard_type: 0,
+            pattern_cells: 0,
+            pattern_table: Vec::new(),
+            pattern_frequency: 1.0,
             color0: Vec::new(),
             alpha0: Vec::new(),
         }
@@ -558,6 +651,85 @@ mod tests {
         ];
         let middle = sample_keys(&keys, 5.0, 10.0, [1.0; 4]);
         assert!((middle[0] - 0.5).abs() < 0.001, "got {middle:?}");
+    }
+
+    /// Every case here is a real texture from the dump with its real cell count. The grid is
+    /// not stored anywhere, so this inference is the whole basis for showing one frame of a
+    /// sheet instead of all of them, and getting it wrong shows a slice of four smoke puffs
+    /// rather than one.
+    #[test]
+    fn sheet_grids_are_inferred_from_real_textures() {
+        // (width, height, cells, expected grid)
+        for (width, height, cells, expected) in [
+            (512, 512, 16, (4, 4)),   // ef_cmn_fire00
+            (128, 128, 16, (4, 4)),   // ef_cmn_bomb_indirect00
+            (1024, 1024, 12, (4, 4)), // ef_cmn_fireimpact00 — 12 frames in a 16-cell sheet
+            (256, 768, 8, (2, 6)),    // ef_cmn_fireimpact04 — non-square texture
+            (256, 128, 5, (4, 2)),    // ef_cmn_impact11
+            (128, 128, 5, (4, 4)),    // ef_cmn_wind00
+            (256, 256, 6, (4, 4)),    // ef_cmn_impact05_ani
+        ] {
+            let grid = sheet_grid(width, height, cells);
+            assert_eq!(
+                grid, expected,
+                "{width}x{height} with {cells} cells gave {grid:?}"
+            );
+            let (columns, rows) = grid;
+            assert!(
+                columns * rows >= cells,
+                "{width}x{height}: grid {grid:?} cannot hold {cells} cells"
+            );
+            // Square cells is the property the inference rests on.
+            let cell_w = width as f32 / columns as f32;
+            let cell_h = height as f32 / rows as f32;
+            assert!(
+                (cell_w - cell_h).abs() < 0.51,
+                "{width}x{height} grid {grid:?} gives non-square cells {cell_w}x{cell_h}"
+            );
+        }
+
+        // A single-cell texture is used whole rather than divided.
+        assert_eq!(sheet_grid(256, 128, 0), (1, 1));
+        assert_eq!(sheet_grid(256, 128, 1), (1, 1));
+        assert_eq!(cell_uv(0, 1, 1), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_cell_maps_to_its_own_corner_of_the_sheet() {
+        // 4x4: cell 0 top-left, cell 5 is column 1 row 1.
+        assert_eq!(cell_uv(0, 4, 4), [0.0, 0.0, 0.25, 0.25]);
+        assert_eq!(cell_uv(5, 4, 4), [0.25, 0.25, 0.25, 0.25]);
+        // Out of range wraps rather than sampling outside the sheet.
+        assert_eq!(cell_uv(16, 4, 4), cell_uv(0, 4, 4));
+    }
+
+    /// A particle on a sheet must advance through its frames as it ages. Showing cell 0 for
+    /// the whole life is the same visual bug as showing the whole sheet, just subtler.
+    #[test]
+    fn a_particle_walks_the_pattern_table_as_it_ages() {
+        let mut sim = emitter();
+        sim.rate = 1.0;
+        sim.life = 8.0;
+        sim.pattern_cells = 16;
+        sim.pattern_frequency = 1.0;
+        sim.pattern_table = vec![0, 1, 2, 3, 4, 5, 6, 7];
+
+        // The oldest particle at each moment is the one born at t=0, so its cell tracks age.
+        let cell_at = |age: f32| {
+            evaluate(&sim, age, 5)
+                .into_iter()
+                .map(|particle| particle.cell)
+                .max()
+                .unwrap_or(0)
+        };
+        assert_eq!(cell_at(0.0), 0);
+        assert!(cell_at(3.0) > cell_at(1.0), "the sheet never advanced");
+        // Past the end of the table it holds the last frame rather than wrapping to the start.
+        assert_eq!(cell_at(20.0), cell_at(7.0));
+
+        // No pattern means cell 0 throughout, not a walk through a table that isn't there.
+        sim.pattern_cells = 0;
+        assert!(evaluate(&sim, 5.0, 5).iter().all(|p| p.cell == 0));
     }
 
     #[test]
