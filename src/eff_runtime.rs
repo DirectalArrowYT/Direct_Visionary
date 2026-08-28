@@ -512,10 +512,29 @@ pub struct QuadPlanes {
 
 impl Default for QuadPlanes {
     fn default() -> Self {
-        // Everything oriented starts in local XY; type 0 stays camera-facing.
+        // Dialled in against the game, per type, rather than derived -- the file records a
+        // billboard type and says nothing about what it means, so these came from putting the
+        // effect on screen next to what Smash draws.
+        //
+        // Type 0 is the interesting one. A camera-facing quad ignores orientation for its
+        // PLANE, so its turn cannot be fixing how the quad faces: it can only be fixing where
+        // the particles fly, since the same orientation rotates each particle's offset from the
+        // emitter. That is a second, independent frame correction living in the same field, and
+        // worth separating if a type ever needs different values for the two.
+        //
+        //   0  camera facing   X 90, Y 90   (particle motion frame)
+        //   3  local XY        Z 90         SYS_ATTACK_ARC
+        //   5  local XY        X 90         MIIGUNNER_ATK_SHOT_S, RIDLEY_SMASH_BOMB
+        //
+        // 1, 4, 6 and 7 are untouched: no effect using them has been checked against the game,
+        // and a guessed default is worse than an obvious one because it looks deliberate.
+        let mut offsets = [[0.0f32; 3]; 8];
+        offsets[0] = [90.0, 90.0, 0.0];
+        offsets[3] = [0.0, 0.0, 90.0];
+        offsets[5] = [90.0, 0.0, 0.0];
         Self {
             planes: [0, 1, 1, 1, 1, 1, 1, 1],
-            offsets: [[0.0; 3]; 8],
+            offsets,
         }
     }
 }
@@ -2338,7 +2357,13 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
     /// The per-type turn must apply in the units it is labelled with, and only to its own type.
     #[test]
     fn the_per_type_turn_is_in_degrees_and_type_scoped() {
-        let mut planes = QuadPlanes::default();
+        // Explicitly zeroed rather than Default: this covers the mechanism, and the shipped
+        // defaults are checked by their own test. Starting from Default would make this fail
+        // every time a type is dialled in against the game.
+        let mut planes = QuadPlanes {
+            planes: [0; 8],
+            offsets: [[0.0; 3]; 8],
+        };
         assert_eq!(planes.offset_for(5), glam::Quat::IDENTITY);
 
         planes.offsets[5] = [0.0, 90.0, 0.0];
@@ -2358,6 +2383,33 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
             .angle_between(glam::Vec3::X)
             .to_degrees();
         assert!(nudge < 1.5, "one degree of turn moved {nudge} degrees");
+    }
+
+    /// The dialled-in orientation defaults. These came from comparing the viewport against the
+    /// game rather than from anything in the file, so nothing derives them and nothing else
+    /// would notice them silently changing.
+    #[test]
+    fn the_orientation_defaults_are_the_ones_measured_against_the_game() {
+        let planes = QuadPlanes::default();
+
+        // Type 0 faces the camera; its turn corrects particle motion, not the quad.
+        assert_eq!(planes.plane_for(0), 0);
+        assert_eq!(planes.offsets[0], [90.0, 90.0, 0.0]);
+
+        // SYS_ATTACK_ARC and MIIGUNNER_ATK_SHOT_S both sit in the effect's local XY plane and
+        // differ only in the turn they need.
+        assert_eq!(planes.plane_for(3), 1);
+        assert_eq!(planes.offsets[3], [0.0, 0.0, 90.0]);
+        assert_eq!(planes.plane_for(5), 1);
+        assert_eq!(planes.offsets[5], [90.0, 0.0, 0.0]);
+
+        // Unverified types carry no turn. A guessed default is worse than an obvious one.
+        for kind in [1, 4, 6, 7] {
+            assert_eq!(
+                planes.offsets[kind], [0.0; 3],
+                "type {kind} has an unverified turn baked in"
+            );
+        }
     }
 
     /// Why the smoke effects still read as squares.
