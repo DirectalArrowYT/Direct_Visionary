@@ -437,6 +437,13 @@ pub struct LiveEffect {
     /// effects off the joint constantly -- a hit flash at the end of a sword, smoke under a
     /// foot -- so dropping it puts every effect exactly on the joint instead.
     pub offset: glam::Vec3,
+    /// The call's own Euler rotation, radians, in the editor's X/Y/Z order.
+    ///
+    /// This is how a script aims an effect: the same explosion is spawned pointing along the
+    /// punch, up off the ground, or back over the shoulder purely by this argument. Dropping it
+    /// leaves every effect at whatever angle its emitter happens to carry, which for most is
+    /// none at all.
+    pub rotation: glam::Vec3,
 }
 
 /// Put a decoded effect texture into one form the shader can treat uniformly.
@@ -521,7 +528,16 @@ pub fn build_particle_batches(
     let mut decoded: std::collections::HashSet<TextureKey> = std::collections::HashSet::new();
     let slots = crate::eff_sim::Slots::new();
 
-    for LiveEffect { name, bone, tint, alpha, age, offset: call_offset } in live {
+    for LiveEffect {
+        name,
+        bone,
+        tint,
+        alpha,
+        age,
+        offset: call_offset,
+        rotation: call_rotation,
+    } in live
+    {
         let Ok(resolved) = resolver.resolve(name) else {
             continue;
         };
@@ -601,10 +617,23 @@ pub fn build_particle_batches(
                     sim.rotation.y,
                     sim.rotation.z,
                 );
-                let orientation = bone_rotation * emitter_rotation;
+                // Bone, then the call's aim, then the emitter's own. Order matters: the call
+                // rotates the whole effect in the bone's frame, and the emitter is a further
+                // turn inside that.
+                let call_turn = glam::Quat::from_euler(
+                    glam::EulerRot::XYZ,
+                    call_rotation.x,
+                    call_rotation.y,
+                    call_rotation.z,
+                );
+                let orientation = bone_rotation * call_turn * emitter_rotation;
                 // The ACMD call's own offset is in the effect's local frame, as is the
                 // emitter's; both ride through the bone's rotation to reach world space.
-                let origin = matrix.transform_point3(*call_offset + sim.translation);
+                // The emitter's own offset is inside the effect's rotated frame; the call's is
+                // in the bone's. Rotating both, or neither, puts multi-emitter effects in the
+                // wrong shape as soon as a script aims one.
+                let origin =
+                    matrix.transform_point3(*call_offset + call_turn * sim.translation);
                 let seed = (part.set_idx as u64) << 32 ^ (emitter_index as u64) << 8 ^ index as u64;
                 let particle_age = age - part.start_frame as f32;
                 if particle_age < 0.0 {
@@ -941,6 +970,7 @@ mod tests {
             alpha: 1.0,
             age: 4.0,
             offset: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
         }];
         let (effects, _) =
             build_particle_batches(
@@ -1016,6 +1046,7 @@ mod tests {
             alpha: 1.0,
             age: 4.0,
             offset: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
         }];
         let (none_effects, _) =
             build_particle_batches(
@@ -1747,6 +1778,7 @@ mod tests {
             alpha: 1.0,
             age: 4.0,
             offset: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver,
@@ -1884,6 +1916,7 @@ EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,             
             alpha: 1.0,
             age: 3.0,
             offset: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, &bones, &live,
@@ -2110,6 +2143,65 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
                 }
             }
         }
+    }
+
+    /// A script's aim must reach the particles. This is how an effect points along a punch
+    /// rather than sitting at whatever angle its emitter happens to carry.
+    #[test]
+    fn the_calls_own_rotation_aims_the_effect() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(EffectResolver::common_eff_path(&root)));
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+
+        // A bone with no rotation of its own, so anything that moves is the call's doing.
+        let mut bones = std::collections::HashMap::new();
+        bones.insert("Top".to_string(), glam::Mat4::IDENTITY);
+
+        let mut sample = |rotation: glam::Vec3, meshes: &mut crate::eff_mesh::MeshLibrary| {
+            let live = vec![LiveEffect {
+                name: "SYS_ATTACK_ARC".into(),
+                bone: "top".into(),
+                tint: [1.0, 1.0, 1.0],
+                alpha: 1.0,
+                age: 2.0,
+                offset: glam::Vec3::ZERO,
+                rotation,
+            }];
+            let (effects, _) = build_particle_batches(
+                &mut resolver, &|_| false, &|_| false, &|_| false, meshes, &bones, &live,
+            );
+            effects
+                .batches
+                .iter()
+                .flat_map(|b| b.instances.iter())
+                .chain(effects.mesh_batches.iter().flat_map(|b| b.instances.iter()))
+                .map(|i| glam::Quat::from_array(i.orientation))
+                .next()
+        };
+
+        let unaimed = sample(glam::Vec3::ZERO, &mut meshes).expect("arc places particles");
+        let aimed = sample(
+            glam::Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2),
+            &mut meshes,
+        )
+        .expect("arc places particles when aimed");
+
+        // Quarter turn about Z: the quad's own right axis must swing to point up.
+        let right_before = unaimed * glam::Vec3::X;
+        let right_after = aimed * glam::Vec3::X;
+        let swing = right_before.angle_between(right_after).to_degrees();
+        println!(
+            "
+SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degrees)"
+        );
+        assert!(
+            swing > 80.0,
+            "a 90 degree aim moved the effect by only {swing:.1} degrees — the call's rotation              is not reaching the particles"
+        );
     }
 
     /// Why the smoke effects still read as squares.

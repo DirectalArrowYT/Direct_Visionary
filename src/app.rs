@@ -3647,6 +3647,9 @@ impl VisionaryApp {
                 // Scripts place effects off the joint constantly -- a flash at a sword tip,
                 // smoke under a foot -- so this is not usually zero.
                 offset: glam::Vec3::from(call.offset),
+                // How the script aims the effect. The same explosion points along the punch or
+                // up off the ground purely by this.
+                rotation: glam::Vec3::from(call.rotation),
             })
             .collect()
     }
