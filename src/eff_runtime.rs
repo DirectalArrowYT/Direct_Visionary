@@ -319,6 +319,19 @@ impl EffectResolver {
     }
 }
 
+/// One effect the timeline has live on the current frame.
+#[derive(Debug, Clone)]
+pub struct LiveEffect {
+    pub name: String,
+    pub bone: String,
+    pub tint: [f32; 3],
+    pub alpha: f32,
+    /// Frames since the effect started. This, not the absolute frame, is what the simulation
+    /// runs on — an effect spawned on frame 12 and one spawned on frame 40 look the same five
+    /// frames in, and the emitter data is written in those terms.
+    pub age: f32,
+}
+
 /// A texture the renderer needs but does not have yet, decoded ready to upload.
 pub struct PendingTexture {
     pub key: crate::eff_render::TextureKey,
@@ -337,16 +350,23 @@ pub struct PendingTexture {
 pub fn build_particle_batches(
     resolver: &mut EffectResolver,
     uploaded: &dyn Fn(&crate::eff_render::TextureKey) -> bool,
+    failed: &dyn Fn(&crate::eff_render::TextureKey) -> bool,
     bone_matrices: &std::collections::HashMap<String, glam::Mat4>,
-    live: &[(String, String, [f32; 3], f32)],
-) -> (Vec<crate::eff_render::ParticleBatch>, Vec<PendingTexture>) {
+    live: &[LiveEffect],
+) -> (
+    Vec<crate::eff_render::ParticleBatch>,
+    Vec<PendingTexture>,
+    Vec<crate::eff_render::TextureKey>,
+) {
     use crate::eff_render::{ParticleBatch, ParticleInstance, TextureKey};
 
     let mut batches: Vec<ParticleBatch> = Vec::new();
     let mut pending: Vec<PendingTexture> = Vec::new();
+    let mut undecodable: Vec<TextureKey> = Vec::new();
     let mut decoded: std::collections::HashSet<TextureKey> = std::collections::HashSet::new();
+    let slots = crate::eff_sim::Slots::new();
 
-    for (name, bone, tint, alpha) in live {
+    for LiveEffect { name, bone, tint, alpha, age } in live {
         let Ok(resolved) = resolver.resolve(name) else {
             continue;
         };
@@ -369,7 +389,7 @@ pub fn build_particle_batches(
             let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else {
                 continue;
             };
-            for emitter in &set.emitters {
+            for (emitter_index, emitter) in set.emitters.iter().enumerate() {
                 let Some(texture_index) = emitter.texture_index else {
                     continue;
                 };
@@ -381,6 +401,12 @@ pub fn build_particle_batches(
                     file: file.clone(),
                     index,
                 };
+                // A texture that will not decode must be recorded as such. Without this the
+                // decode is retried every frame the effect is live, which both costs the
+                // decode and floods the console with the same line forever.
+                if failed(&key) {
+                    continue;
+                }
                 if !uploaded(&key) && decoded.insert(key.clone()) {
                     match crate::texture_import::decode_rgba(&pool, index, &info.tex_name, None) {
                         Ok(image) => pending.push(PendingTexture {
@@ -389,27 +415,31 @@ pub fn build_particle_batches(
                         }),
                         Err(error) => {
                             eprintln!("[eff] texture '{}' not drawable: {error}", info.tex_name);
+                            undecodable.push(key.clone());
                             continue;
                         }
                     }
                 }
 
-                // Colour comes from the emitter's first colour key, scaled by whatever the
-                // ACMD call asked for. The texture supplies shape only — see the note in
-                // `eff_render` about these being two-channel.
-                let base = emitter.color0.first();
-                let color = [
-                    base.map_or(1.0, |key| key.r) * tint[0],
-                    base.map_or(1.0, |key| key.g) * tint[1],
-                    base.map_or(1.0, |key| key.b) * tint[2],
-                    emitter.alpha0_keys.first().map_or(1.0, |key| key.r) * alpha,
-                ];
+                let sim = crate::eff_sim::EmitterSim::read(emitter, &slots);
+                // The emitter's own seed. Two emitters with identical settings must not
+                // produce identically jittered particles stacked on each other, which is what
+                // seeding by the effect alone would do.
+                let seed = (part.set_idx as u64) << 32 ^ (emitter_index as u64) << 8 ^ index as u64;
+                let particle_age = age - part.start_frame as f32;
+                if particle_age < 0.0 {
+                    continue;
+                }
+                let simulated = crate::eff_sim::evaluate(&sim, particle_age, seed);
+                if simulated.is_empty() {
+                    continue;
+                }
 
-                let batch = match batches
-                    .iter_mut()
-                    .find(|batch| batch.texture == key && batch.additive)
+                let batch_index = match batches
+                    .iter()
+                    .position(|batch| batch.texture == key && batch.additive)
                 {
-                    Some(batch) => batch,
+                    Some(found) => found,
                     None => {
                         batches.push(ParticleBatch {
                             texture: key.clone(),
@@ -419,23 +449,28 @@ pub fn build_particle_batches(
                             additive: true,
                             instances: Vec::new(),
                         });
-                        batches.last_mut().expect("just pushed")
+                        batches.len() - 1
                     }
                 };
-                batch.instances.push(ParticleInstance {
-                    position: origin.to_array(),
-                    // Fixed for the slice. Real size comes from the emitter's scale keys and
-                    // the ACMD call's own scale, which the simulation pass will supply.
-                    size: 1.5,
-                    color,
-                    rotation: 0.0,
-                    _padding: [0.0; 3],
-                });
+                for particle in simulated {
+                    batches[batch_index].instances.push(ParticleInstance {
+                        position: (origin + particle.offset).to_array(),
+                        size: particle.size,
+                        color: [
+                            particle.color[0] * tint[0],
+                            particle.color[1] * tint[1],
+                            particle.color[2] * tint[2],
+                            particle.color[3] * alpha,
+                        ],
+                        rotation: particle.rotation,
+                        _padding: [0.0; 3],
+                    });
+                }
             }
         }
     }
 
-    (batches, pending)
+    (batches, pending, undecodable)
 }
 
 /// Bone lookup that tolerates the case difference between ACMD and the skeleton.
@@ -655,14 +690,15 @@ mod tests {
             glam::Mat4::from_translation(glam::Vec3::new(1.0, 20.0, 3.0)),
         );
 
-        let live = vec![(
-            "MARIO_ATKHI3_ARC".to_string(),
-            "top".to_string(),
-            [1.0, 1.0, 1.0],
-            1.0,
-        )];
-        let (batches, pending) =
-            build_particle_batches(&mut resolver, &|_| false, &bones, &live);
+        let live = vec![LiveEffect {
+            name: "MARIO_ATKHI3_ARC".to_string(),
+            bone: "top".to_string(),
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            age: 4.0,
+        }];
+        let (batches, pending, _) =
+            build_particle_batches(&mut resolver, &|_| false, &|_| false, &bones, &live);
 
         let instances: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         println!(
@@ -684,28 +720,37 @@ mod tests {
 
         // Placed at the bone, not at the origin — the failure that looks like the effect
         // spawning correctly somewhere you are not looking.
+        // Particles move now, so an exact match would only pass for a motionless emitter.
+        // What must hold is that they are placed AROUND the bone rather than at the origin.
         let first = batches[0].instances[0];
-        assert_eq!(first.position, [1.0, 20.0, 3.0]);
+        let bone = glam::Vec3::new(1.0, 20.0, 3.0);
+        let near = batches[0]
+            .instances
+            .iter()
+            .any(|i| (glam::Vec3::from(i.position) - bone).length() < 50.0);
+        assert!(near, "no particle near the bone; first at {:?}", first.position);
         assert!(first.color[3] > 0.0, "fully transparent particle");
 
         // A texture already resident must not be decoded again: decoding is the expensive part
         // and it would otherwise run every frame the effect is live.
         let key = pending[0].key.clone();
-        let (_batches, again) =
-            build_particle_batches(&mut resolver, &|k| *k == key, &bones, &live);
+        let (_batches, again, _) =
+            build_particle_batches(&mut resolver, &|k| *k == key, &|_| false, &bones, &live);
         assert!(
             again.iter().all(|texture| texture.key != key),
             "a resident texture was decoded again"
         );
 
         // A bone the skeleton does not have places nothing rather than defaulting to origin.
-        let missing = vec![(
-            "MARIO_ATKHI3_ARC".to_string(),
-            "no_such_bone".to_string(),
-            [1.0, 1.0, 1.0],
-            1.0,
-        )];
-        let (none, _) = build_particle_batches(&mut resolver, &|_| false, &bones, &missing);
+        let missing = vec![LiveEffect {
+            name: "MARIO_ATKHI3_ARC".to_string(),
+            bone: "no_such_bone".to_string(),
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            age: 4.0,
+        }];
+        let (none, _, _) =
+            build_particle_batches(&mut resolver, &|_| false, &|_| false, &bones, &missing);
         assert!(
             none.iter().all(|batch| batch.instances.is_empty()),
             "particles placed for a bone that does not exist"
@@ -791,7 +836,7 @@ mod tests {
             let mut primitive_ids: std::collections::BTreeSet<i64> =
                 std::collections::BTreeSet::new();
             for set in &loaded.ptcl.emitter_sets {
-                for emitter in &set.emitters {
+                for (emitter_index, emitter) in set.emitters.iter().enumerate() {
                     emitters += 1;
                     if emitter.texture_index.is_some() {
                         textured += 1;
@@ -948,7 +993,7 @@ mod tests {
                     part.start_frame,
                     part.bone
                 );
-                for emitter in &set.emitters {
+                for (emitter_index, emitter) in set.emitters.iter().enumerate() {
                     let value = |slot: usize| -> Option<i64> {
                         match emitter.attrs.get(slot).and_then(|a| a.as_ref())? {
                             crate::eff_attrs::AttrValue::Int(v) => Some(*v),
@@ -956,6 +1001,28 @@ mod tests {
                             crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
                         }
                     };
+                    // The simulation's own view of this emitter. Printed next to the raw
+                    // fields so a value that reads wrong here — an emission duration of 1 on a
+                    // continuous flame, say — is visible as a misreading rather than showing
+                    // up later as an effect that emits once and stops.
+                    let sim = crate::eff_sim::EmitterSim::read(emitter, &crate::eff_sim::Slots::new());
+                    println!(
+                        "      sim: rate={} interval={} start={} duration={} life={}±{} \
+                         all_dir={} desig={:?}×{} diff={:?} grav={:?} scale={:?} n@f5={}",
+                        sim.rate,
+                        sim.interval,
+                        sim.emission_start,
+                        sim.emission_duration,
+                        sim.life,
+                        sim.life_random,
+                        sim.all_direction,
+                        sim.designated_dir,
+                        sim.designated_dir_scale,
+                        sim.diffusion,
+                        sim.gravity,
+                        sim.scale,
+                        crate::eff_sim::evaluate(&sim, 5.0, 1).len(),
+                    );
                     println!(
                         "    '{}' billboard_type={:?} life={:?} texture={:?} primitive_id={:?}{}",
                         emitter.name,

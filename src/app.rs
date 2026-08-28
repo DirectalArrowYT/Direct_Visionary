@@ -2613,6 +2613,9 @@ pub struct VisionaryApp {
     /// Loads and caches `.eff` files for the viewport's effect preview, and resolves the names
     /// ACMD spawns against the fighter's own file and `ef_common`.
     effect_resolver: crate::eff_runtime::EffectResolver,
+    /// Effect textures whose format Visionary cannot decode. Remembered so the failure is
+    /// reported once rather than retried on every frame the effect is on screen.
+    undecodable_textures: std::collections::HashSet<crate::eff_render::TextureKey>,
     /// The last **Sync Edits Into Source** result, while its report window is open.
     ///
     /// Sync refuses far more than it writes — every structural edit is reported rather than
@@ -3003,6 +3006,7 @@ impl VisionaryApp {
             extra_roots: saved_mod_roots,
             selected_costume_slot: 0,
             effect_resolver: crate::eff_runtime::EffectResolver::default(),
+            undecodable_textures: std::collections::HashSet::new(),
             sync_report: None,
             forgotten_fighters: load_forgotten_fighters(),
             current_eff_path: None,
@@ -3621,7 +3625,7 @@ impl VisionaryApp {
     /// `EFFECT_OFF_KIND` that closes it, which is what `active_end` already encodes. Disabled
     /// calls and the `null` placeholder are skipped — the placeholder exists precisely because
     /// the script spawns nothing there, so drawing something would invent a graphic.
-    fn live_effect_spawns(&self) -> Vec<(String, String, [f32; 3], f32)> {
+    fn live_effect_spawns(&self) -> Vec<crate::eff_runtime::LiveEffect> {
         let frame = self.state.current_frame;
         self.state
             .effects
@@ -3629,13 +3633,14 @@ impl VisionaryApp {
             .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
             .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
             .filter(|call| frame >= call.active_start && frame <= call.active_end)
-            .map(|call| {
-                (
-                    call.effect_name.clone(),
-                    call.bone_name.clone(),
-                    call.tint.unwrap_or([1.0, 1.0, 1.0]),
-                    call.alpha.unwrap_or(1.0),
-                )
+            .map(|call| crate::eff_runtime::LiveEffect {
+                name: call.effect_name.clone(),
+                bone: call.bone_name.clone(),
+                tint: call.tint.unwrap_or([1.0, 1.0, 1.0]),
+                alpha: call.alpha.unwrap_or(1.0),
+                // Age since this call fired, which is what the emitter data is written in
+                // terms of.
+                age: frame.saturating_sub(call.active_start) as f32,
             })
             .collect()
     }
@@ -31302,6 +31307,7 @@ impl eframe::App for VisionaryApp {
                 // which effects the timeline has live. It reads the same bone matrices the
                 // hitbox overlay does, at the same requested frame, so particles and hitboxes
                 // cannot disagree about where a bone is.
+                let mut newly_undecodable: Vec<crate::eff_render::TextureKey> = Vec::new();
                 let (particle_batches, pending_textures) = {
                     let live = self.live_effect_spawns();
                     if live.is_empty() {
@@ -31316,12 +31322,20 @@ impl eframe::App for VisionaryApp {
                                         .as_ref()
                                         .is_some_and(|particles| particles.has_texture(key))
                                 };
-                                let (batches, pending) = crate::eff_runtime::build_particle_batches(
-                                    &mut self.effect_resolver,
-                                    &resident,
-                                    &bones,
-                                    &live,
-                                );
+                                let failed_before = self.undecodable_textures.clone();
+                                let was_failed =
+                                    move |key: &crate::eff_render::TextureKey| {
+                                        failed_before.contains(key)
+                                    };
+                                let (batches, pending, undecodable) =
+                                    crate::eff_runtime::build_particle_batches(
+                                        &mut self.effect_resolver,
+                                        &resident,
+                                        &was_failed,
+                                        &bones,
+                                        &live,
+                                    );
+                                newly_undecodable = undecodable;
                                 (
                                     batches,
                                     pending
@@ -31336,6 +31350,10 @@ impl eframe::App for VisionaryApp {
                         (Vec::new(), Vec::new())
                     }
                 };
+
+                // Remember textures that would not decode, so the attempt is not repeated
+                // every frame for the whole time the effect is live.
+                self.undecodable_textures.extend(newly_undecodable);
 
                 let callback = egui_wgpu::Callback::new_paint_callback(
                     rect,
