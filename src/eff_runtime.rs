@@ -437,7 +437,12 @@ pub struct LiveEffect {
     /// effects off the joint constantly -- a hit flash at the end of a sword, smoke under a
     /// foot -- so dropping it puts every effect exactly on the joint instead.
     pub offset: glam::Vec3,
-    /// The call's own Euler rotation, radians, in the editor's X/Y/Z order.
+    /// The call's own Euler rotation in DEGREES, in the editor's X/Y/Z order.
+    ///
+    /// Degrees, not radians, and the distinction is not cosmetic: the emitter's own rotation in
+    /// the eff file IS radians (a quarter turn reads as 1.5707964), while an ACMD spawn's
+    /// rotation arguments are degrees and go to the script unconverted. Feeding both to the
+    /// same euler constructor made one degree of aim come out as fifty-seven.
     ///
     /// This is how a script aims an effect: the same explosion is spawned pointing along the
     /// punch, up off the ground, or back over the shoulder purely by this argument. Dropping it
@@ -648,9 +653,9 @@ pub fn build_particle_batches(
                 // turn inside that.
                 let call_turn = glam::Quat::from_euler(
                     glam::EulerRot::XYZ,
-                    call_rotation.x,
-                    call_rotation.y,
-                    call_rotation.z,
+                    call_rotation.x.to_radians(),
+                    call_rotation.y.to_radians(),
+                    call_rotation.z.to_radians(),
                 );
                 let orientation = bone_rotation * call_turn * emitter_rotation;
                 // The ACMD call's own offset is in the effect's local frame, as is the
@@ -2211,11 +2216,10 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
         };
 
         let unaimed = sample(glam::Vec3::ZERO, &mut meshes).expect("arc places particles");
-        let aimed = sample(
-            glam::Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2),
-            &mut meshes,
-        )
-        .expect("arc places particles when aimed");
+        // Degrees. An ACMD spawn's rotation arguments are degrees and reach here unconverted;
+        // passing radians made one degree of aim come out as fifty-seven.
+        let aimed = sample(glam::Vec3::new(0.0, 0.0, 90.0), &mut meshes)
+            .expect("arc places particles when aimed");
 
         // Quarter turn about Z: the quad's own right axis must swing to point up.
         let right_before = unaimed * glam::Vec3::X;
@@ -2228,6 +2232,18 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         assert!(
             swing > 80.0,
             "a 90 degree aim moved the effect by only {swing:.1} degrees — the call's rotation              is not reaching the particles"
+        );
+
+        // And the units must be degrees. One degree of aim is one degree of movement; treating
+        // it as radians turns it into fifty-seven, which is what made a 1 look like a 90.
+        let nudged = sample(glam::Vec3::new(0.0, 1.0, 0.0), &mut meshes).expect("places");
+        let nudge = (unaimed * glam::Vec3::X)
+            .angle_between(nudged * glam::Vec3::X)
+            .to_degrees();
+        println!("  a 1 degree aim moves the effect {nudge:.2} degrees");
+        assert!(
+            nudge < 3.0,
+            "one degree of aim moved the effect {nudge:.1} degrees — the call's rotation is              being read as radians"
         );
     }
 
