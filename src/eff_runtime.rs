@@ -74,6 +74,9 @@ pub enum ResolveFailure {
 #[derive(Default)]
 pub struct EffectResolver {
     files: HashMap<PathBuf, Option<LoadedEffect>>,
+    /// Primitive descriptor ids per file, so "does this emitter draw a mesh" does not reparse
+    /// a 33 MB eff for every emitter of every effect on every frame.
+    descriptors: HashMap<PathBuf, std::collections::HashSet<u64>>,
     /// Search order: the fighter's own file first, then common. Held as a list so the order is
     /// explicit rather than implied by two named fields.
     search: Vec<(EffectSource, PathBuf)>,
@@ -209,9 +212,38 @@ impl EffectResolver {
         self.file(path)
     }
 
+    /// Primitive descriptor ids held by one `.eff`, cached alongside the file.
+    ///
+    /// An emitter's `primitive_id` is a name hash matched against these; an id with no
+    /// descriptor in its own file draws nothing, which is how a leftover id on a file with no
+    /// primitives at all is told apart from a real mesh reference.
+    pub fn descriptor_ids(&mut self, path: &Path) -> std::collections::HashSet<u64> {
+        if let Some(cached) = self.descriptors.get(path) {
+            return cached.clone();
+        }
+        let ids = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| effect_library::NamcoEffectFile::load(&bytes).ok())
+            .and_then(|raw| {
+                raw.ptcl_file
+                    .as_ref()
+                    .and_then(|ptcl| ptcl.primitive_info.as_ref())
+                    .map(|info| {
+                        info.descriptors
+                            .iter()
+                            .map(|d| d.id)
+                            .collect::<std::collections::HashSet<u64>>()
+                    })
+            })
+            .unwrap_or_default();
+        self.descriptors.insert(path.to_path_buf(), ids.clone());
+        ids
+    }
+
     /// Drop every cached file. Used when the data root changes underneath the session.
     pub fn clear(&mut self) {
         self.files.clear();
+        self.descriptors.clear();
     }
 }
 
@@ -258,9 +290,9 @@ pub struct EffectSummary {
     /// Emitters that sample a texture. Anything less than `emitters` means part of the effect
     /// draws untextured.
     pub textured: usize,
-    /// Emitters whose `primitive_id` points at a primitive this file actually holds. Almost
-    /// always zero: the id is populated on nearly every emitter as a name hash, and only means
-    /// something when the file carries a primitive pool to resolve it against.
+    /// Emitters whose `primitive_id` resolves to a primitive descriptor in this file — that
+    /// is, ones drawing geometry rather than a quad. Around half of them, measured across
+    /// ef_edge, ef_mario and ef_common, so this is the common case rather than an exception.
     pub mesh_emitters: usize,
     /// Distinct `billboard_type` values across the emitters, ascending. These are orientation
     /// modes — camera-facing, axis-aligned, velocity-aligned — not a mesh/quad switch.
@@ -319,6 +351,12 @@ impl EffectResolver {
             .position(|attr| attr.id == "particle_data.primitive_id");
         let life_slot = table.iter().position(|attr| attr.id == "particle_data.life");
 
+        // Whether an emitter draws geometry is a lookup, not a flag: its `primitive_id` is
+        // matched against the file's primitive descriptors by id. Treating the id as an index,
+        // or reading the raw section list instead of the descriptor table, reports every file
+        // as pure billboards -- which is what this said before, for files where half the
+        // emitters draw a mesh.
+        let descriptors = self.descriptor_ids(&file);
         let Some(loaded) = self.loaded(&file) else {
             return Err(ResolveFailure::NoEmitterSet);
         };
@@ -366,13 +404,17 @@ impl EffectResolver {
                         summary.billboard_types.push(kind);
                     }
                 }
+                if let Some(id) = value(primitive_slot) {
+                    if id != 0 && id != -1 && descriptors.contains(&(id as u64)) {
+                        summary.mesh_emitters += 1;
+                    }
+                }
                 if let Some(life) = value(life_slot) {
                     summary.life_range = Some(match summary.life_range {
                         None => (life, life),
                         Some((low, high)) => (low.min(life), high.max(life)),
                     });
                 }
-                let _ = primitive_slot;
             }
         }
         summary.billboard_types.sort_unstable();
@@ -1134,11 +1176,21 @@ mod tests {
             // otherwise — an untextured count appearing here would mean the texture link is
             // being read wrong.
             assert_eq!(summary.textured, summary.emitters, "{name}");
+            // These three were reported as pure billboards while the mesh count was being
+            // read from the wrong field. Roughly half of all emitters draw geometry, so the
+            // headline has to distinguish them rather than assuming quads.
             assert!(
-                summary.headline().contains("billboards"),
-                "{name}: {}",
-                summary.headline()
+                summary.mesh_emitters <= summary.emitters,
+                "{name}: more meshes than emitters"
             );
+            if summary.mesh_emitters > 0 {
+                assert!(
+                    summary.headline().contains("mesh"),
+                    "{name} has {} mesh emitter(s) but the headline hides them: {}",
+                    summary.mesh_emitters,
+                    summary.headline()
+                );
+            }
             assert!(summary.life_range.is_some(), "{name} has no lifetimes");
         }
 
@@ -1338,6 +1390,74 @@ mod tests {
             .filter(|name| without.resolve(name).is_ok())
             .count();
         println!("  without donors, {still} of 2 still resolve");
+    }
+
+    /// How many emitters really draw geometry, counted through the right field.
+    ///
+    /// An earlier pass counted `ptcl.primitives`, which is the raw section list, and concluded
+    /// almost nothing used meshes. The pool that matters is `primitive_info.descriptors`, and
+    /// an emitter's `primitive_id` is matched against `descriptor.id` — not used as an index.
+    /// Counting the wrong field made every file look like billboards.
+    #[test]
+    fn how_many_emitters_actually_draw_geometry() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let table = crate::eff_attrs::table();
+        let primitive_slot = table
+            .iter()
+            .position(|attr| attr.id == "particle_data.primitive_id")
+            .unwrap();
+
+        for relative in [
+            "effect/fighter/edge/ef_edge.eff",
+            "effect/fighter/mario/ef_mario.eff",
+            "effect/system/common/ef_common.eff",
+        ] {
+            let path = root.join(relative);
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Ok(raw) = effect_library::NamcoEffectFile::load(&bytes) else { continue };
+            let Ok(loaded) = load_effect(&path) else { continue };
+
+            let info = raw.ptcl_file.as_ref().and_then(|p| p.primitive_info.as_ref());
+            let descriptors = info.map(|i| i.descriptors.as_slice()).unwrap_or(&[]);
+            let blob = info
+                .and_then(|i| i.binary_data.as_ref())
+                .map(|b| b.len())
+                .unwrap_or(0);
+
+            let mut emitters = 0usize;
+            let mut mesh = 0usize;
+            let mut unresolved = 0usize;
+            let mut used: std::collections::BTreeSet<usize> = Default::default();
+            for set in &loaded.ptcl.emitter_sets {
+                for emitter in &set.emitters {
+                    emitters += 1;
+                    let id = match emitter.attrs.get(primitive_slot).and_then(|a| a.as_ref()) {
+                        Some(crate::eff_attrs::AttrValue::UInt(v)) => *v,
+                        Some(crate::eff_attrs::AttrValue::Int(v)) => *v as u64,
+                        _ => continue,
+                    };
+                    match effect_library::bfres::descriptor_index_for_id(descriptors, id) {
+                        Some(index) => {
+                            mesh += 1;
+                            used.insert(index);
+                        }
+                        None if id != 0 && id != u64::MAX => unresolved += 1,
+                        None => {}
+                    }
+                }
+            }
+            println!("\n=== {relative} ===");
+            println!("  primitive descriptors : {}", descriptors.len());
+            println!("  bfres blob            : {blob} bytes");
+            println!(
+                "  emitters              : {emitters}, of which {mesh} draw a primitive \
+                 ({} distinct), {unresolved} name an id this file has no descriptor for",
+                used.len()
+            );
+        }
     }
 
     /// Why the smoke effects still read as squares.
