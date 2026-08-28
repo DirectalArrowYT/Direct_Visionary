@@ -3861,7 +3861,17 @@ impl VisionaryApp {
             .iter()
             .map(|root| crate::eff_runtime::EffectResolver::common_eff_path(root))
             .find(|path| path.exists());
-        self.effect_resolver.set_search_path(eff_path, common);
+        // A moveset mod spawns effects belonging to other fighters and ships their eff files
+        // under `transplant/`. Without these the borrowed effects resolve to nothing, which is
+        // most of what a transplant-heavy moveset puts on screen.
+        let transplants = crate::eff_runtime::EffectResolver::transplant_donors(&roots, &name);
+        if !transplants.is_empty() {
+            println!(
+                "[eff] {name}: {} transplant donor(s) on the search path",
+                transplants.len()
+            );
+        }
+        self.effect_resolver.set_search_path(eff_path, transplants, common);
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
         let labels = self.state.labels.clone();

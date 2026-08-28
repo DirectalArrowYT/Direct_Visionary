@@ -74,6 +74,10 @@ pub struct EmitterSim {
     pub pattern_table: Vec<i32>,
     /// Frames each pattern step lasts.
     pub pattern_frequency: f32,
+    /// Cells the emitter's texture divides into, worked out from the texture's real size. Set
+    /// by the caller, which is the side that knows the texture; the emitter data alone does
+    /// not say.
+    pub sheet_cells: u32,
     pub color0: Vec<ColorKey>,
     pub alpha0: Vec<ColorKey>,
 }
@@ -231,6 +235,7 @@ impl EmitterSim {
             },
             pattern_cells: get(slots.pattern_cells).unwrap_or(0.0).max(0.0) as u32,
             pattern_frequency: get(slots.pattern_frequency).unwrap_or(1.0).max(1.0),
+            sheet_cells: 0,
             pattern_table: slots
                 .pattern_table
                 .iter()
@@ -360,8 +365,28 @@ fn sample_scale(keys: &[(f32, glam::Vec3)], age: f32, life: f32) -> glam::Vec3 {
 /// A grid can hold more cells than the animation uses (12 frames in a 4×4 sheet is common), so
 /// the fit is `columns * rows >= cells`, not equality.
 pub fn sheet_grid(width: u32, height: u32, cells: u32) -> (u32, u32) {
-    if cells <= 1 || width == 0 || height == 0 {
+    if width == 0 || height == 0 {
         return (1, 1);
+    }
+    if cells <= 1 {
+        // No declared cell count. Most emitters that animate a sheet still leave `num` at 0 --
+        // the smoke effects do -- so falling back to "use the whole texture" draws a 256x128
+        // strip squashed onto a square quad, which is the square a foot-dust puff was showing.
+        //
+        // Effect sheet cells are square, so a non-square texture is a strip of them and its
+        // own proportions give the grid. A square texture stays whole: without a cell count
+        // there is nothing to say it is subdivided.
+        let smaller = width.min(height);
+        if smaller == 0 || width % smaller != 0 || height % smaller != 0 {
+            return (1, 1);
+        }
+        let (columns, rows) = (width / smaller, height / smaller);
+        // A strip of more than 16 would mean a very long sheet; more likely the texture is not
+        // a sheet at all and the proportions are a coincidence.
+        if columns * rows > 16 {
+            return (1, 1);
+        }
+        return (columns, rows);
     }
     // Square cells means width/columns == height/rows, so the grid's aspect matches the
     // texture's. Walk column counts and keep the first that fits.
@@ -493,10 +518,17 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
         // Which frame of the sheet this particle is on. The table is the sequence of cells;
         // stepping it by age is what makes a smoke puff billow instead of showing every frame
         // of its animation at once.
+        // Two ways a particle picks its cell. An emitter with a declared cell count animates
+        // through its table as it ages. One without -- the smoke family, which leaves `num` at
+        // 0 -- is picking a variant per particle instead, so every puff in a cloud is not the
+        // same drawing; that one is chosen by the particle's own hash so it stays put while
+        // the playhead moves.
         let cell = if sim.pattern_cells > 1 && !sim.pattern_table.is_empty() {
             let step = (age / sim.pattern_frequency.max(1.0)) as usize;
             let entry = sim.pattern_table[step.min(sim.pattern_table.len() - 1)];
             entry.max(0) as u32 % sim.pattern_cells
+        } else if sim.sheet_cells > 1 {
+            (hashed(seed, id ^ 0x71) * sim.sheet_cells as f32) as u32 % sim.sheet_cells
         } else {
             0
         };
@@ -541,6 +573,7 @@ mod tests {
             pattern_cells: 0,
             pattern_table: Vec::new(),
             pattern_frequency: 1.0,
+            sheet_cells: 0,
             color0: Vec::new(),
             alpha0: Vec::new(),
         }
@@ -688,10 +721,64 @@ mod tests {
             );
         }
 
-        // A single-cell texture is used whole rather than divided.
-        assert_eq!(sheet_grid(256, 128, 0), (1, 1));
-        assert_eq!(sheet_grid(256, 128, 1), (1, 1));
         assert_eq!(cell_uv(0, 1, 1), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Emitters that animate a sheet but leave the cell count at zero — the whole smoke family
+    /// does — must still be divided, or a 256x128 strip is drawn squashed onto a square quad
+    /// and a foot-dust puff reads as a square.
+    #[test]
+    fn an_undeclared_sheet_is_divided_by_the_textures_own_proportions() {
+        // ef_cmn_smoke01 / smoke03: two square frames side by side.
+        assert_eq!(sheet_grid(256, 128, 0), (2, 1));
+        // ef_cmn_smoke04.
+        assert_eq!(sheet_grid(384, 128, 0), (3, 1));
+        // ef_cmn_fireimpact04: a vertical strip.
+        assert_eq!(sheet_grid(256, 768, 0), (1, 3));
+
+        // A square texture with no declared count stays whole — nothing says it is subdivided,
+        // and guessing would slice single images into quarters.
+        assert_eq!(sheet_grid(256, 256, 0), (1, 1));
+        assert_eq!(sheet_grid(133, 133, 0), (1, 1)); // ef_cmn_smoke02
+        // Proportions that do not divide evenly are not a sheet.
+        assert_eq!(sheet_grid(133, 100, 0), (1, 1));
+        // An implausibly long strip is more likely a coincidence than a 32-frame sheet.
+        assert_eq!(sheet_grid(2048, 64, 0), (1, 1));
+
+        // A declared count still wins over the proportions.
+        assert_eq!(sheet_grid(256, 128, 5), (4, 2));
+    }
+
+    /// With no declared pattern, particles pick a cell each rather than all showing the same
+    /// one — a cloud of identical puffs reads as wrong as a squashed one. The choice must be
+    /// stable per particle so scrubbing does not reshuffle the cloud.
+    #[test]
+    fn particles_on_an_undeclared_sheet_vary_and_stay_put() {
+        let mut sim = emitter();
+        sim.rate = 4.0;
+        sim.life = 20.0;
+        sim.pattern_cells = 0;
+        sim.sheet_cells = 2;
+
+        let first = evaluate(&sim, 10.0, 9);
+        let cells: std::collections::BTreeSet<u32> =
+            first.iter().map(|particle| particle.cell).collect();
+        assert!(
+            cells.len() > 1,
+            "every particle picked the same cell: {cells:?}"
+        );
+        assert!(
+            cells.iter().all(|cell| *cell < 2),
+            "cell outside the sheet: {cells:?}"
+        );
+
+        // Same frame again after scrubbing elsewhere: identical assignment.
+        let _ = evaluate(&sim, 3.0, 9);
+        let _ = evaluate(&sim, 40.0, 9);
+        let again = evaluate(&sim, 10.0, 9);
+        let before: Vec<u32> = first.iter().map(|p| p.cell).collect();
+        let after: Vec<u32> = again.iter().map(|p| p.cell).collect();
+        assert_eq!(before, after, "the cloud reshuffled when the playhead moved");
     }
 
     #[test]

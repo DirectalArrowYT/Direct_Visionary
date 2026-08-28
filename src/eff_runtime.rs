@@ -21,6 +21,14 @@ use crate::effects::{load_effect, EffEntryInfo, LoadedEffect};
 pub enum EffectSource {
     /// The selected fighter's own `ef_<fighter>.eff`.
     Fighter,
+    /// A donor file the mod transplants effects from, under
+    /// `effect/fighter/<name>/transplant/<donor>/ef_<donor>.eff`.
+    ///
+    /// A moveset mod routinely spawns effects belonging to a different fighter, and ships that
+    /// fighter's eff alongside so the game can resolve them. Without searching these, every
+    /// borrowed effect resolves to nothing and silently never appears -- which is most of what
+    /// a transplant-heavy moveset spawns.
+    Transplant,
     /// The shared `ef_common.eff`.
     Common,
 }
@@ -76,10 +84,21 @@ impl EffectResolver {
     ///
     /// Either may be absent — a fighter with no `.eff` of its own still spawns common effects,
     /// and a dump without `ef_common` still resolves the fighter's own.
-    pub fn set_search_path(&mut self, fighter_eff: Option<PathBuf>, common_eff: Option<PathBuf>) {
+    pub fn set_search_path(
+        &mut self,
+        fighter_eff: Option<PathBuf>,
+        transplants: Vec<PathBuf>,
+        common_eff: Option<PathBuf>,
+    ) {
+        // Order is the resolution rule: the fighter's own file wins, then anything it
+        // transplanted, then the shared file. A donor and `ef_common` can both define a name,
+        // and the donor is the one the mod meant.
         let mut search = Vec::new();
         if let Some(path) = fighter_eff {
             search.push((EffectSource::Fighter, path));
+        }
+        for path in transplants {
+            search.push((EffectSource::Transplant, path));
         }
         if let Some(path) = common_eff {
             search.push((EffectSource::Common, path));
@@ -87,6 +106,40 @@ impl EffectResolver {
         if search != self.search {
             self.search = search;
         }
+    }
+
+    /// Donor effect files a mod transplants from, for one fighter, across every root.
+    ///
+    /// Layout is ARCropolis's: `effect/fighter/<name>/transplant/<donor>/ef_<donor>.eff`. The
+    /// donor directory name is not assumed to match the file inside it -- the file is whatever
+    /// `.eff` is there -- because the pairing is a mod author's convention rather than a rule.
+    pub fn transplant_donors(roots: &[PathBuf], fighter: &str) -> Vec<PathBuf> {
+        let mut donors = Vec::new();
+        for root in roots {
+            let base = root
+                .join("effect")
+                .join("fighter")
+                .join(fighter)
+                .join("transplant");
+            let Ok(entries) = std::fs::read_dir(&base) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(files) = std::fs::read_dir(entry.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("eff"))
+                        && !donors.contains(&path)
+                    {
+                        donors.push(path);
+                    }
+                }
+            }
+        }
+        donors.sort();
+        donors
     }
 
     /// The conventional location of the shared effect file under a dump root.
@@ -198,6 +251,8 @@ fn parts_of(entry: &EffEntryInfo) -> Vec<ResolvedPart> {
 #[derive(Debug, Clone)]
 pub struct EffectSummary {
     pub source: EffectSource,
+    /// File stem the effect resolved from, so a transplant can name its donor.
+    pub donor: String,
     pub set_names: Vec<String>,
     pub emitters: usize,
     /// Emitters that sample a texture. Anything less than `emitters` means part of the effect
@@ -219,8 +274,9 @@ impl EffectSummary {
     /// what explains a viewport showing 26 quads where the game shows a continuous stream.
     pub fn headline(&self) -> String {
         let where_from = match self.source {
-            EffectSource::Fighter => "fighter eff",
-            EffectSource::Common => "ef_common",
+            EffectSource::Fighter => "fighter eff".to_string(),
+            EffectSource::Transplant => format!("transplant: {}", self.donor),
+            EffectSource::Common => "ef_common".to_string(),
         };
         let kind = if self.mesh_emitters > 0 {
             format!("{} mesh + {} billboard", self.mesh_emitters, self.emitters - self.mesh_emitters)
@@ -250,6 +306,10 @@ impl EffectResolver {
         let resolved = self.resolve(name)?;
         let source = resolved.source;
         let file = resolved.file.clone();
+        let donor = file
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().to_string())
+            .unwrap_or_default();
         let table = crate::eff_attrs::table();
         let billboard_slot = table
             .iter()
@@ -275,6 +335,7 @@ impl EffectResolver {
 
         let mut summary = EffectSummary {
             source,
+            donor,
             set_names: Vec::new(),
             emitters: 0,
             textured: 0,
@@ -427,6 +488,9 @@ pub fn build_particle_batches(
                 // are in hand, and the simulation only says which cell.
                 let (columns, rows) =
                     crate::eff_sim::sheet_grid(info.width, info.height, sim.pattern_cells);
+                let mut sim = sim;
+                sim.sheet_cells = columns * rows;
+                let sim = sim;
                 // The emitter's own seed. Two emitters with identical settings must not
                 // produce identically jittered particles stacked on each other, which is what
                 // seeding by the effect alone would do.
@@ -612,7 +676,7 @@ mod tests {
         let common = EffectResolver::common_eff_path(&root);
 
         let mut resolver = EffectResolver::default();
-        resolver.set_search_path(Some(fighter.clone()), Some(common.clone()));
+        resolver.set_search_path(Some(fighter.clone()), Vec::new(), Some(common.clone()));
 
         // Every name each file offers, resolved through the real search path.
         let fighter_names: Vec<String> = load_effect(&fighter)
@@ -684,6 +748,7 @@ mod tests {
         let mut resolver = EffectResolver::default();
         resolver.set_search_path(
             Some(fighter.clone()),
+            Vec::new(),
             Some(EffectResolver::common_eff_path(&root)),
         );
 
@@ -842,7 +907,7 @@ mod tests {
             let mut primitive_ids: std::collections::BTreeSet<i64> =
                 std::collections::BTreeSet::new();
             for set in &loaded.ptcl.emitter_sets {
-                for (emitter_index, emitter) in set.emitters.iter().enumerate() {
+                for (_emitter_index, emitter) in set.emitters.iter().enumerate() {
                     emitters += 1;
                     if emitter.texture_index.is_some() {
                         textured += 1;
@@ -953,7 +1018,7 @@ mod tests {
         let fighter = root.join("effect/fighter/mario/ef_mario.eff");
         let common = EffectResolver::common_eff_path(&root);
         let mut resolver = EffectResolver::default();
-        resolver.set_search_path(Some(fighter), Some(common));
+        resolver.set_search_path(Some(fighter), Vec::new(), Some(common));
 
         let table = crate::eff_attrs::table();
         let index_of = |id: &str| table.iter().position(|attr| attr.id == id);
@@ -1056,6 +1121,7 @@ mod tests {
         let mut resolver = EffectResolver::default();
         resolver.set_search_path(
             Some(root.join("effect/fighter/mario/ef_mario.eff")),
+            Vec::new(),
             Some(EffectResolver::common_eff_path(&root)),
         );
 
@@ -1099,6 +1165,7 @@ mod tests {
         let mut resolver = EffectResolver::default();
         resolver.set_search_path(
             Some(root.join("effect/fighter/mario/ef_mario.eff")),
+            Vec::new(),
             Some(EffectResolver::common_eff_path(&root)),
         );
 
@@ -1150,6 +1217,194 @@ mod tests {
                         value(pat_freq),
                         slots,
                     );
+                }
+            }
+        }
+    }
+
+    /// Where the effects a MOD spawns actually live, and what the smoke emitters look like.
+    ///
+    /// A mod routinely spawns effects belonging to a fighter other than the one it is built on
+    /// — the Shigaraki moveset is on eflame but calls `edge_attack_dash_*`. Those resolve
+    /// against neither eflame's eff nor `ef_common`, so a two-file search path finds nothing
+    /// and the effect silently never appears.
+    #[test]
+    fn effects_a_mod_borrows_from_another_fighter() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+
+        for (fighter, wanted) in [
+            ("edge", vec!["EDGE_ATTACK_DASH_AURA", "EDGE_ATTACK_DASH_HIT"]),
+        ] {
+            let path = root.join(format!("effect/fighter/{fighter}/ef_{fighter}.eff"));
+            let Ok(loaded) = load_effect(&path) else {
+                println!("could not load {}", path.display());
+                continue;
+            };
+            println!("\n=== ef_{fighter}.eff: {} entries ===", loaded.entries.len());
+            for name in &wanted {
+                let found = loaded
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name.eq_ignore_ascii_case(name));
+                match found {
+                    Some(entry) => println!(
+                        "  {name}: set={:?} variants={}",
+                        entry.set_idx,
+                        entry.variants.len()
+                    ),
+                    None => println!("  {name}: NOT in this file"),
+                }
+            }
+            // Anything else beginning EDGE_ATTACK_DASH, so a near-miss on the name is visible.
+            let similar: Vec<&str> = loaded
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .filter(|name| name.to_ascii_uppercase().contains("ATTACK_DASH"))
+                .collect();
+            println!("  entries containing ATTACK_DASH: {similar:?}");
+        }
+    }
+
+    /// The transplant search, against a real mod that relies on it.
+    ///
+    /// `VISIONARY_MOD_ROOT` should point at a mod root (the folder holding `effect/`). Skipped
+    /// when unset, since this needs a mod rather than the vanilla dump.
+    #[test]
+    fn a_mods_transplanted_effects_resolve_through_its_donors() {
+        let (Some(dump), Some(mod_root)) = (
+            root(),
+            std::env::var_os("VISIONARY_MOD_ROOT").map(PathBuf::from),
+        ) else {
+            eprintln!("VISIONARY_EFF_ROOT / VISIONARY_MOD_ROOT not set — skipping");
+            return;
+        };
+
+        let roots = vec![mod_root.clone(), dump.clone()];
+        let donors = EffectResolver::transplant_donors(&roots, "eflame");
+        println!("\ntransplant donors found: {}", donors.len());
+        for donor in &donors {
+            println!("  {}", donor.display());
+        }
+        assert!(
+            !donors.is_empty(),
+            "no donors under {}/effect/fighter/eflame/transplant",
+            mod_root.display()
+        );
+
+        // The mod ships a slot-specific eff of its own; that is the file the fighter half of
+        // the search path should be pointing at for this costume.
+        let own = mod_root.join("effect/fighter/eflame/ef_eflame_c80.eff");
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(
+            own.exists().then(|| own.clone()),
+            donors.clone(),
+            Some(EffectResolver::common_eff_path(&dump)),
+        );
+
+        // Without the donors these resolve to nothing at all, which is the bug: the effect is
+        // spawned by the script, the game shows it, and the viewport showed nothing.
+        for name in ["EDGE_ATTACK_DASH_AURA", "EDGE_ATTACK_DASH_HIT"] {
+            let resolved = resolver
+                .resolve(name)
+                .unwrap_or_else(|failure| panic!("{name} did not resolve: {failure:?}"));
+            println!(
+                "  {name} -> {:?} from {}",
+                resolved.source,
+                resolved
+                    .file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            let summary = resolver.describe(name).expect("describes");
+            println!("      {}", summary.headline());
+            assert!(summary.emitters > 0, "{name} resolved to no emitters");
+        }
+
+        // Prove the donors are load-bearing rather than incidental: drop them and the same
+        // names must stop resolving.
+        let mut without = EffectResolver::default();
+        without.set_search_path(
+            own.exists().then_some(own),
+            Vec::new(),
+            Some(EffectResolver::common_eff_path(&dump)),
+        );
+        let still = ["EDGE_ATTACK_DASH_AURA", "EDGE_ATTACK_DASH_HIT"]
+            .iter()
+            .filter(|name| without.resolve(name).is_ok())
+            .count();
+        println!("  without donors, {still} of 2 still resolve");
+    }
+
+    /// Why the smoke effects still read as squares.
+    ///
+    /// `SYS_ATK_SMOKE` and `SYS_TURN_SMOKE` look square while sheet-animated effects work, so
+    /// the cell count is not being found for these. Dumps every pattern channel rather than
+    /// just the first, since an emitter using channel 1 or 2 would look exactly like one with
+    /// no pattern at all.
+    #[test]
+    fn what_the_smoke_emitters_actually_carry() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(EffectResolver::common_eff_path(&root)));
+
+        let table = crate::eff_attrs::table();
+        let at = |id: &str| table.iter().position(|attr| attr.id == id);
+        let channels = [
+            ("0", at("emitter_static.tex_pattern_anim0.num"), at("texture_anim0.pattern_anim_type"), at("emitter_static.tex_pattern_anim0.num_random")),
+            ("1", at("emitter_static.tex_pattern_anim1.num"), at("texture_anim1.pattern_anim_type"), at("emitter_static.tex_pattern_anim1.num_random")),
+            ("2", at("emitter_static.tex_pattern_anim2.num"), at("texture_anim2.pattern_anim_type"), at("emitter_static.tex_pattern_anim2.num_random")),
+        ];
+        let full_table: Vec<Option<usize>> = (0..32)
+            .map(|i| at(&format!("emitter_static.tex_pattern_anim0.table[{i}]")))
+            .collect();
+
+        for name in ["SYS_ATK_SMOKE", "SYS_TURN_SMOKE", "SYS_DASH_SMOKE"] {
+            let Ok(resolved) = resolver.resolve(name) else {
+                println!("\n{name}: does not resolve");
+                continue;
+            };
+            let file = resolved.file.clone();
+            let parts = resolved.parts.clone();
+            let Some(loaded) = resolver.loaded(&file) else { continue };
+            println!("\n=== {name} ===");
+            for part in &parts {
+                let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
+                for emitter in set.emitters.iter().take(5) {
+                    let value = |slot: Option<usize>| -> Option<i64> {
+                        match emitter.attrs.get(slot?).and_then(|a| a.as_ref())? {
+                            crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                            crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                            crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                        }
+                    };
+                    let tex = emitter
+                        .texture_index
+                        .and_then(|i| loaded.ptcl.bntx_textures.get(i as usize))
+                        .map(|t| format!("{} {}x{}", t.tex_name, t.width, t.height));
+                    let per_channel: Vec<String> = channels
+                        .iter()
+                        .map(|(label, num, kind, rand)| {
+                            format!(
+                                "ch{label}(num={:?} type={:?} rand={:?})",
+                                value(*num),
+                                value(*kind),
+                                value(*rand)
+                            )
+                        })
+                        .collect();
+                    let seq: Vec<i64> = full_table.iter().filter_map(|s| value(*s)).collect();
+                    let distinct: std::collections::BTreeSet<i64> = seq.iter().copied().collect();
+                    println!("  '{}' tex={:?}", emitter.name, tex);
+                    println!("      {}", per_channel.join(" "));
+                    println!("      table distinct={distinct:?} len={}", seq.len());
                 }
             }
         }
