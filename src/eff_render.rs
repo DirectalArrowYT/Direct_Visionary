@@ -47,7 +47,13 @@ pub struct ParticleInstance {
     /// (EDGE_ATTACK_DASH_HIT turns two of its emitters 90 degrees). Drawing every ring
     /// axis-aligned in world space puts them at the wrong angle to the fighter.
     pub orientation: [f32; 4],
-    pub _padding: [f32; 3],
+    /// The emitter's `billboard_type`. Zero means camera-facing; anything else means the quad
+    /// has a real orientation in the world and must use it.
+    ///
+    /// SYS_ATTACK_ARC is type 3, and drawn camera-facing it lies flat no matter which way the
+    /// swing goes — an arc that does not follow the attack.
+    pub billboard_type: u32,
+    pub _padding: [f32; 2],
 }
 
 /// A run of particles sharing one texture and one blend mode — the unit of a draw call.
@@ -139,6 +145,7 @@ struct Instance {
     @location(3) rotation: f32,
     @location(4) uv_rect: vec4<f32>,
     @location(7) orientation: vec4<f32>,
+    @location(8) billboard_type: u32,
 };
 
 struct VertexOut {
@@ -146,6 +153,11 @@ struct VertexOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
 };
+
+fn rotate_by(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
 
 @vertex
 fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> VertexOut {
@@ -159,8 +171,15 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     let c = cos(instance.rotation);
     let spun = vec2<f32>(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
 
-    let offset = camera.camera_right.xyz * spun.x * instance.size
-               + camera.camera_up.xyz * spun.y * instance.size;
+    // Type 0 faces the camera. Anything else has a real orientation in the world -- the attack
+    // arc is type 3, and drawn camera-facing it lies flat however the swing is angled.
+    var right = camera.camera_right.xyz;
+    var up = camera.camera_up.xyz;
+    if (instance.billboard_type != 0u) {
+        right = rotate_by(instance.orientation, vec3<f32>(1.0, 0.0, 0.0));
+        up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
+    }
+    let offset = right * spun.x * instance.size + up * spun.y * instance.size;
 
     var out: VertexOut;
     out.clip_position = camera.view_projection * vec4<f32>(instance.position + offset, 1.0);
@@ -173,22 +192,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sampled = textureSample(particle_texture, particle_sampler, in.uv);
-    // BC5 gives two channels: red carries the particle's shape. The colour is the emitter's,
-    // not the texture's — sampling RGB here would render every effect missing its blue.
-    let mask = sampled.r;
-    return vec4<f32>(in.color.rgb * mask, in.color.a * mask);
+    // Uniform because the upload normalised it: RGB is the texture's own shading and alpha is
+    // the particle's shape, whichever family the texture came from. Sampling red as the mask
+    // instead rendered every BC3 effect as a solid white quad -- red averages 225 of 255 on
+    // ef_cmn_impact05_ani, while the smoke lives entirely in alpha.
+    return in.color * sampled;
 }
 
 struct MeshVertexIn {
     @location(5) position: vec3<f32>,
     @location(6) uv: vec2<f32>,
 };
-
-fn rotate_by(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
-    // v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
-    let t = 2.0 * cross(q.xyz, v);
-    return v + q.w * t + cross(q.xyz, t);
-}
 
 @vertex
 fn vs_mesh(vertex: MeshVertexIn, instance: Instance) -> VertexOut {
@@ -304,6 +318,11 @@ impl ParticleRenderer {
                     format: wgpu::VertexFormat::Float32x4,
                     offset: 52,
                     shader_location: 7,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Uint32,
+                    offset: 68,
+                    shader_location: 8,
                 },
             ],
         };
@@ -723,6 +742,7 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, rotation), 32);
         assert_eq!(offset_of!(ParticleInstance, uv_rect), 36);
         assert_eq!(offset_of!(ParticleInstance, orientation), 52);
+        assert_eq!(offset_of!(ParticleInstance, billboard_type), 68);
         // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
         // every instance after the first.
         assert_eq!(size_of::<ParticleInstance>(), 80);

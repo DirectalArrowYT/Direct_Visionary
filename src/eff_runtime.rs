@@ -439,6 +439,39 @@ pub struct LiveEffect {
     pub offset: glam::Vec3,
 }
 
+/// Put a decoded effect texture into one form the shader can treat uniformly.
+///
+/// Effect textures come in two families that store the particle's shape in different places,
+/// and reading the wrong one renders a solid white quad rather than a shape:
+///
+/// * `BC3` and friends carry greyscale colour in RGB with the shape in ALPHA. On
+///   `ef_cmn_impact05_ani` red averages 225 of 255 — nearly solid white — while alpha averages
+///   74 and holds the actual smoke.
+/// * `BC5` is two-channel: red and green carry data, blue is zero and alpha is a constant 255.
+///   Here the shape is in RED, and there is no alpha to read.
+///
+/// Rather than branch in the shader on a format the shader cannot see, a constant-alpha texture
+/// is rewritten so red becomes both its colour and its alpha. Everything downstream then means
+/// the same thing by RGBA.
+fn normalize_mask(image: image::RgbaImage) -> image::RgbaImage {
+    let mut lowest = 255u8;
+    let mut highest = 0u8;
+    for pixel in image.pixels() {
+        lowest = lowest.min(pixel.0[3]);
+        highest = highest.max(pixel.0[3]);
+    }
+    // A texture whose alpha never varies is not carrying shape in it.
+    if highest.saturating_sub(lowest) > 2 {
+        return image;
+    }
+    let mut out = image;
+    for pixel in out.pixels_mut() {
+        let mask = pixel.0[0];
+        pixel.0 = [mask, mask, mask, mask];
+    }
+    out
+}
+
 /// A texture the renderer needs but does not have yet, decoded ready to upload.
 pub struct PendingTexture {
     pub key: crate::eff_render::TextureKey,
@@ -536,7 +569,7 @@ pub fn build_particle_batches(
                     match crate::texture_import::decode_rgba(&pool, index, &info.tex_name, None) {
                         Ok(image) => pending.push(PendingTexture {
                             key: key.clone(),
-                            image: std::sync::Arc::new(image),
+                            image: std::sync::Arc::new(normalize_mask(image)),
                         }),
                         Err(error) => {
                             eprintln!("[eff] texture '{}' not drawable: {error}", info.tex_name);
@@ -627,7 +660,8 @@ pub fn build_particle_batches(
                             rotation: particle.rotation,
                             uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                             orientation: orientation.to_array(),
-                            _padding: [0.0; 3],
+                            billboard_type: sim.billboard_type.max(0) as u32,
+                            _padding: [0.0; 2],
                         });
                     }
                     continue;
@@ -663,7 +697,8 @@ pub fn build_particle_batches(
                         rotation: particle.rotation,
                         uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                         orientation: orientation.to_array(),
-                        _padding: [0.0; 3],
+                        billboard_type: sim.billboard_type.max(0) as u32,
+                        _padding: [0.0; 2],
                     });
                 }
             }
@@ -1885,6 +1920,196 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
             (centre - bone_at).length() < 25.0,
             "the cloud drifted away from its bone: centre {centre:?} vs bone {bone_at:?}"
         );
+    }
+
+    /// Which channel of an effect texture carries the shape.
+    ///
+    /// The shader samples red as a mask. If red is near 1.0 across the whole image the mask
+    /// does nothing and every particle renders as a solid white quad, which is what the smoke
+    /// effects look like. This reports the real per-channel statistics rather than assuming.
+    #[test]
+    fn which_texture_channel_is_the_mask() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        for (relative, wanted) in [
+            (
+                "effect/system/common/ef_common.eff",
+                vec!["ef_cmn_smoke01", "ef_cmn_smoke03", "ef_cmn_impact05_ani", "ef_cmn_line02"],
+            ),
+            (
+                "effect/fighter/edge/ef_edge.eff",
+                vec!["ef_edge_aura01"],
+            ),
+        ] {
+            let path = root.join(relative);
+            let Ok(loaded) = load_effect(&path) else { continue };
+            let Some(pool) = loaded.texture_pool.as_ref() else { continue };
+            println!("
+=== {relative} ===");
+            for (index, info) in loaded.ptcl.bntx_textures.iter().enumerate() {
+                let interesting = wanted.iter().any(|w| info.tex_name.contains(w));
+                if !interesting {
+                    continue;
+                }
+                let Ok(image) = crate::texture_import::decode_rgba(pool, index, &info.tex_name, None)
+                else {
+                    println!("  {} [{}]: would not decode", info.tex_name, info.format);
+                    continue;
+                };
+                let mut stats = [[255u8, 0u8]; 4];
+                let mut sums = [0u64; 4];
+                let pixels = image.pixels().count() as u64;
+                for pixel in image.pixels() {
+                    for channel in 0..4 {
+                        let v = pixel.0[channel];
+                        stats[channel][0] = stats[channel][0].min(v);
+                        stats[channel][1] = stats[channel][1].max(v);
+                        sums[channel] += v as u64;
+                    }
+                }
+                let names = ["R", "G", "B", "A"];
+                let summary: Vec<String> = (0..4)
+                    .map(|c| {
+                        format!(
+                            "{}:{}-{} avg{}",
+                            names[c],
+                            stats[c][0],
+                            stats[c][1],
+                            sums[c] / pixels.max(1)
+                        )
+                    })
+                    .collect();
+                println!(
+                    "  {} [{}] {}x{}  {}",
+                    info.tex_name,
+                    info.format,
+                    image.width(),
+                    image.height(),
+                    summary.join("  ")
+                );
+            }
+        }
+    }
+
+    /// The two texture families must both end up meaning the same thing by RGBA.
+    #[test]
+    fn textures_are_normalised_so_the_shape_is_always_in_alpha() {
+        // BC3-like: greyscale RGB, real shape in alpha. Left alone.
+        let mut varying = image::RgbaImage::new(2, 2);
+        varying.put_pixel(0, 0, image::Rgba([200, 200, 200, 0]));
+        varying.put_pixel(1, 0, image::Rgba([200, 200, 200, 255]));
+        varying.put_pixel(0, 1, image::Rgba([200, 200, 200, 128]));
+        varying.put_pixel(1, 1, image::Rgba([200, 200, 200, 64]));
+        let kept = normalize_mask(varying.clone());
+        assert_eq!(kept.get_pixel(0, 0).0, [200, 200, 200, 0]);
+        assert_eq!(kept.get_pixel(1, 0).0, [200, 200, 200, 255]);
+
+        // BC5-like: shape in red, alpha a constant 255. Red becomes the alpha, so a particle
+        // is shaped rather than a solid square.
+        let mut constant = image::RgbaImage::new(2, 1);
+        constant.put_pixel(0, 0, image::Rgba([0, 40, 0, 255]));
+        constant.put_pixel(1, 0, image::Rgba([255, 90, 0, 255]));
+        let fixed = normalize_mask(constant);
+        assert_eq!(fixed.get_pixel(0, 0).0, [0, 0, 0, 0], "transparent where red is 0");
+        assert_eq!(fixed.get_pixel(1, 0).0, [255, 255, 255, 255], "opaque where red is 1");
+    }
+
+    /// The real textures, through the real decode, must not come out as solid blocks.
+    #[test]
+    fn real_effect_textures_are_not_solid_after_normalisation() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let path = EffectResolver::common_eff_path(&root);
+        let Ok(loaded) = load_effect(&path) else { return };
+        let Some(pool) = loaded.texture_pool.as_ref() else { return };
+
+        let mut checked = 0usize;
+        for (index, info) in loaded.ptcl.bntx_textures.iter().enumerate() {
+            if !["ef_cmn_smoke01", "ef_cmn_impact05_ani", "ef_cmn_line02"]
+                .iter()
+                .any(|w| info.tex_name.contains(w))
+            {
+                continue;
+            }
+            let Ok(image) = crate::texture_import::decode_rgba(pool, index, &info.tex_name, None)
+            else {
+                continue;
+            };
+            let normalised = normalize_mask(image);
+            let mut lowest = 255u8;
+            let mut highest = 0u8;
+            for pixel in normalised.pixels() {
+                lowest = lowest.min(pixel.0[3]);
+                highest = highest.max(pixel.0[3]);
+            }
+            println!(
+                "  {} [{}] alpha after normalisation: {lowest}-{highest}",
+                info.tex_name, info.format
+            );
+            // A particle whose alpha never drops is a solid quad, whatever its texture shows.
+            assert!(
+                highest > lowest + 8,
+                "{} has no shape in alpha after normalisation ({lowest}-{highest}) — it will                  render as a solid block",
+                info.tex_name
+            );
+            checked += 1;
+        }
+        assert!(checked >= 2, "expected to check both texture families");
+    }
+
+    /// SYS_ATTACK_ARC, which renders horizontal when it should point along the swing.
+    #[test]
+    fn what_orients_the_attack_arc() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(EffectResolver::common_eff_path(&root)));
+        let table = crate::eff_attrs::table();
+        let at = |id: &str| table.iter().position(|a| a.id == id);
+        let rot = [at("emitter_info.rotate_x"), at("emitter_info.rotate_y"), at("emitter_info.rotate_z")];
+        let prim = at("particle_data.primitive_id");
+        let billboard = at("particle_data.billboard_type");
+
+        for name in ["SYS_ATTACK_ARC", "SYS_ATK_ARC"] {
+            let Ok(resolved) = resolver.resolve(name) else {
+                println!("{name}: does not resolve");
+                continue;
+            };
+            let file = resolved.file.clone();
+            let parts = resolved.parts.clone();
+            let ids = resolver.descriptor_ids(&file);
+            let Some(loaded) = resolver.loaded(&file) else { continue };
+            println!("
+=== {name} ===");
+            for part in &parts {
+                let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
+                for emitter in &set.emitters {
+                    let f = |slot: Option<usize>| -> f32 {
+                        match emitter.attrs.get(slot.unwrap_or(usize::MAX)).and_then(|a| a.as_ref()) {
+                            Some(crate::eff_attrs::AttrValue::Float(v)) => *v,
+                            Some(crate::eff_attrs::AttrValue::Int(v)) => *v as f32,
+                            Some(crate::eff_attrs::AttrValue::UInt(v)) => *v as f32,
+                            None => 0.0,
+                        }
+                    };
+                    let id = f(prim) as u64;
+                    println!(
+                        "  '{}' rot=[{:.3}, {:.3}, {:.3}] billboard={} mesh={} tex={:?}",
+                        emitter.name,
+                        f(rot[0]), f(rot[1]), f(rot[2]),
+                        f(billboard) as i64,
+                        ids.contains(&id),
+                        emitter.texture_index,
+                    );
+                }
+            }
+        }
     }
 
     /// Why the smoke effects still read as squares.
