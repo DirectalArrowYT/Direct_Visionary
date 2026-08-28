@@ -104,6 +104,9 @@ pub struct HitboxRenderState {
     /// Cached GPU handles for use in paint()
     pub wgpu_device: Option<wgpu::Device>,
     pub wgpu_queue: Option<wgpu::Queue>,
+    /// Effect particles, drawn as their own pass after the model. Optional only so a device
+    /// that cannot build the pipeline still renders fighters rather than failing to start.
+    pub particles: Option<crate::eff_render::ParticleRenderer>,
 }
 
 impl HitboxRenderState {
@@ -148,6 +151,7 @@ impl HitboxRenderState {
             last_skel_path: None,
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
+            particles: Some(crate::eff_render::ParticleRenderer::new(device, surface_format)),
         }
     }
 
@@ -830,6 +834,17 @@ pub struct ViewportCallback {
     /// Optional default eyelid visibility baseline for the selected fighter/costume.
     pub default_anim_path: Option<std::path::PathBuf>,
     pub skel_path: Option<std::path::PathBuf>,
+    /// Effect particles for this frame, already placed in world space by the app — the app is
+    /// the side that knows which effects are live, and it reads the same bone matrices this
+    /// callback would, so resolving them here would duplicate that work a frame later.
+    pub particle_batches: Vec<crate::eff_render::ParticleBatch>,
+    /// Textures referenced by `particle_batches` that are not on the GPU yet. Decoding happens
+    /// app-side because it needs the `.eff` file; uploading happens here because it needs the
+    /// device. Already-uploaded textures are not resent.
+    pub pending_textures: Vec<(
+        crate::eff_render::TextureKey,
+        std::sync::Arc<image::RgbaImage>,
+    )>,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -879,6 +894,27 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_skel_path = self.skel_path.clone();
             }
 
+            // Effect particles. Uploads first, then staging: `prepare` skips a batch whose
+            // texture is not resident, so a texture arriving in the same frame as the batch
+            // that uses it has to land before staging rather than after.
+            if let Some(particles) = state.particles.as_mut() {
+                for (key, image) in &self.pending_textures {
+                    particles.upload_texture(device, queue, key.clone(), image);
+                }
+                let transforms = state.camera.transforms(self.width, self.height);
+                // The billboard axes are the camera's own, in world space. `model_view` maps
+                // world to view, so its inverse holds the camera basis as its columns.
+                let view_to_world = transforms.model_view_matrix.inverse();
+                particles.prepare(
+                    device,
+                    queue,
+                    transforms.mvp_matrix,
+                    view_to_world.x_axis.truncate().normalize_or_zero(),
+                    view_to_world.y_axis.truncate().normalize_or_zero(),
+                    &self.particle_batches,
+                );
+            }
+
             // Always re-render (camera may have changed, or egui needs a fresh frame)
             state.renderer.begin_render_models(
                 egui_encoder,
@@ -908,6 +944,11 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
     ) {
         if let Some(state) = resources.get::<HitboxRenderState>() {
             state.renderer.end_render_models(render_pass);
+            // After the model, so particles composite over the fighter rather than being
+            // overwritten by it.
+            if let Some(particles) = state.particles.as_ref() {
+                particles.draw(render_pass);
+            }
         } else {
             eprintln!("[VIEWPORT] paint skipped: HitboxRenderState missing (load a model first)");
         }

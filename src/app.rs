@@ -2610,6 +2610,9 @@ pub struct VisionaryApp {
     move_source_cache: HashMap<String, crate::mod_project::MoveSourceSnapshot>,
     /// Selection is held here while the source mismatch modal is open.
     source_mismatch_prompt: Option<PendingMoveSourceMismatch>,
+    /// Loads and caches `.eff` files for the viewport's effect preview, and resolves the names
+    /// ACMD spawns against the fighter's own file and `ef_common`.
+    effect_resolver: crate::eff_runtime::EffectResolver,
     /// The last **Sync Edits Into Source** result, while its report window is open.
     ///
     /// Sync refuses far more than it writes — every structural edit is reported rather than
@@ -2999,6 +3002,7 @@ impl VisionaryApp {
             export_dir: saved_export_dir,
             extra_roots: saved_mod_roots,
             selected_costume_slot: 0,
+            effect_resolver: crate::eff_runtime::EffectResolver::default(),
             sync_report: None,
             forgotten_fighters: load_forgotten_fighters(),
             current_eff_path: None,
@@ -3610,6 +3614,32 @@ impl VisionaryApp {
         }
     }
 
+    /// Effects the timeline has live on the current frame, as the runtime wants them:
+    /// (effect name, bone, tint, alpha).
+    ///
+    /// A one-shot effect is live only on its own frame; a following effect stays live until the
+    /// `EFFECT_OFF_KIND` that closes it, which is what `active_end` already encodes. Disabled
+    /// calls and the `null` placeholder are skipped — the placeholder exists precisely because
+    /// the script spawns nothing there, so drawing something would invent a graphic.
+    fn live_effect_spawns(&self) -> Vec<(String, String, [f32; 3], f32)> {
+        let frame = self.state.current_frame;
+        self.state
+            .effects
+            .iter()
+            .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
+            .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
+            .filter(|call| frame >= call.active_start && frame <= call.active_end)
+            .map(|call| {
+                (
+                    call.effect_name.clone(),
+                    call.bone_name.clone(),
+                    call.tint.unwrap_or([1.0, 1.0, 1.0]),
+                    call.alpha.unwrap_or(1.0),
+                )
+            })
+            .collect()
+    }
+
     fn select_fighter(&mut self, idx: usize) {
         if self.source_mismatch_prompt.is_some() {
             return;
@@ -3815,9 +3845,18 @@ impl VisionaryApp {
                     .find(|p| p.exists())
             });
         self.current_eff_path = eff_path.clone();
-        if let Some(path) = eff_path {
+        if let Some(path) = eff_path.clone() {
             self.eff_editor.queue_load(&path);
         }
+
+        // The viewport's effect preview searches the fighter's own file first, then the shared
+        // one. `ef_common` holds everything generic — hit flashes, smoke, sparks — so without
+        // it most of what a move spawns resolves to nothing at all.
+        let common = roots
+            .iter()
+            .map(|root| crate::eff_runtime::EffectResolver::common_eff_path(root))
+            .find(|path| path.exists());
+        self.effect_resolver.set_search_path(eff_path, common);
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
         let labels = self.state.labels.clone();
@@ -31179,6 +31218,46 @@ impl eframe::App for VisionaryApp {
 
                 // Paint the animated character. Circle overlays are drawn below by egui.
                 let animation_frame = animation_frame_for_game_frame(self.state.current_frame);
+
+                // Effect particles are placed app-side because this is the side that knows
+                // which effects the timeline has live. It reads the same bone matrices the
+                // hitbox overlay does, at the same requested frame, so particles and hitboxes
+                // cannot disagree about where a bone is.
+                let (particle_batches, pending_textures) = {
+                    let live = self.live_effect_spawns();
+                    if live.is_empty() {
+                        (Vec::new(), Vec::new())
+                    } else if let Some(wgpu_state) = frame.wgpu_render_state() {
+                        let renderer = wgpu_state.renderer.read();
+                        match renderer.callback_resources.get::<HitboxRenderState>() {
+                            Some(rs) => {
+                                let bones = rs.bone_world_matrices_at(animation_frame);
+                                let resident = |key: &crate::eff_render::TextureKey| {
+                                    rs.particles
+                                        .as_ref()
+                                        .is_some_and(|particles| particles.has_texture(key))
+                                };
+                                let (batches, pending) = crate::eff_runtime::build_particle_batches(
+                                    &mut self.effect_resolver,
+                                    &resident,
+                                    &bones,
+                                    &live,
+                                );
+                                (
+                                    batches,
+                                    pending
+                                        .into_iter()
+                                        .map(|texture| (texture.key, texture.image))
+                                        .collect(),
+                                )
+                            }
+                            None => (Vec::new(), Vec::new()),
+                        }
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                };
+
                 let callback = egui_wgpu::Callback::new_paint_callback(
                     rect,
                     ViewportCallback {
@@ -31188,6 +31267,8 @@ impl eframe::App for VisionaryApp {
                         anim_path: self.current_anim_path.clone(),
                         default_anim_path: self.current_default_eyelid_path.clone(),
                         skel_path: self.current_skel_path.clone(),
+                        particle_batches,
+                        pending_textures,
                     },
                 );
                 ui.painter().add(callback);
