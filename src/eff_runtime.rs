@@ -2204,6 +2204,65 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         );
     }
 
+    /// Billboard types across the effects being looked at, so the quad-plane rule is chosen
+    /// from what the data uses rather than from one example.
+    #[test]
+    fn billboard_types_in_use() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let table = crate::eff_attrs::table();
+        let billboard = table.iter().position(|a| a.id == "particle_data.billboard_type").unwrap();
+
+        for (relative, names) in [
+            ("effect/fighter/miigunner/ef_miigunner.eff", vec!["MIIGUNNER_ATK_SHOT_S"]),
+            ("effect/system/common/ef_common.eff", vec!["SYS_ATTACK_ARC", "SYS_TURN_SMOKE"]),
+        ] {
+            let path = root.join(relative);
+            let Ok(loaded) = load_effect(&path) else {
+                println!("{relative}: not loadable");
+                continue;
+            };
+            println!("
+=== {relative} ===");
+            // Whole-file histogram, so the rule is not tuned to one effect.
+            let mut histogram: std::collections::BTreeMap<i64, usize> = Default::default();
+            for set in &loaded.ptcl.emitter_sets {
+                for emitter in &set.emitters {
+                    if let Some(crate::eff_attrs::AttrValue::Int(v)) =
+                        emitter.attrs.get(billboard).and_then(|a| a.as_ref())
+                    {
+                        *histogram.entry(*v).or_insert(0) += 1;
+                    }
+                }
+            }
+            println!("  billboard_type histogram across the file: {histogram:?}");
+            for wanted in names {
+                let Some(entry) = loaded
+                    .entries
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(wanted))
+                else {
+                    println!("  {wanted}: no entry");
+                    continue;
+                };
+                for part in parts_of(entry) {
+                    let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
+                    let types: Vec<i64> = set
+                        .emitters
+                        .iter()
+                        .filter_map(|e| match e.attrs.get(billboard).and_then(|a| a.as_ref()) {
+                            Some(crate::eff_attrs::AttrValue::Int(v)) => Some(*v),
+                            _ => None,
+                        })
+                        .collect();
+                    println!("  {wanted}: {} emitters, types {types:?}", set.emitters.len());
+                }
+            }
+        }
+    }
+
     /// Why the smoke effects still read as squares.
     ///
     /// `SYS_ATK_SMOKE` and `SYS_TURN_SMOKE` look square while sheet-animated effects work, so

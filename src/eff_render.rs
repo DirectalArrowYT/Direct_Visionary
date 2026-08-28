@@ -171,11 +171,24 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     let c = cos(instance.rotation);
     let spun = vec2<f32>(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
 
-    // Type 0 faces the camera. Anything else has a real orientation in the world -- the attack
-    // arc is type 3, and drawn camera-facing it lies flat however the swing is angled.
+    // The quad's plane depends on the emitter's billboard type. Only type 0 is certain --
+    // it faces the camera, which is what a billboard is, and it is the commonest by far
+    // (753 of 1348 emitters in ef_common). The oriented types put the quad in a fixed plane
+    // of the effect's own frame, and WHICH plane is the difference between an effect facing
+    // the viewer and facing along the attack.
+    //
+    // Type 5 spans forward-and-up, so its normal points sideways: a muzzle flash fired from
+    // the hand faces left and right rather than at the screen. Measured on
+    // MIIGUNNER_ATK_SHOT_S, which is types 5 and 0.
+    //
+    // The remaining types (1, 4, 6, 7 -- together under a tenth of the corpus) fall through to
+    // the local XY plane. That is a placeholder, not a reading of what they mean.
     var right = camera.camera_right.xyz;
     var up = camera.camera_up.xyz;
-    if (instance.billboard_type != 0u) {
+    if (instance.billboard_type == 5u) {
+        right = rotate_by(instance.orientation, vec3<f32>(0.0, 0.0, 1.0));
+        up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
+    } else if (instance.billboard_type != 0u) {
         right = rotate_by(instance.orientation, vec3<f32>(1.0, 0.0, 0.0));
         up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
     }
