@@ -78,6 +78,10 @@ pub struct EmitterSim {
     /// by the caller, which is the side that knows the texture; the emitter data alone does
     /// not say.
     pub sheet_cells: u32,
+    /// Name hash of the primitive this emitter draws, when it draws one. Matched against the
+    /// file's descriptor table -- it is not an index, and treating it as one finds the wrong
+    /// mesh or none.
+    pub primitive_id: Option<u64>,
     pub color0: Vec<ColorKey>,
     pub alpha0: Vec<ColorKey>,
 }
@@ -109,6 +113,7 @@ pub struct Slots {
     diffusion: [Option<usize>; 3],
     velocity_random: Option<usize>,
     scale: [Option<usize>; 3],
+    primitive_id: Option<usize>,
     pattern_cells: Option<usize>,
     pattern_frequency: Option<usize>,
     pattern_table: Vec<Option<usize>>,
@@ -154,6 +159,7 @@ impl Slots {
                 at("emitter_info.scale_y"),
                 at("emitter_info.scale_z"),
             ],
+            primitive_id: at("particle_data.primitive_id"),
             pattern_cells: at("emitter_static.tex_pattern_anim0.num"),
             pattern_frequency: at("emitter_static.tex_pattern_anim0.frequency"),
             pattern_table: (0..32)
@@ -195,6 +201,13 @@ impl EmitterSim {
         Self {
             // A rate of zero would emit nothing at all, which is almost never what the data
             // means — it means the field was not populated for this emitter.
+            primitive_id: slots.primitive_id.and_then(|slot| {
+                match emitter.attrs.get(slot).and_then(|value| value.as_ref()) {
+                    Some(AttrValue::UInt(v)) => Some(*v),
+                    Some(AttrValue::Int(v)) if *v > 0 => Some(*v as u64),
+                    _ => None,
+                }
+            }),
             rate: get(slots.rate).unwrap_or(1.0).max(0.0),
             rate_random: get(slots.rate_random).unwrap_or(0.0),
             interval: get(slots.interval).unwrap_or(0.0).max(0.0),
@@ -574,6 +587,7 @@ mod tests {
             pattern_table: Vec::new(),
             pattern_frequency: 1.0,
             sheet_cells: 0,
+            primitive_id: None,
             color0: Vec::new(),
             alpha0: Vec::new(),
         }

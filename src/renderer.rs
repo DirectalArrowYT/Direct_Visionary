@@ -838,6 +838,10 @@ pub struct ViewportCallback {
     /// the side that knows which effects are live, and it reads the same bone matrices this
     /// callback would, so resolving them here would duplicate that work a frame later.
     pub particle_batches: Vec<crate::eff_render::ParticleBatch>,
+    /// Effect particles that draw a primitive rather than a quad — about half of them.
+    pub mesh_batches: Vec<crate::eff_render::MeshBatch>,
+    /// Primitive geometry referenced by `mesh_batches` that is not on the GPU yet.
+    pub pending_meshes: Vec<(crate::eff_mesh::MeshKey, crate::eff_mesh::EffectMesh)>,
     /// Textures referenced by `particle_batches` that are not on the GPU yet. Decoding happens
     /// app-side because it needs the `.eff` file; uploading happens here because it needs the
     /// device. Already-uploaded textures are not resent.
@@ -901,6 +905,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 for (key, image) in &self.pending_textures {
                     particles.upload_texture(device, queue, key.clone(), image);
                 }
+                for (key, mesh) in &self.pending_meshes {
+                    particles.upload_mesh(device, key.clone(), mesh);
+                }
                 let transforms = state.camera.transforms(self.width, self.height);
                 // The billboard axes are the camera's own, in world space. `model_view` maps
                 // world to view, so its inverse holds the camera basis as its columns.
@@ -912,6 +919,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     view_to_world.x_axis.truncate().normalize_or_zero(),
                     view_to_world.y_axis.truncate().normalize_or_zero(),
                     &self.particle_batches,
+                    &self.mesh_batches,
                 );
             }
 

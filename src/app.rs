@@ -2613,6 +2613,8 @@ pub struct VisionaryApp {
     /// Loads and caches `.eff` files for the viewport's effect preview, and resolves the names
     /// ACMD spawns against the fighter's own file and `ef_common`.
     effect_resolver: crate::eff_runtime::EffectResolver,
+    /// Extracted primitive geometry for effects that draw a mesh rather than a quad.
+    effect_meshes: crate::eff_mesh::MeshLibrary,
     /// Effect textures whose format Visionary cannot decode. Remembered so the failure is
     /// reported once rather than retried on every frame the effect is on screen.
     undecodable_textures: std::collections::HashSet<crate::eff_render::TextureKey>,
@@ -3006,6 +3008,7 @@ impl VisionaryApp {
             extra_roots: saved_mod_roots,
             selected_costume_slot: 0,
             effect_resolver: crate::eff_runtime::EffectResolver::default(),
+            effect_meshes: crate::eff_mesh::MeshLibrary::default(),
             undecodable_textures: std::collections::HashSet::new(),
             sync_report: None,
             forgotten_fighters: load_forgotten_fighters(),
@@ -31318,10 +31321,10 @@ impl eframe::App for VisionaryApp {
                 // hitbox overlay does, at the same requested frame, so particles and hitboxes
                 // cannot disagree about where a bone is.
                 let mut newly_undecodable: Vec<crate::eff_render::TextureKey> = Vec::new();
-                let (particle_batches, pending_textures) = {
+                let frame_effects = {
                     let live = self.live_effect_spawns();
                     if live.is_empty() {
-                        (Vec::new(), Vec::new())
+                        crate::eff_runtime::FrameEffects::default()
                     } else if let Some(wgpu_state) = frame.wgpu_render_state() {
                         let renderer = wgpu_state.renderer.read();
                         match renderer.callback_resources.get::<HitboxRenderState>() {
@@ -31332,32 +31335,33 @@ impl eframe::App for VisionaryApp {
                                         .as_ref()
                                         .is_some_and(|particles| particles.has_texture(key))
                                 };
+                                let mesh_resident = |key: &crate::eff_mesh::MeshKey| {
+                                    rs.particles
+                                        .as_ref()
+                                        .is_some_and(|particles| particles.has_mesh(key))
+                                };
                                 let failed_before = self.undecodable_textures.clone();
                                 let was_failed =
                                     move |key: &crate::eff_render::TextureKey| {
                                         failed_before.contains(key)
                                     };
-                                let (batches, pending, undecodable) =
+                                let (effects, undecodable) =
                                     crate::eff_runtime::build_particle_batches(
                                         &mut self.effect_resolver,
                                         &resident,
                                         &was_failed,
+                                        &mesh_resident,
+                                        &mut self.effect_meshes,
                                         &bones,
                                         &live,
                                     );
                                 newly_undecodable = undecodable;
-                                (
-                                    batches,
-                                    pending
-                                        .into_iter()
-                                        .map(|texture| (texture.key, texture.image))
-                                        .collect(),
-                                )
+                                effects
                             }
-                            None => (Vec::new(), Vec::new()),
+                            None => crate::eff_runtime::FrameEffects::default(),
                         }
                     } else {
-                        (Vec::new(), Vec::new())
+                        crate::eff_runtime::FrameEffects::default()
                     }
                 };
 
@@ -31374,8 +31378,14 @@ impl eframe::App for VisionaryApp {
                         anim_path: self.current_anim_path.clone(),
                         default_anim_path: self.current_default_eyelid_path.clone(),
                         skel_path: self.current_skel_path.clone(),
-                        particle_batches,
-                        pending_textures,
+                        particle_batches: frame_effects.batches,
+                        mesh_batches: frame_effects.mesh_batches,
+                        pending_textures: frame_effects
+                            .pending_textures
+                            .into_iter()
+                            .map(|texture| (texture.key, texture.image))
+                            .collect(),
+                        pending_meshes: frame_effects.pending_meshes,
                     },
                 );
                 ui.painter().add(callback);

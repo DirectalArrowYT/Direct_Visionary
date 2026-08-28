@@ -50,6 +50,19 @@ pub struct ParticleBatch {
     pub instances: Vec<ParticleInstance>,
 }
 
+/// A run of mesh particles sharing one primitive, one texture and one blend mode.
+///
+/// Kept separate from [`ParticleBatch`] rather than folded into it because the two draw
+/// differently in kind: a billboard's geometry is generated in the vertex shader from the
+/// camera basis, a mesh's comes from a vertex and index buffer and keeps its own orientation.
+/// A ring drawn as a camera-facing quad is the square a shockwave was showing.
+pub struct MeshBatch {
+    pub mesh: crate::eff_mesh::MeshKey,
+    pub texture: TextureKey,
+    pub additive: bool,
+    pub instances: Vec<ParticleInstance>,
+}
+
 /// Identifies an uploaded texture: which `.eff` it came from and its index in that file's pool.
 /// Effects from the fighter file and from `ef_common` routinely share pool indices, so the file
 /// has to be part of the key or one would silently render with the other's texture.
@@ -61,6 +74,12 @@ pub struct TextureKey {
 
 struct UploadedTexture {
     bind_group: wgpu::BindGroup,
+}
+
+struct UploadedMesh {
+    vertices: wgpu::Buffer,
+    indices: wgpu::Buffer,
+    index_count: u32,
 }
 
 pub struct ParticleRenderer {
@@ -75,6 +94,11 @@ pub struct ParticleRenderer {
     instance_capacity: usize,
     /// (offset, count, texture, additive) for each batch queued this frame.
     draws: Vec<(u32, u32, TextureKey, bool)>,
+    pipeline_mesh_alpha: wgpu::RenderPipeline,
+    pipeline_mesh_additive: wgpu::RenderPipeline,
+    meshes: std::collections::HashMap<crate::eff_mesh::MeshKey, UploadedMesh>,
+    /// (offset, count, mesh, texture, additive) for each mesh batch queued this frame.
+    mesh_draws: Vec<(u32, u32, crate::eff_mesh::MeshKey, TextureKey, bool)>,
 }
 
 /// Camera data the particle shader needs. A separate, smaller uniform than the model
@@ -145,6 +169,25 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // not the texture's — sampling RGB here would render every effect missing its blue.
     let mask = sampled.r;
     return vec4<f32>(in.color.rgb * mask, in.color.a * mask);
+}
+
+struct MeshVertexIn {
+    @location(5) position: vec3<f32>,
+    @location(6) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_mesh(vertex: MeshVertexIn, instance: Instance) -> VertexOut {
+    // A mesh keeps its own orientation in world space -- that is the whole reason it is a mesh
+    // and not a billboard. Only scale and position come from the particle.
+    let world = instance.position + vertex.position * instance.size;
+
+    var out: VertexOut;
+    out.clip_position = camera.view_projection * vec4<f32>(world, 1.0);
+    // The model's own UVs, mapped into the particle's cell of the sheet.
+    out.uv = vertex.uv * instance.uv_rect.zw + instance.uv_rect.xy;
+    out.color = instance.color;
+    return out;
 }
 "#;
 
@@ -307,6 +350,79 @@ impl ParticleRenderer {
             },
         );
 
+        let mesh_vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<crate::eff_mesh::MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 0,
+                    shader_location: 5,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 12,
+                    shader_location: 6,
+                },
+            ],
+        };
+        let make_mesh_pipeline = |label: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_mesh"),
+                    buffers: &[mesh_vertex_layout.clone(), instance_layout.clone()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    // Effect meshes are open shells -- discs, rings, arcs -- and are meant to
+                    // be seen from both sides. Culling would make half of every ring vanish
+                    // depending on where the camera stands.
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline_mesh_alpha = make_mesh_pipeline(
+            "particle mesh alpha",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+        );
+        let pipeline_mesh_additive = make_mesh_pipeline(
+            "particle mesh additive",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+        );
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("particle sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -336,7 +452,46 @@ impl ParticleRenderer {
             instance_buffer,
             instance_capacity,
             draws: Vec::new(),
+            pipeline_mesh_alpha,
+            pipeline_mesh_additive,
+            meshes: std::collections::HashMap::new(),
+            mesh_draws: Vec::new(),
         }
+    }
+
+    /// Whether a primitive's geometry is already on the GPU.
+    pub fn has_mesh(&self, key: &crate::eff_mesh::MeshKey) -> bool {
+        self.meshes.contains_key(key)
+    }
+
+    /// Upload one primitive's geometry. Idempotent.
+    pub fn upload_mesh(
+        &mut self,
+        device: &wgpu::Device,
+        key: crate::eff_mesh::MeshKey,
+        mesh: &crate::eff_mesh::EffectMesh,
+    ) {
+        if self.meshes.contains_key(&key) || mesh.indices.is_empty() {
+            return;
+        }
+        let vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("effect mesh vertices"),
+            contents: bytemuck::cast_slice(&mesh.vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("effect mesh indices"),
+            contents: bytemuck::cast_slice(&mesh.indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.meshes.insert(
+            key,
+            UploadedMesh {
+                vertices,
+                indices,
+                index_count: mesh.indices.len() as u32,
+            },
+        );
     }
 
     /// Whether a texture is already on the GPU, so the caller can skip decoding it again.
@@ -404,6 +559,7 @@ impl ParticleRenderer {
         camera_right: glam::Vec3,
         camera_up: glam::Vec3,
         batches: &[ParticleBatch],
+        mesh_batches: &[MeshBatch],
     ) {
         queue.write_buffer(
             &self.camera_buffer,
@@ -416,7 +572,14 @@ impl ParticleRenderer {
         );
 
         self.draws.clear();
-        let total: usize = batches.iter().map(|batch| batch.instances.len()).sum();
+        self.mesh_draws.clear();
+        // Billboards and meshes share one instance buffer: the layout is identical and one
+        // upload beats two.
+        let total: usize = batches.iter().map(|batch| batch.instances.len()).sum::<usize>()
+            + mesh_batches
+                .iter()
+                .map(|batch| batch.instances.len())
+                .sum::<usize>();
         if total == 0 {
             return;
         }
@@ -444,6 +607,23 @@ impl ParticleRenderer {
                 batch.additive,
             ));
         }
+        for batch in mesh_batches {
+            if batch.instances.is_empty()
+                || !self.textures.contains_key(&batch.texture)
+                || !self.meshes.contains_key(&batch.mesh)
+            {
+                continue;
+            }
+            let offset = packed.len() as u32;
+            packed.extend_from_slice(&batch.instances);
+            self.mesh_draws.push((
+                offset,
+                batch.instances.len() as u32,
+                batch.mesh.clone(),
+                batch.texture.clone(),
+                batch.additive,
+            ));
+        }
         if !packed.is_empty() {
             queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&packed));
         }
@@ -451,6 +631,14 @@ impl ParticleRenderer {
 
     /// Draw what `prepare` staged. Safe to call with nothing staged.
     pub fn draw(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        if self.draws.is_empty() && self.mesh_draws.is_empty() {
+            return;
+        }
+        self.draw_billboards(render_pass);
+        self.draw_meshes(render_pass);
+    }
+
+    fn draw_billboards(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         if self.draws.is_empty() {
             return;
         }
@@ -467,6 +655,31 @@ impl ParticleRenderer {
             });
             render_pass.set_bind_group(1, &texture.bind_group, &[]);
             render_pass.draw(0..4, *offset..(*offset + *count));
+        }
+    }
+
+    fn draw_meshes(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        if self.mesh_draws.is_empty() {
+            return;
+        }
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        for (offset, count, mesh_key, texture_key, additive) in &self.mesh_draws {
+            let (Some(mesh), Some(texture)) = (
+                self.meshes.get(mesh_key),
+                self.textures.get(texture_key),
+            ) else {
+                continue;
+            };
+            render_pass.set_pipeline(if *additive {
+                &self.pipeline_mesh_additive
+            } else {
+                &self.pipeline_mesh_alpha
+            });
+            render_pass.set_bind_group(1, &texture.bind_group, &[]);
+            render_pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            render_pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..mesh.index_count, 0, *offset..(*offset + *count));
         }
     }
 }

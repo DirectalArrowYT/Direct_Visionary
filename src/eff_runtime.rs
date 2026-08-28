@@ -441,6 +441,15 @@ pub struct PendingTexture {
     pub image: std::sync::Arc<image::RgbaImage>,
 }
 
+/// Everything one frame of effects needs handed to the GPU.
+#[derive(Default)]
+pub struct FrameEffects {
+    pub batches: Vec<crate::eff_render::ParticleBatch>,
+    pub mesh_batches: Vec<crate::eff_render::MeshBatch>,
+    pub pending_textures: Vec<PendingTexture>,
+    pub pending_meshes: Vec<(crate::eff_mesh::MeshKey, crate::eff_mesh::EffectMesh)>,
+}
+
 /// Turn the effects live on this frame into particles the viewport can draw.
 ///
 /// This is the vertical slice of the runtime: it resolves each live effect, finds the emitters
@@ -454,16 +463,22 @@ pub fn build_particle_batches(
     resolver: &mut EffectResolver,
     uploaded: &dyn Fn(&crate::eff_render::TextureKey) -> bool,
     failed: &dyn Fn(&crate::eff_render::TextureKey) -> bool,
+    mesh_uploaded: &dyn Fn(&crate::eff_mesh::MeshKey) -> bool,
+    meshes: &mut crate::eff_mesh::MeshLibrary,
     bone_matrices: &std::collections::HashMap<String, glam::Mat4>,
     live: &[LiveEffect],
 ) -> (
-    Vec<crate::eff_render::ParticleBatch>,
-    Vec<PendingTexture>,
+    FrameEffects,
     Vec<crate::eff_render::TextureKey>,
 ) {
-    use crate::eff_render::{ParticleBatch, ParticleInstance, TextureKey};
+    use crate::eff_render::{MeshBatch, ParticleBatch, ParticleInstance, TextureKey};
 
     let mut batches: Vec<ParticleBatch> = Vec::new();
+    let mut mesh_batches: Vec<MeshBatch> = Vec::new();
+    let mut pending_meshes: Vec<(crate::eff_mesh::MeshKey, crate::eff_mesh::EffectMesh)> =
+        Vec::new();
+    let mut staged_meshes: std::collections::HashSet<crate::eff_mesh::MeshKey> =
+        Default::default();
     let mut pending: Vec<PendingTexture> = Vec::new();
     let mut undecodable: Vec<TextureKey> = Vec::new();
     let mut decoded: std::collections::HashSet<TextureKey> = std::collections::HashSet::new();
@@ -546,6 +561,56 @@ pub fn build_particle_batches(
                     continue;
                 }
 
+                // An emitter whose primitive_id resolves draws geometry instead of a quad --
+                // about half of them do. A ring drawn as a camera-facing square is the shape a
+                // shockwave was showing, and no billboard setting fixes it.
+                let mesh_key = sim.primitive_id.and_then(|id| {
+                    meshes
+                        .descriptor_for(&file, id)
+                        .map(|descriptor| crate::eff_mesh::MeshKey {
+                            file: file.clone(),
+                            descriptor,
+                        })
+                });
+                if let Some(mesh_key) = mesh_key {
+                    if !mesh_uploaded(&mesh_key) && staged_meshes.insert(mesh_key.clone()) {
+                        if let Some(mesh) = meshes.mesh(&mesh_key) {
+                            pending_meshes.push((mesh_key.clone(), mesh.clone()));
+                        }
+                    }
+                    let batch_index = match mesh_batches
+                        .iter()
+                        .position(|batch| batch.mesh == mesh_key && batch.texture == key)
+                    {
+                        Some(found) => found,
+                        None => {
+                            mesh_batches.push(MeshBatch {
+                                mesh: mesh_key,
+                                texture: key.clone(),
+                                additive: true,
+                                instances: Vec::new(),
+                            });
+                            mesh_batches.len() - 1
+                        }
+                    };
+                    for particle in simulated {
+                        mesh_batches[batch_index].instances.push(ParticleInstance {
+                            position: (origin + particle.offset).to_array(),
+                            size: particle.size,
+                            color: [
+                                particle.color[0] * tint[0],
+                                particle.color[1] * tint[1],
+                                particle.color[2] * tint[2],
+                                particle.color[3] * alpha,
+                            ],
+                            rotation: particle.rotation,
+                            uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
+                            _padding: [0.0; 3],
+                        });
+                    }
+                    continue;
+                }
+
                 let batch_index = match batches
                     .iter()
                     .position(|batch| batch.texture == key && batch.additive)
@@ -582,7 +647,15 @@ pub fn build_particle_batches(
         }
     }
 
-    (batches, pending, undecodable)
+    (
+        FrameEffects {
+            batches,
+            mesh_batches,
+            pending_textures: pending,
+            pending_meshes,
+        },
+        undecodable,
+    )
 }
 
 /// Bone lookup that tolerates the case difference between ACMD and the skeleton.
@@ -810,8 +883,22 @@ mod tests {
             alpha: 1.0,
             age: 4.0,
         }];
-        let (batches, pending, _) =
-            build_particle_batches(&mut resolver, &|_| false, &|_| false, &bones, &live);
+        let (effects, _) =
+            build_particle_batches(
+                &mut resolver, &|_| false, &|_| false, &|_| false,
+                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &live);
+        // Both of this effect's emitters draw a primitive, so its particles arrive as mesh
+        // batches rather than quads. The two paths are checked together: what matters is that
+        // the effect produced placed, textured particles, not which pipeline draws them.
+        let mut batches = effects.batches;
+        batches.extend(effects.mesh_batches.into_iter().map(|mesh| {
+            crate::eff_render::ParticleBatch {
+                texture: mesh.texture,
+                additive: mesh.additive,
+                instances: mesh.instances,
+            }
+        }));
+        let pending = effects.pending_textures;
 
         let instances: usize = batches.iter().map(|batch| batch.instances.len()).sum();
         println!(
@@ -827,7 +914,10 @@ mod tests {
                 texture.image.height()
             );
         }
-        assert!(!batches.is_empty(), "no batch built for a resolvable effect");
+        assert!(
+            !batches.is_empty(),
+            "no batch of either kind built for a resolvable effect"
+        );
         assert!(instances > 0, "no particles placed");
         assert!(!pending.is_empty(), "no texture decoded for upload");
 
@@ -847,10 +937,15 @@ mod tests {
         // A texture already resident must not be decoded again: decoding is the expensive part
         // and it would otherwise run every frame the effect is live.
         let key = pending[0].key.clone();
-        let (_batches, again, _) =
-            build_particle_batches(&mut resolver, &|k| *k == key, &|_| false, &bones, &live);
+        let (again_effects, _) =
+            build_particle_batches(
+                &mut resolver, &|k| *k == key, &|_| false, &|_| false,
+                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &live);
         assert!(
-            again.iter().all(|texture| texture.key != key),
+            again_effects
+                .pending_textures
+                .iter()
+                .all(|texture| texture.key != key),
             "a resident texture was decoded again"
         );
 
@@ -862,10 +957,23 @@ mod tests {
             alpha: 1.0,
             age: 4.0,
         }];
-        let (none, _, _) =
-            build_particle_batches(&mut resolver, &|_| false, &|_| false, &bones, &missing);
+        let (none_effects, _) =
+            build_particle_batches(
+                &mut resolver, &|_| false, &|_| false, &|_| false,
+                &mut crate::eff_mesh::MeshLibrary::default(), &bones, &missing);
+        let none: Vec<usize> = none_effects
+            .batches
+            .iter()
+            .map(|batch| batch.instances.len())
+            .chain(
+                none_effects
+                    .mesh_batches
+                    .iter()
+                    .map(|batch| batch.instances.len()),
+            )
+            .collect();
         assert!(
-            none.iter().all(|batch| batch.instances.is_empty()),
+            none.iter().all(|count| *count == 0),
             "particles placed for a bone that does not exist"
         );
     }
@@ -949,7 +1057,7 @@ mod tests {
             let mut primitive_ids: std::collections::BTreeSet<i64> =
                 std::collections::BTreeSet::new();
             for set in &loaded.ptcl.emitter_sets {
-                for (_emitter_index, emitter) in set.emitters.iter().enumerate() {
+                for emitter in set.emitters.iter() {
                     emitters += 1;
                     if emitter.texture_index.is_some() {
                         textured += 1;
@@ -1106,7 +1214,7 @@ mod tests {
                     part.start_frame,
                     part.bone
                 );
-                for (emitter_index, emitter) in set.emitters.iter().enumerate() {
+                for emitter in set.emitters.iter() {
                     let value = |slot: usize| -> Option<i64> {
                         match emitter.attrs.get(slot).and_then(|a| a.as_ref())? {
                             crate::eff_attrs::AttrValue::Int(v) => Some(*v),
@@ -1456,6 +1564,174 @@ mod tests {
                 "  emitters              : {emitters}, of which {mesh} draw a primitive \
                  ({} distinct), {unresolved} name an id this file has no descriptor for",
                 used.len()
+            );
+        }
+    }
+
+    /// What an effect primitive's geometry actually looks like, before writing a mesh loader.
+    ///
+    /// Half of all emitters draw one of these. The vertex layout is not documented anywhere,
+    /// so the attribute names, their formats, and the index encoding are read off real models
+    /// rather than assumed — a wrong stride or format silently produces a cloud of scattered
+    /// triangles rather than an error.
+    #[test]
+    fn what_effect_primitives_are_made_of() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let path = root.join("effect/fighter/edge/ef_edge.eff");
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let raw = effect_library::NamcoEffectFile::load(&bytes).expect("parse eff");
+        let info = raw
+            .ptcl_file
+            .as_ref()
+            .and_then(|ptcl| ptcl.primitive_info.as_ref())
+            .expect("ef_edge has a primitive pool");
+        let blob = info.binary_data.as_ref().expect("pool has a bfres blob");
+        println!(
+            "\n{} descriptors, {} byte bfres blob",
+            info.descriptors.len(),
+            blob.len()
+        );
+
+        let mut formats: std::collections::BTreeMap<(String, u16), usize> = Default::default();
+        let mut index_formats: std::collections::BTreeMap<u32, usize> = Default::default();
+        let mut primitive_types: std::collections::BTreeMap<u32, usize> = Default::default();
+        let mut loaded_models = 0usize;
+
+        for index in 0..info.descriptors.len().min(8) {
+            let single = match effect_library::bfres::ResFile::export_single_model(blob, index) {
+                Ok(single) => single,
+                Err(error) => {
+                    println!("  model {index}: export failed: {error}");
+                    continue;
+                }
+            };
+            let (name, model) =
+                match effect_library::bfres::ResFile::parse_model_export(single) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        println!("  model {index}: parse failed: {error}");
+                        continue;
+                    }
+                };
+            loaded_models += 1;
+            let vertices: u32 = model.vertex_buffers.iter().map(|b| b.vertex_count).sum();
+            let mut attrs: Vec<String> = Vec::new();
+            for buffer in &model.vertex_buffers {
+                for (attr_name, attr) in buffer.attributes.iter() {
+                    *formats.entry((attr_name.clone(), attr.format)).or_insert(0) += 1;
+                    attrs.push(format!(
+                        "{attr_name}(fmt={:#06x} buf={} off={})",
+                        attr.format, attr.buffer_index, attr.offset
+                    ));
+                }
+            }
+            let strides: Vec<u32> = model
+                .vertex_buffers
+                .iter()
+                .flat_map(|b| b.buffer_strides.clone())
+                .collect();
+            let mut mesh_desc = Vec::new();
+            for shape in model.shapes.values() {
+                for mesh in &shape.meshes {
+                    *index_formats.entry(mesh.index_format).or_insert(0) += 1;
+                    *primitive_types.entry(mesh.primitive_type).or_insert(0) += 1;
+                    mesh_desc.push(format!(
+                        "{} idx={} fmt={} prim={} bytes={}",
+                        shape.name,
+                        mesh.index_count,
+                        mesh.index_format,
+                        mesh.primitive_type,
+                        mesh.index_data.len()
+                    ));
+                }
+            }
+            println!(
+                "  [{index}] '{name}' verts={vertices} strides={strides:?} shapes={}",
+                model.shapes.len()
+            );
+            println!("      attrs: {}", attrs.join(", "));
+            for line in mesh_desc.iter().take(2) {
+                println!("      mesh: {line}");
+            }
+        }
+
+        println!("\n  attribute formats seen: {formats:?}");
+        println!("  index formats seen: {index_formats:?}");
+        println!("  primitive types seen: {primitive_types:?}");
+        assert!(loaded_models > 0, "no primitive model could be extracted");
+    }
+
+    /// The mesh path end to end: a transplanted effect that draws geometry produces mesh
+    /// batches with real primitives behind them, not billboards.
+    #[test]
+    fn geometry_emitters_produce_mesh_batches() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let edge = root.join("effect/fighter/edge/ef_edge.eff");
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(Some(edge.clone()), Vec::new(), None);
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+
+        let mut bones = std::collections::HashMap::new();
+        bones.insert("Top".to_string(), glam::Mat4::from_translation(glam::Vec3::Y * 10.0));
+
+        let live = vec![LiveEffect {
+            name: "EDGE_ATTACK_DASH_HIT".into(),
+            bone: "top".into(),
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            age: 4.0,
+        }];
+        let (effects, _) = build_particle_batches(
+            &mut resolver,
+            &|_| false,
+            &|_| false,
+            &|_| false,
+            &mut meshes,
+            &bones,
+            &live,
+        );
+
+        let quad_instances: usize = effects.batches.iter().map(|b| b.instances.len()).sum();
+        let mesh_instances: usize = effects.mesh_batches.iter().map(|b| b.instances.len()).sum();
+        println!(
+            "
+EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,              {} mesh batch(es)/{mesh_instances} instances, {} primitive(s) to upload",
+            effects.batches.len(),
+            effects.mesh_batches.len(),
+            effects.pending_meshes.len()
+        );
+        for (key, mesh) in &effects.pending_meshes {
+            println!(
+                "  primitive {} -> '{}' {} verts {} tris",
+                key.descriptor,
+                mesh.name,
+                mesh.vertices.len(),
+                mesh.indices.len() / 3
+            );
+        }
+
+        assert!(
+            !effects.mesh_batches.is_empty(),
+            "a mesh-drawing effect produced no mesh batches"
+        );
+        assert!(mesh_instances > 0, "mesh batches carry no instances");
+        assert!(
+            !effects.pending_meshes.is_empty(),
+            "no primitive geometry was extracted for upload"
+        );
+        // Every mesh batch must name a primitive that really extracted, or the draw silently
+        // does nothing.
+        for batch in &effects.mesh_batches {
+            assert!(
+                meshes.mesh(&batch.mesh).is_some(),
+                "mesh batch names primitive {} which does not extract",
+                batch.mesh.descriptor
             );
         }
     }
