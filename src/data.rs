@@ -6714,9 +6714,6 @@ pub struct FighterEntry {
     pub display_name: String,
     #[allow(dead_code)]
     pub param_path: PathBuf,
-    pub motion_dir: PathBuf,
-    pub model_dir: PathBuf,
-    pub effect_dir: Option<PathBuf>,
     /// Costume slots that actually exist on disk for this fighter, ascending. Vanilla
     /// fighters yield 0..=7; mods add c08+ and community slot packs go well past that.
     pub slots: Vec<u8>,
@@ -7073,6 +7070,99 @@ pub fn part_costume_slots(part_dir: &std::path::Path) -> Vec<u8> {
 /// Locate a model part's `model.nusktb`, preferring `preferred_slot` and otherwise taking the
 /// lowest slot the part actually has.
 ///
+/// The root and slot that should back a preview of costume `requested` for one fighter
+/// part/category (e.g. `("model", "body")` or `("motion", "body")`): whichever configured
+/// root ships `<category>/<part>/cNN/<marker>` for `requested` itself, or failing that the
+/// nearest OTHER slot that does (preferring the nearest slot below, since a costume
+/// conventionally shares its base's data — a slot-add mod's second costume shares that mod's
+/// own base slot, not necessarily the fighter's lowest vanilla slot).
+///
+/// A slot-add mod frequently lives in a different root than the fighter's vanilla dump, and
+/// its model and moveset don't have to live in the same root as each other, so
+/// [`FighterEntry::fighter_dir`] (fixed to whichever root first claimed the fighter's name)
+/// cannot be assumed to hold every slot's files — this searches every root instead, once per
+/// part/category.
+pub fn resolve_costume_root(
+    roots: &[PathBuf],
+    name: &str,
+    category: &str,
+    part: &str,
+    marker: &str,
+    requested: u8,
+    all_slots: &[u8],
+) -> Option<(PathBuf, u8)> {
+    let mut below: Vec<u8> = all_slots.iter().copied().filter(|s| *s < requested).collect();
+    below.sort_unstable_by(|a, b| b.cmp(a));
+    let mut above: Vec<u8> = all_slots.iter().copied().filter(|s| *s > requested).collect();
+    above.sort_unstable();
+    let order = std::iter::once(requested).chain(below).chain(above);
+    for slot in order {
+        let slot_dir = format!("c{slot:02}");
+        for root in roots {
+            let path = root
+                .join("fighter")
+                .join(name)
+                .join(category)
+                .join(part)
+                .join(&slot_dir)
+                .join(marker);
+            if path.exists() {
+                return Some((root.clone(), slot));
+            }
+        }
+    }
+    None
+}
+
+/// The costume slots that belong to the same slot-add mod as `slot`, for scoping an export.
+///
+/// A moveset skinned onto a vanilla fighter's spare costumes is still that fighter as far as
+/// the game is concerned, so its scripts have to be installed for its own slots only. The mod
+/// that owns those slots is the root that ships `slot`; the slots to scope to are the ones
+/// *that same root* provides for the fighter — not every slot the fighter has, which would
+/// include the vanilla dump's, and not `slot` alone, which would leave the mod's other
+/// costumes running the vanilla moveset.
+///
+/// `roots[0]` is the game-data root when one is open, so a slot found there is a vanilla
+/// costume: the answer is then empty, meaning "install unscoped", which is what editing a
+/// vanilla fighter has always done.
+pub fn mod_costume_slots(
+    roots: &[PathBuf],
+    name: &str,
+    slot: u8,
+    data_root: Option<&std::path::Path>,
+) -> Vec<u8> {
+    let provides = |root: &std::path::Path, slot: u8| {
+        let fighter = root.join("fighter").join(name);
+        let dir = format!("c{slot:02}");
+        fighter
+            .join("model")
+            .join("body")
+            .join(&dir)
+            .join("model.nusktb")
+            .exists()
+            || fighter
+                .join("motion")
+                .join("body")
+                .join(&dir)
+                .join("motion_list.bin")
+                .exists()
+    };
+    let Some(owner) = roots.iter().find(|root| provides(root, slot)) else {
+        return Vec::new();
+    };
+    if data_root.is_some_and(|data| owner.as_path() == data) {
+        return Vec::new();
+    }
+    let mut slots: Vec<u8> = discover_costume_slots(std::slice::from_ref(owner), name)
+        .into_iter()
+        .filter(|candidate| provides(owner, *candidate))
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
+}
+
 /// Weapon parts routinely carry a different slot set from the body, and a modded fighter may
 /// ship no `c00` at all — hardcoding `c00` silently dropped that fighter's weapons.
 pub fn find_part_skel(part_dir: &std::path::Path, preferred_slot: u8) -> Option<PathBuf> {

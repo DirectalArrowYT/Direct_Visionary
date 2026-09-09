@@ -34,6 +34,7 @@ effect_library = "1.1.4"
 bntx = { git = "https://github.com/ScanMountGoat/bntx.git", rev = "87fffc7d17238cb07ff93ec75e0a7b5db15f4683" }
 binrw = "0.15"
 image_dds = "0.7"
+bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Async + HTTP (for ACMD fetch)

@@ -436,6 +436,19 @@ pub enum ParamValue {
 pub struct FighterMod {
     #[serde(default)]
     pub display: String,
+    /// Costume slots this fighter's edits belong to, when they belong to a slot-add mod rather
+    /// than to the fighter itself.
+    ///
+    /// A moveset skinned onto an existing fighter's spare slots is still, to the game, that
+    /// fighter — installing its scripts unscoped replaces the move on every costume, so the
+    /// vanilla character stops working. Smashline scopes an agent with `set_costume`, and this
+    /// is the list the export passes to it.
+    ///
+    /// Empty means the edits are the fighter's own and are installed for every costume, which
+    /// is what an unscoped export has always done. `#[serde(default)]` keeps projects saved
+    /// before this field loadable on exactly those terms.
+    #[serde(default)]
+    pub costume_slots: Vec<u8>,
     /// move name → hitbox/script edit (the hitbox editor's existing edit-log record)
     #[serde(default)]
     pub acmd: HashMap<String, EditRecord>,

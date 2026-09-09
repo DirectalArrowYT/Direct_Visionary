@@ -499,6 +499,7 @@ impl SourceIndex {
                 }
             }
         }
+        let mut aliases: Vec<(String, String, ScriptSite)> = Vec::new();
         for (file, text) in &sources {
             index.index_file(
                 file,
@@ -506,10 +507,53 @@ impl SourceIndex {
                 &fighter_scopes,
                 &project_wide,
                 &project_registrations,
+                &mut aliases,
             );
         }
+        index.apply_aliases(aliases);
         index.files = files;
         Ok(index)
+    }
+
+    /// Record conventional names that nothing else claimed.
+    ///
+    /// A project may register a function under a name that is not the one the move's script is
+    /// actually called: `.game_acmd("game_attacks3", game_attacks3s, …)` installs the *side
+    /// tilt* function under the unangled name. The registration is authoritative for what the
+    /// game installs, so it stays the primary identity — but `game_attacks3s` is the name the
+    /// editor asks for when that move is selected, and indexing only the registered name made
+    /// every such move read as empty while its sibling categories still resolved.
+    ///
+    /// An alias is therefore deliberately weaker than a registration: it is applied only after
+    /// every file is indexed, only where nothing else already claims the name, and never as a
+    /// conflict. Where the same alias is reached from two different functions it is dropped
+    /// rather than guessed between.
+    fn apply_aliases(&mut self, aliases: Vec<(String, String, ScriptSite)>) {
+        let mut by_name: HashMap<(String, String), Vec<ScriptSite>> = HashMap::new();
+        for (fighter, script, site) in aliases {
+            let entry = by_name
+                .entry((normalize_fighter(&fighter), script))
+                .or_default();
+            if !entry.contains(&site) {
+                entry.push(site);
+            }
+        }
+        for ((fighter, script), sites) in by_name {
+            let [site] = sites.as_slice() else { continue };
+            if self
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.fighter == fighter && conflict.script == script)
+            {
+                continue;
+            }
+            self.fighters
+                .entry(fighter)
+                .or_default()
+                .scripts
+                .entry(script)
+                .or_insert_with(|| site.clone());
+        }
     }
 
     /// Total number of indexed scripts, across every fighter.
@@ -619,6 +663,7 @@ impl SourceIndex {
         fighter_scopes: &HashMap<PathBuf, Vec<String>>,
         project_wide: &[String],
         project_registrations: &HashMap<String, Vec<RegisteredScript>>,
+        aliases: &mut Vec<(String, String, ScriptSite)>,
     ) {
         let functions = scan_acmd_functions(text);
         if functions.is_empty() {
@@ -683,16 +728,23 @@ impl SourceIndex {
             else {
                 continue;
             };
+            let site = ScriptSite {
+                file: file.to_path_buf(),
+                function: function.name.clone(),
+                span: function.span.clone(),
+            };
+            // The function's own conventional name, when the project registered it as
+            // something else. See `apply_aliases` for why this is kept, and why it is weaker
+            // than the registration above.
+            if !script_names.contains(&function.name)
+                && ["game_", "effect_", "sound_", "expression_"]
+                    .iter()
+                    .any(|prefix| function.name.starts_with(prefix))
+            {
+                aliases.push((fighter.clone(), function.name.clone(), site.clone()));
+            }
             for script_name in script_names {
-                self.record_script(
-                    &fighter,
-                    script_name,
-                    ScriptSite {
-                        file: file.to_path_buf(),
-                        function: function.name.clone(),
-                        span: function.span.clone(),
-                    },
-                );
+                self.record_script(&fighter, script_name, site.clone());
             }
         }
     }
@@ -984,6 +1036,8 @@ fn scan_acmd_registrations(text: &str) -> Vec<(&str, &str)> {
         ".acmd(",
         ".game_acmd(",
         ".effect_acmd(",
+        ".sound_acmd(",
+        ".expression_acmd(",
         "install_acmd_script!(",
     ] {
         let mut search = 0;
@@ -2524,6 +2578,55 @@ pub fn sync_effect_calls(
     sync_script(index, fighter, &script_name, |body| {
         rewrite_effect_calls(body, &format!("{fighter}/{move_name}"), pristine, edited)
     })
+}
+
+/// Replace one indexed function's whole body with `generated`, keeping the project's own name
+/// for it.
+///
+/// This is the deliberate opposite of [`sync_script`]'s write-back. That pass rewrites argument
+/// *values* in place and refuses everything structural, so the user's macros, comments, and
+/// formatting survive — at the cost of not being able to land a call that is not already in the
+/// file. This one takes the regenerated function whole, which lands added and removed calls,
+/// retimed blocks, and changed macros in a single step, and costs exactly what the other pass
+/// protects: anything hand-written inside this one function is replaced.
+///
+/// The header is respelled to whatever the project calls this function, so a registration
+/// pointing at `my_nair` keeps pointing at `my_nair` and does not silently install nothing. Only
+/// the one function's span is touched; imports, the install block, and every other move in the
+/// file are left exactly as they were.
+///
+/// Returns the file written, or `None` when the generated text already matched.
+pub fn overwrite_script(
+    index: &SourceIndex,
+    fighter: &str,
+    script_name: &str,
+    generated: &str,
+) -> Result<Option<PathBuf>> {
+    if let Some(conflict) = index.conflict(fighter, script_name) {
+        bail!("{}", conflict.description());
+    }
+    let Some(site) = index.script(fighter, script_name) else {
+        bail!("{fighter}: the project has no {script_name} to write into");
+    };
+    let text = std::fs::read_to_string(&site.file)
+        .with_context(|| format!("reading {}", site.file.display()))?;
+    let Some(body) = text.get(site.span.clone()) else {
+        bail!(
+            "{} changed on disk since it was indexed — rescan and try again",
+            site.file.display()
+        );
+    };
+    let replacement = header_named(generated.trim_end(), &site.function);
+    if replacement == body {
+        return Ok(None);
+    }
+    let mut updated = String::with_capacity(text.len() + replacement.len());
+    updated.push_str(&text[..site.span.start]);
+    updated.push_str(&replacement);
+    updated.push_str(&text[site.span.end..]);
+    std::fs::write(&site.file, &updated)
+        .with_context(|| format!("writing {}", site.file.display()))?;
+    Ok(Some(site.file.clone()))
 }
 
 /// Read one indexed script, hand its text to `rewrite`, and splice the result back in.
@@ -9001,6 +9104,194 @@ pub fn install(agent: &mut smashline::Agent) {
         let after = std::fs::read_to_string(&game_file).unwrap();
         assert!(after.contains("fn hudsons_nair(agent"));
         assert!(after.contains("frame(agent.lua_state_agent, 6.0)"));
+    }
+
+    /// A slot-add moveset registering its angled side tilt under the *unangled* script name —
+    /// `.game_acmd("game_attacks3", game_attacks3s, High)`. The registration is what the game
+    /// installs and stays the primary identity, but the move the editor opens is
+    /// `attack_s3_s`, whose script is `game_attacks3s`. Indexing only the registered name made
+    /// that move's collisions, motion state, and effects read as empty while its `sound_`
+    /// function — registered the same way, but conventionally named — still resolved.
+    #[test]
+    fn a_function_registered_under_another_name_keeps_its_own_conventional_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/eflame/acmd/tilts.rs",
+            r#"unsafe extern "C" fn game_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 22.0);
+    if macros::is_excute(agent) {
+        macros::ATTACK(agent, 0, 0, Hash40::new("handr"), 8.0, 361, 100, 0, 50, 6.5, 0.0, 0.0, 0.0, Some(-3.0), Some(3.0), Some(0.0), 1.0, 1.0, *ATTACK_SETOFF_KIND_ON, *ATTACK_LR_CHECK_F, false, 0, 0.0, 0, false, true, false, false, true, *COLLISION_SITUATION_MASK_GA, *COLLISION_CATEGORY_MASK_ALL, *COLLISION_PART_MASK_ALL, false, Hash40::new("collision_attr_normal"), *ATTACK_SOUND_LEVEL_M, *COLLISION_SOUND_ATTR_PUNCH, *ATTACK_REGION_PUNCH);
+    }
+}
+
+unsafe extern "C" fn sound_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 25.0);
+    if macros::is_excute(agent) {
+        macros::PLAY_STEP(agent, Hash40::new("se_common_011"));
+    }
+}
+
+unsafe extern "C" fn effect_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new("edge_attack_dash_hit"), Hash40::new("handr"), 2, 1, 0, 0, 0, 0, 1, true);
+    }
+}
+
+pub fn install() {
+    Agent::new("eflame")
+    .set_costume(vec![80, 81])
+    .game_acmd("game_attacks3", game_attacks3s, High)
+    .sound_acmd("sound_attacks3", sound_attacks3s, High)
+    .effect_acmd("effect_attacks3", effect_attacks3s, High)
+    .install();
+}
+"#,
+        );
+
+        let index = SourceIndex::build(tmp.path()).unwrap();
+
+        // The registered names remain the primary identity — that is what smashline installs.
+        assert!(index.script("eflame", "game_attacks3").is_some());
+        assert!(index.script("eflame", "effect_attacks3").is_some());
+        assert!(index.script("eflame", "sound_attacks3").is_some());
+
+        // …and the move the editor actually opens resolves to the same functions.
+        let project = index.script_source("eflame", "attack_s3_s").unwrap();
+        assert_eq!(project.covers, ["game_", "effect_", "sound_"]);
+        assert_eq!(
+            crate::acmd::parse_acmd_script(&project.body).to_hitboxes().len(),
+            1,
+            "side tilt's collisions load under its own script name"
+        );
+        assert!(
+            !crate::acmd::parse_effect_script(&project.body).stmts.is_empty(),
+            "side tilt's effects load under its own script name"
+        );
+        assert!(!index.conflicts.iter().any(|c| c.script.contains("attacks3")));
+    }
+
+    /// The write `sync_effect_calls` refuses. Overwriting takes the regenerated function whole,
+    /// so a spawn the project never had lands — and the project's own name for the function is
+    /// kept, because renaming it would leave its registration pointing at nothing.
+    #[test]
+    fn overwriting_lands_a_new_call_and_keeps_the_projects_function_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = write(
+            tmp.path(),
+            "src/eflame/tilts.rs",
+            r#"unsafe extern "C" fn my_side_tilt_vfx(agent: &mut L2CAgentBase) {
+    // hand-written note that the overwrite is allowed to replace
+    frame(agent.lua_state_agent, 16.0);
+}
+
+pub fn install() {
+    Agent::new("eflame")
+    .effect_acmd("effect_attacks3s", my_side_tilt_vfx, High)
+    .install();
+}
+"#,
+        );
+
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let generated = r#"unsafe extern "C" fn effect_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 16.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FLW_POS_NO_STOP(agent, Hash40::new("sys_hit_l"), Hash40::new("handr"), 2, 1, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let written = overwrite_script(&index, "eflame", "effect_attacks3s", generated)
+            .unwrap()
+            .expect("the function differed, so the file is written");
+        assert_eq!(written, file);
+
+        let after = std::fs::read_to_string(&file).unwrap();
+        // The added spawn is in the file — the whole point.
+        assert!(after.contains("EFFECT_FLW_POS_NO_STOP"));
+        // Under the project's own name, so `.effect_acmd(…, my_side_tilt_vfx, …)` still resolves.
+        assert!(after.contains("fn my_side_tilt_vfx(agent"));
+        assert!(!after.contains("fn effect_attacks3s(agent"));
+        // Only that function was replaced.
+        assert!(after.contains(".effect_acmd(\"effect_attacks3s\", my_side_tilt_vfx, High)"));
+        assert!(after.contains("pub fn install()"));
+        // And the replaced body really is gone, which is the cost the button states.
+        assert!(!after.contains("hand-written note"));
+
+        // Writing the same text again is a no-op rather than a second edit.
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert_eq!(
+            overwrite_script(&index, "eflame", "effect_attacks3s", generated).unwrap(),
+            None
+        );
+    }
+
+    /// Overwriting a script the project does not have refuses instead of inventing a home for
+    /// it — the same boundary `sync_script` keeps.
+    #[test]
+    fn overwriting_a_script_the_project_lacks_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/eflame/tilts.rs",
+            r#"unsafe extern "C" fn game_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+}
+
+pub fn install() {
+    Agent::new("eflame")
+    .game_acmd("game_attacks3s", game_attacks3s, High)
+    .install();
+}
+"#,
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        let error = overwrite_script(&index, "eflame", "effect_attacks3s", "fn x() {}")
+            .expect_err("no effect script exists");
+        assert!(
+            error.to_string().contains("no effect_attacks3s"),
+            "{error}"
+        );
+    }
+
+    /// The alias above must never win over a real registration, nor manufacture a conflict.
+    #[test]
+    fn a_conventional_alias_never_displaces_a_real_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/eflame/moves.rs",
+            r#"unsafe extern "C" fn game_attacks3s(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+}
+
+unsafe extern "C" fn angled_side_tilt(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 2.0);
+}
+
+pub fn install() {
+    Agent::new("eflame")
+    .game_acmd("game_attacks3", game_attacks3s, High)
+    .game_acmd("game_attacks3s", angled_side_tilt, High)
+    .install();
+}
+"#,
+        );
+
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        // `game_attacks3s` the *function* would alias onto `game_attacks3s` the script name,
+        // but `angled_side_tilt` is registered as exactly that — so the alias stands down
+        // rather than displacing it or turning the pair into a conflict.
+        assert_eq!(
+            index.script("eflame", "game_attacks3s").unwrap().function,
+            "angled_side_tilt"
+        );
+        assert_eq!(
+            index.script("eflame", "game_attacks3").unwrap().function,
+            "game_attacks3s"
+        );
+        assert!(index.conflicts.is_empty());
     }
 
     #[test]
