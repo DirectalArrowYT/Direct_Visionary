@@ -67,6 +67,42 @@ pub struct EmitterSim {
     /// gives every particle in the game the same size, because emitters are nearly all 1.0.
     pub scale_keys: Vec<(f32, glam::Vec3)>,
     pub billboard_type: i64,
+    /// How the emitter's particles blend with what is behind them.
+    ///
+    /// 0 is normal alpha, 1 additive, 2 subtractive -- the format's own numbering, with 0 the
+    /// default as a format's zero usually is. Across two real fighter files this splits about
+    /// 73 / 25 / 3, so an assumption that everything is additive is wrong for roughly three
+    /// quarters of every emitter in the game, and wrong in the direction that makes smoke and
+    /// dust glow like fire.
+    pub blend_type: i64,
+    /// The particle's own roll about the quad's normal, and how it changes.
+    ///
+    /// `init` is where the particle starts, `init_rand` a symmetric spread on that, `add` the
+    /// per-frame velocity and `add_rand` a spread on that. Radians, as the emitter's own
+    /// rotation is.
+    ///
+    /// Reading these is what tells a spinning smoke puff apart from an attack arc. Both are
+    /// one quad with a texture on it; the puff carries a full turn of `init_rand` so every
+    /// one in the cloud sits differently, and the arc carries zeros because the crescent is
+    /// painted at the angle it is meant to be seen at. Substituting a random roll for the
+    /// data made the puffs look right and left the arc at a random angle every time -- and no
+    /// orientation setting could correct it, because the error was per-particle.
+    pub rotate_init: glam::Vec3,
+    pub rotate_init_rand: glam::Vec3,
+    pub rotate_add: glam::Vec3,
+    pub rotate_add_rand: glam::Vec3,
+    /// Which axes the emitter actually animates, from `particle_data.is_rotate_*`.
+    ///
+    /// Not decoration. Across ef_common Z is enabled on 49% of emitters, Y on 14% and X on
+    /// 5%, so an implementation that assumes the roll is always about Z covers about half the
+    /// game and silently drops the rest -- including SYS_ATTACK_ARC, which sweeps about Y.
+    pub rotate_enabled: [bool; 3],
+    /// Per-frame multiplier on rotation velocity -- a resistance, not a rate. The arc carries
+    /// 0.99 and its cylinder 0.98, so the sweep slows as it goes.
+    ///
+    /// Zero means the emitter never set it, not "stop instantly": treating an unset field as
+    /// total damping would freeze every rotation in the game.
+    pub rotate_regist: f32,
     /// Number of cells the emitter's texture is divided into. Zero or one means the texture is
     /// a single image and the particle uses all of it.
     pub pattern_cells: u32,
@@ -130,6 +166,13 @@ pub struct Slots {
     num_scale_keys: Option<usize>,
     scale_keys: Vec<[Option<usize>; 4]>,
     billboard_type: Option<usize>,
+    blend_type: Option<usize>,
+    rotate_init: [Option<usize>; 3],
+    rotate_init_rand: [Option<usize>; 3],
+    rotate_add: [Option<usize>; 3],
+    rotate_add_rand: [Option<usize>; 3],
+    is_rotate: [Option<usize>; 3],
+    rotate_regist: Option<usize>,
 }
 
 impl Slots {
@@ -197,6 +240,33 @@ impl Slots {
                 })
                 .collect(),
             billboard_type: at("particle_data.billboard_type"),
+            blend_type: at("render_state.blend_type"),
+            rotate_init: [
+                at("emitter_static.rotate_init_x"),
+                at("emitter_static.rotate_init_y"),
+                at("emitter_static.rotate_init_z"),
+            ],
+            rotate_init_rand: [
+                at("emitter_static.rotate_init_rand_x"),
+                at("emitter_static.rotate_init_rand_y"),
+                at("emitter_static.rotate_init_rand_z"),
+            ],
+            rotate_add: [
+                at("emitter_static.rotate_add_x"),
+                at("emitter_static.rotate_add_y"),
+                at("emitter_static.rotate_add_z"),
+            ],
+            rotate_add_rand: [
+                at("emitter_static.rotate_add_rand_x"),
+                at("emitter_static.rotate_add_rand_y"),
+                at("emitter_static.rotate_add_rand_z"),
+            ],
+            is_rotate: [
+                at("particle_data.is_rotate_x"),
+                at("particle_data.is_rotate_y"),
+                at("particle_data.is_rotate_z"),
+            ],
+            rotate_regist: at("emitter_static.rotate_regist"),
         }
     }
 }
@@ -286,6 +356,26 @@ impl EmitterSim {
                     AttrValue::Float(v) => *v as i64,
                 })
                 .unwrap_or(0),
+            blend_type: emitter
+                .attrs
+                .get(slots.blend_type.unwrap_or(usize::MAX))
+                .and_then(|value| value.as_ref())
+                .map(|value| match value {
+                    AttrValue::Int(v) => *v,
+                    AttrValue::UInt(v) => *v as i64,
+                    AttrValue::Float(v) => *v as i64,
+                })
+                .unwrap_or(0),
+            rotate_init: vec3(&slots.rotate_init),
+            rotate_init_rand: vec3(&slots.rotate_init_rand),
+            rotate_add: vec3(&slots.rotate_add),
+            rotate_add_rand: vec3(&slots.rotate_add_rand),
+            rotate_enabled: [
+                get(slots.is_rotate[0]).unwrap_or(0.0) != 0.0,
+                get(slots.is_rotate[1]).unwrap_or(0.0) != 0.0,
+                get(slots.is_rotate[2]).unwrap_or(0.0) != 0.0,
+            ],
+            rotate_regist: get(slots.rotate_regist).unwrap_or(0.0),
             color0: emitter.color0.clone(),
             alpha0: emitter.alpha0_keys.clone(),
         }
@@ -322,6 +412,20 @@ pub struct SimParticle {
     pub rotation: f32,
     /// Which cell of the emitter's sprite sheet this particle is showing right now.
     pub cell: u32,
+    /// The particle's own turn, per axis, in radians at this age.
+    ///
+    /// Three axes rather than one because the emitter says which axis it animates and it is
+    /// not always the same one -- an arc sweeps about Y, a spark tumbles about Z. Which of
+    /// these is visible depends on how the quad is built, so the choice is made where the
+    /// billboard mode is known rather than here.
+    pub spin: glam::Vec3,
+    /// Where the particle is heading right now, in the effect's own frame.
+    ///
+    /// The derivative of `offset`, so it already carries gravity: a spark thrown up and falling
+    /// back points up early in its life and down late in it, which is the whole reason a
+    /// velocity-oriented billboard looks like a spark and not a square. Unused by the plane
+    /// modes, which take their axes from the emitter instead.
+    pub velocity: glam::Vec3,
 }
 
 /// Sample a keyframe list at a normalised age.
@@ -568,6 +672,33 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             0
         };
 
+        // The turn the emitter actually asks for, per axis, rather than a random one.
+        //
+        // A cloud still looks like a cloud through this, because a puff emitter carries a full
+        // turn in `rotate_init_rand_*` and gets its scatter from the data. An arc carries zeros
+        // for its initial angle and a velocity about Y, so it sweeps instead of sitting at a
+        // different random angle every time the frame is evaluated.
+        let mut spin = glam::Vec3::ZERO;
+        for axis in 0..3 {
+            if !sim.rotate_enabled[axis] {
+                continue;
+            }
+            let start = sim.rotate_init[axis]
+                + sim.rotate_init_rand[axis] * hashed_signed(seed, id ^ (0x61 + axis as u64));
+            let rate = sim.rotate_add[axis]
+                + sim.rotate_add_rand[axis] * hashed_signed(seed, id ^ (0x71 + axis as u64));
+            // `rotate_regist` damps the velocity each frame, so the total turn is a geometric
+            // series rather than rate*age. Outside (0, 1) it is either unset or not damping,
+            // and the undamped sum is the right reading of both.
+            let turned = if sim.rotate_regist > 0.0 && sim.rotate_regist < 1.0 {
+                let r = sim.rotate_regist;
+                rate * (1.0 - r.powf(age)) / (1.0 - r)
+            } else {
+                rate * age
+            };
+            spin[axis] = start + turned;
+        }
+
         let curve = sample_scale(&sim.scale_keys, age, life);
         particles.push(SimParticle {
             offset,
@@ -575,8 +706,12 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             // laid out: the curve is the shape of the size over life, the emitter scales it.
             size: (curve.x.max(curve.y) * sim.scale.x.max(sim.scale.y)).max(0.01),
             color: [color[0], color[1], color[2], alpha * fade],
-            rotation: hashed(seed, id ^ 0x61) * std::f32::consts::TAU,
+            rotation: spin.z,
+            spin,
             cell,
+            // d/dt of `offset`. Taking the birth velocity instead would point every particle
+            // of a falling burst upwards for its whole life.
+            velocity: velocity + sim.gravity * age,
         });
     }
     particles
@@ -605,6 +740,15 @@ mod tests {
             scale: glam::Vec3::ONE,
             scale_keys: Vec::new(),
             billboard_type: 0,
+            blend_type: 0,
+            // No roll: the fixture is about emission and motion, and a spin would only make
+            // its assertions harder to read.
+            rotate_init: glam::Vec3::ZERO,
+            rotate_init_rand: glam::Vec3::ZERO,
+            rotate_add: glam::Vec3::ZERO,
+            rotate_add_rand: glam::Vec3::ZERO,
+            rotate_enabled: [false; 3],
+            rotate_regist: 0.0,
             pattern_cells: 0,
             pattern_table: Vec::new(),
             pattern_frequency: 1.0,
@@ -679,6 +823,105 @@ mod tests {
         assert!(
             highest > -1.0,
             "the newest particles were dropped: highest y {highest}"
+        );
+    }
+
+    /// The blend mode comes from the emitter, not from an assumption about the corpus.
+    ///
+    /// Measured on two real fighter files (ef_kamui, ef_ridley): blend_type is 0 for about
+    /// 73% of emitters, 1 for 25% and 2 for 3%. Drawing everything additive -- which is what
+    /// this did -- therefore put roughly three quarters of the game's emitters in the wrong
+    /// mode, and in the direction that makes smoke and dust glow.
+    #[test]
+    fn only_the_emitters_that_ask_for_additive_get_it() {
+        assert!(!super::super::eff_runtime::is_additive(0), "0 is normal alpha");
+        assert!(super::super::eff_runtime::is_additive(1), "1 is additive");
+        // Subtractive darkens. With no subtractive pipeline, normal is far closer than
+        // additive, which would light up the very thing meant to dim.
+        assert!(!super::super::eff_runtime::is_additive(2), "2 is subtractive");
+    }
+
+    /// The arc sweeps about Y, and the axis comes from the data.
+    ///
+    /// SYS_ATTACK_ARC sets `is_rotate_y`, `rotate_add_y` of 0.0349 rad/frame and a
+    /// `rotate_regist` of 0.99, and leaves X and Z untouched. An implementation that reads
+    /// only Z gives it no motion at all -- which is what "the arc's shape never matches"
+    /// turned out to be.
+    #[test]
+    fn the_axis_a_particle_turns_about_is_the_one_the_emitter_enables() {
+        let mut sim = emitter();
+        sim.life = 40.0;
+        sim.rate = 1.0;
+        // The arc's own numbers.
+        sim.rotate_enabled = [false, true, false];
+        sim.rotate_add = glam::Vec3::new(0.0, 0.034906585, 0.0);
+        sim.rotate_regist = 0.99;
+
+        let particles = evaluate(&sim, 8.0, 7);
+        let newest = particles.first().expect("a particle exists");
+        let oldest = particles.last().expect("several ages exist");
+        // X and Z are not enabled, so nothing may leak into them.
+        assert_eq!(newest.spin.x, 0.0);
+        assert_eq!(newest.spin.z, 0.0);
+        assert!(oldest.spin.y > newest.spin.y, "the sweep must accumulate with age");
+
+        // Damped, so the turn is a geometric series and falls short of rate*age.
+        let age = 8.0f32;
+        let undamped = 0.034906585 * age;
+        let damped = particles
+            .iter()
+            .map(|p| p.spin.y)
+            .fold(0.0f32, f32::max);
+        assert!(damped < undamped, "regist 0.99 must slow the sweep: {damped} vs {undamped}");
+        assert!(damped > undamped * 0.9, "0.99 is light damping, not a stop: {damped}");
+    }
+
+    /// An emitter that asks for no roll gets no roll.
+    ///
+    /// This is the whole difference between an attack arc and a smoke puff, and it used to be
+    /// wrong in the direction that hides: every particle was given a uniformly random turn,
+    /// which is indistinguishable from correct on a radial puff and ruins a crescent. The arc
+    /// then sat at a different angle every time it was evaluated, which reads as "the shape is
+    /// wrong" rather than as "the roll is random" -- and no orientation setting could fix it,
+    /// because the error was per-particle rather than per-effect.
+    #[test]
+    fn a_particle_rolls_the_way_its_emitter_says_rather_than_at_random() {
+        let mut sim = emitter();
+        sim.life = 40.0;
+        sim.rate = 1.0;
+
+        // Zeros throughout: the arc case. Every particle must sit flat.
+        for particle in evaluate(&sim, 6.0, 99) {
+            assert_eq!(particle.rotation, 0.0, "an unrotated emitter produced a roll");
+        }
+
+        // A quarter turn asked for, and no randomness: every particle takes exactly it.
+        sim.rotate_enabled = [false, false, true];
+        sim.rotate_init = glam::Vec3::new(0.0, 0.0, std::f32::consts::FRAC_PI_2);
+        for particle in evaluate(&sim, 6.0, 99) {
+            assert!((particle.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        }
+
+        // Rotation velocity accumulates over the particle's own age, so a long-lived particle
+        // has turned further than a freshly born one.
+        sim.rotate_init = glam::Vec3::ZERO;
+        sim.rotate_add = glam::Vec3::new(0.0, 0.0, 0.1);
+        sim.rotate_enabled = [false, false, true];
+        let rolls: Vec<f32> = evaluate(&sim, 6.0, 99).iter().map(|p| p.rotation).collect();
+        assert!(rolls.len() > 1, "need several ages to compare");
+        let (newest, oldest) = (rolls[0], rolls[rolls.len() - 1]);
+        assert!(
+            oldest > newest,
+            "the older particle should have turned further: {oldest} vs {newest}"
+        );
+
+        // And the puff case still scatters, because the DATA asks it to.
+        sim.rotate_add = glam::Vec3::ZERO;
+        sim.rotate_init_rand = glam::Vec3::new(0.0, 0.0, std::f32::consts::PI);
+        let spread: Vec<f32> = evaluate(&sim, 6.0, 99).iter().map(|p| p.rotation).collect();
+        assert!(
+            spread.windows(2).any(|w| (w[0] - w[1]).abs() > 1e-3),
+            "an emitter asking for random roll must still scatter: {spread:?}"
         );
     }
 

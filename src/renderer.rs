@@ -910,7 +910,9 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 }
                 let transforms = state.camera.transforms(self.width, self.height);
                 // The billboard axes are the camera's own, in world space. `model_view` maps
-                // world to view, so its inverse holds the camera basis as its columns.
+                // world to view, so its inverse holds the camera basis as its columns — and
+                // its translation column is the eye, which the axis-locked modes need to work
+                // out how far to spin each quad about its locked axis.
                 let view_to_world = transforms.model_view_matrix.inverse();
                 particles.prepare(
                     device,
@@ -918,6 +920,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     transforms.mvp_matrix,
                     view_to_world.x_axis.truncate().normalize_or_zero(),
                     view_to_world.y_axis.truncate().normalize_or_zero(),
+                    view_to_world.w_axis.truncate(),
                     &self.particle_batches,
                     &self.mesh_batches,
                 );

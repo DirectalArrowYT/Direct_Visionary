@@ -47,13 +47,18 @@ pub struct ParticleInstance {
     /// (EDGE_ATTACK_DASH_HIT turns two of its emitters 90 degrees). Drawing every ring
     /// axis-aligned in world space puts them at the wrong angle to the fighter.
     pub orientation: [f32; 4],
-    /// Which plane this quad lies in: 0 camera-facing, 1 local XY, 2 local XZ, 3 local ZY.
+    /// How this quad builds its axes. See [`crate::eff_runtime::QuadPlanes::NAMES`]:
+    /// 0 camera-facing, 1 local XY, 2 local XZ, 3 local ZY, 4 Y-billboard, 5 velocity.
     ///
     /// Resolved from the emitter's `billboard_type` before it reaches here. Only type 0 is
     /// known to mean camera-facing; the rest are a mapping the user can change at runtime,
-    /// because which plane is right is a thing you can see and the data does not say.
+    /// because which one is right is a thing you can see and the data does not say.
     pub plane: u32,
-    pub _padding: [f32; 2],
+    /// World-space direction of travel, for the modes that orient along it. Zero for a
+    /// particle that is not moving, which those modes fall back to camera-facing for rather
+    /// than collapsing the quad to nothing.
+    pub velocity: [f32; 3],
+    pub _padding: [f32; 3],
 }
 
 /// A run of particles sharing one texture and one blend mode — the unit of a draw call.
@@ -125,6 +130,11 @@ struct ParticleCamera {
     /// inverting a matrix per vertex.
     camera_right: [f32; 4],
     camera_up: [f32; 4],
+    /// The eye, in world space. The axis-locked modes need the direction from the particle to
+    /// the camera, which the fixed right/up pair cannot give: those two are the same for every
+    /// particle on screen, and a quad that spins about its own axis to face the viewer has to
+    /// know where the viewer is relative to *it*.
+    camera_position: [f32; 4],
 }
 
 const SHADER: &str = r#"
@@ -132,6 +142,7 @@ struct Camera {
     view_projection: mat4x4<f32>,
     camera_right: vec4<f32>,
     camera_up: vec4<f32>,
+    camera_position: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -146,6 +157,7 @@ struct Instance {
     @location(4) uv_rect: vec4<f32>,
     @location(7) orientation: vec4<f32>,
     @location(8) plane: u32,
+    @location(9) velocity: vec3<f32>,
 };
 
 struct VertexOut {
@@ -171,18 +183,27 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     let c = cos(instance.rotation);
     let spun = vec2<f32>(corner.x * c - corner.y * s, corner.x * s + corner.y * c);
 
-    // The quad's plane depends on the emitter's billboard type. Only type 0 is certain --
-    // it faces the camera, which is what a billboard is, and it is the commonest by far
-    // (753 of 1348 emitters in ef_common). The oriented types put the quad in a fixed plane
-    // of the effect's own frame, and WHICH plane is the difference between an effect facing
-    // the viewer and facing along the attack.
+    // How the quad builds its axes depends on the emitter's billboard type. Only type 0 is
+    // certain -- it faces the camera, which is what a billboard is, and it is the commonest by
+    // far (753 of 1348 emitters in ef_common). The mapping from the file's type number to the
+    // modes below is a setting, because which one is right is a thing you can see and the data
+    // does not say.
+    //
+    // Two families, and the difference between them is why a fixed plane alone could never
+    // cover the corpus:
+    //
+    //   * PLANE modes (1, 2, 3) pin the quad to a plane of the effect's own frame and ignore
+    //     the camera entirely. Turn away from one and it goes edge-on. This is what a decal,
+    //     a slash arc, or a ground ring wants.
+    //   * AXIS-LOCKED modes (4, 5) keep one axis fixed and spin about it to face the viewer,
+    //     so they never go edge-on. 4 locks the effect's own up; 5 locks the direction the
+    //     particle is travelling, which is what makes a spark read as a streak rather than a
+    //     square, and it cannot be expressed as a plane at all because it is different for
+    //     every particle and changes as the particle falls.
     //
     // Type 5 spans forward-and-up, so its normal points sideways: a muzzle flash fired from
     // the hand faces left and right rather than at the screen. Measured on
     // MIIGUNNER_ATK_SHOT_S, which is types 5 and 0.
-    //
-    // The remaining types (1, 4, 6, 7 -- together under a tenth of the corpus) fall through to
-    // the local XY plane. That is a placeholder, not a reading of what they mean.
     var right = camera.camera_right.xyz;
     var up = camera.camera_up.xyz;
     if (instance.plane == 1u) {
@@ -194,13 +215,59 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     } else if (instance.plane == 3u) {
         right = rotate_by(instance.orientation, vec3<f32>(0.0, 0.0, 1.0));
         up = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
+    } else if (instance.plane == 4u || instance.plane == 5u) {
+        // The locked axis: the effect's own up, or the particle's heading.
+        var axis = rotate_by(instance.orientation, vec3<f32>(0.0, 1.0, 0.0));
+        if (instance.plane == 5u) {
+            // Already in world space: the CPU rotates it out of the effect's frame alongside
+            // the particle's offset, so the two cannot disagree about which way is up.
+            let travel = instance.velocity;
+            // A particle at rest has no heading to point along. Falling back to the effect's
+            // up keeps it a visible square instead of a degenerate sliver, which is what
+            // normalising a zero vector would give.
+            if (dot(travel, travel) > 1e-8) {
+                axis = normalize(travel);
+            }
+        }
+        axis = normalize(axis);
+        let to_eye = camera.camera_position.xyz - instance.position;
+        // Width is perpendicular to both the axis and the view: that cross product IS the
+        // spin about the axis that turns the quad's face toward the viewer.
+        var across = cross(axis, to_eye);
+        // Looking straight down the locked axis leaves the cross product at zero and the
+        // quad with no width. Any perpendicular will do there -- the quad is edge-on to the
+        // viewer regardless, so which one is not observable.
+        if (dot(across, across) < 1e-8) {
+            across = cross(axis, camera.camera_right.xyz);
+            if (dot(across, across) < 1e-8) {
+                across = cross(axis, camera.camera_up.xyz);
+            }
+        }
+        right = normalize(across);
+        up = axis;
     }
     let offset = right * spun.x * instance.size + up * spun.y * instance.size;
 
     var out: VertexOut;
     out.clip_position = camera.view_projection * vec4<f32>(instance.position + offset, 1.0);
     // Map the quad into this particle's cell of the sheet rather than across the whole image.
-    out.uv = (corner * 0.5 + 0.5) * instance.uv_rect.zw + instance.uv_rect.xy;
+    //
+    // V is FLIPPED against the corner, and it has to be. `corner.y = +1` is the corner along
+    // the quad's `up`, while v = 0 is the texture's TOP row -- the decoded image goes to the
+    // GPU row 0 first, unreversed. Feeding corner.y straight into v therefore drew every
+    // particle upside down.
+    //
+    // Invisible on almost the whole corpus, which is why it survived: effect textures are
+    // overwhelmingly radial puffs and flares, and a vertical mirror of a symmetric blob is
+    // the same blob. It shows up the moment a texture has an up -- an attack arc drew its
+    // crescent opening the wrong way, passing below the fist where the game passes above it.
+    //
+    // The reason it is worth a comment this long: a mirror is NOT a rotation, so no setting
+    // in the orientation model could ever have corrected it. Stepping all 24 basis
+    // corrections and finding that none match is the signature of this bug, not of a missing
+    // basis.
+    out.uv = (vec2<f32>(corner.x, -corner.y) * 0.5 + 0.5) * instance.uv_rect.zw
+        + instance.uv_rect.xy;
     out.color = instance.color;
     return out;
 }
@@ -339,6 +406,11 @@ impl ParticleRenderer {
                     format: wgpu::VertexFormat::Uint32,
                     offset: 68,
                     shader_location: 8,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x3,
+                    offset: 72,
+                    shader_location: 9,
                 },
             ],
         };
@@ -614,6 +686,7 @@ impl ParticleRenderer {
         view_projection: glam::Mat4,
         camera_right: glam::Vec3,
         camera_up: glam::Vec3,
+        camera_position: glam::Vec3,
         batches: &[ParticleBatch],
         mesh_batches: &[MeshBatch],
     ) {
@@ -624,6 +697,7 @@ impl ParticleRenderer {
                 view_projection: view_projection.to_cols_array_2d(),
                 camera_right: camera_right.extend(0.0).to_array(),
                 camera_up: camera_up.extend(0.0).to_array(),
+                camera_position: camera_position.extend(1.0).to_array(),
             }),
         );
 
@@ -759,15 +833,35 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, uv_rect), 36);
         assert_eq!(offset_of!(ParticleInstance, orientation), 52);
         assert_eq!(offset_of!(ParticleInstance, plane), 68);
+        assert_eq!(offset_of!(ParticleInstance, velocity), 72);
         // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
         // every instance after the first.
-        assert_eq!(size_of::<ParticleInstance>(), 80);
+        assert_eq!(size_of::<ParticleInstance>(), 96);
         assert_eq!(align_of::<ParticleInstance>(), 4);
+    }
+
+    /// The billboard's V must be flipped against the quad's up.
+    ///
+    /// A shader cannot be unit tested here, so this guards the one line of it whose
+    /// correctness is not visible from reading it: `corner.y = +1` is the top of the quad,
+    /// `v = 0` is the top of the texture, and the decoded image reaches the GPU top row
+    /// first. Without the flip every particle draws mirrored vertically.
+    ///
+    /// This is a canary rather than a proof. It exists because the bug is invisible on
+    /// symmetric textures -- which is nearly all of them -- so a regression would not be
+    /// caught by looking at the viewport, and because a mirror cannot be corrected by any
+    /// orientation setting, so the next person to hit it would go looking in the wrong place.
+    #[test]
+    fn the_billboard_samples_its_texture_the_right_way_up() {
+        assert!(
+            SHADER.contains("vec2<f32>(corner.x, -corner.y)"),
+            "the billboard's V flip is gone -- particles will draw upside down, and no              orientation setting can correct a mirror"
+        );
     }
 
     #[test]
     fn the_camera_uniform_is_sized_as_the_shader_expects() {
-        // mat4 (64) + two vec4 (32).
-        assert_eq!(std::mem::size_of::<ParticleCamera>(), 96);
+        // mat4 (64) + three vec4 (48).
+        assert_eq!(std::mem::size_of::<ParticleCamera>(), 112);
     }
 }

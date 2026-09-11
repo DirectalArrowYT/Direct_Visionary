@@ -2009,6 +2009,997 @@ fn append_unique_resource_ids<const N: usize>(out: &mut Vec<u64>, ids: [Option<u
 
 #[cfg(test)]
 mod tests {
+
+    /// Stages a whole batch of carrier edits described by a manifest, into a COPY of the carrier.
+    ///
+    /// Batches are data, not code: `<mha>/staged/manifest.json` lists
+    ///   * `transplants` -- effects to bring in (donor file, entry, new name),
+    ///   * `textures`    -- pool textures to replace outright with MHA art,
+    ///   * `retexture`   -- per-emitter swaps: a NEW pool texture (shaped by a template) pointed at
+    ///                      by one emitter, with attribute edits beside it. For art that must not
+    ///                      reach every emitter sharing the old texture -- a decal whose texture
+    ///                      the same effect's rocks also sample, say.
+    ///   * `recolor`     -- effects whose every colour and colour key moves toward one hue,
+    ///                      brightness and whites kept (see `toward_hue`), with per-effect
+    ///                      emitter exclusions for things that must keep their own colour (earth,
+    ///                      smoke). Applied before retextures, so a retexture's explicit colours
+    ///                      win on any emitter both touch.
+    ///   * `keep`        -- entries that must come through unchanged.
+    ///
+    /// Two phases, because a retexture addresses an emitter in a set that only exists once the
+    /// transplant has run: phase 1 brings the effects in, phase 2 applies every art edit to what
+    /// phase 1 produced, resolved by entry name rather than assumed.
+    ///
+    /// Checks before anything is written: each transplanted effect has exactly its donor's
+    /// emitters; every mesh they draw is in the carrier's primitive table (a missing primitive
+    /// parses fine and draws nothing); every replaced texture is in the pool; every retexture
+    /// reads back -- attributes and the sampler both; and every `keep` entry is unchanged.
+    ///
+    /// `VISIONARY_CARRIER`, `VISIONARY_EFF_ROOT`, `VISIONARY_MHA_DIR`, `VISIONARY_WRITE_OUT`.
+    #[test]
+    fn stage_carrier_from_manifest() {
+        use crate::eff_attrs::AttrValue;
+        use crate::mod_project::{
+            AuthoredEdit, EffMod, EmitterFieldEdits, TextureAddition, TextureImport, TransplantOp,
+        };
+        let (Ok(carrier), Some(root), Ok(mha)) = (
+            std::env::var("VISIONARY_CARRIER"),
+            std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from),
+            std::env::var("VISIONARY_MHA_DIR"),
+        ) else {
+            eprintln!("VISIONARY_CARRIER / VISIONARY_EFF_ROOT / VISIONARY_MHA_DIR not set — skipping");
+            return;
+        };
+        let mha = std::path::PathBuf::from(mha);
+        let manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(mha.join("staged").join("manifest.json")).expect("manifest reads"),
+        )
+        .expect("manifest parses");
+        let text = |v: &serde_json::Value, key: &str| -> String {
+            v[key].as_str().unwrap_or_else(|| panic!("manifest: missing '{key}' in {v}")).to_string()
+        };
+        let list = |key: &str| manifest[key].as_array().cloned().unwrap_or_default();
+        let carrier_rel = text(&manifest, "carrier_rel");
+        let moves: Vec<(String, String, String)> =
+            list("transplants").iter().map(|t| (text(t, "from"), text(t, "src"), text(t, "new"))).collect();
+        let swaps: Vec<(String, String)> =
+            list("textures").iter().map(|t| (text(t, "name"), text(t, "png"))).collect();
+        let keep: Vec<String> =
+            list("keep").iter().filter_map(|v| v.as_str().map(String::from)).collect();
+        // A JSON integer is an Int, anything else numeric a Float; the setters convert either.
+        let to_attr = |v: &serde_json::Value| -> AttrValue {
+            match v.as_i64() {
+                Some(i) => AttrValue::Int(i),
+                None => AttrValue::Float(v.as_f64().expect("attribute value is a number") as f32),
+            }
+        };
+        struct Retexture {
+            entry: String,
+            emitter: String,
+            texture: String,
+            template: String,
+            png: String,
+            attrs: Vec<(String, AttrValue)>,
+        }
+        let retextures: Vec<Retexture> = list("retexture")
+            .iter()
+            .map(|r| Retexture {
+                entry: text(r, "entry"),
+                emitter: text(r, "emitter"),
+                texture: text(r, "texture"),
+                template: text(r, "template"),
+                png: text(r, "png"),
+                attrs: r["attrs"]
+                    .as_object()
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), to_attr(v))).collect())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        struct Recolor {
+            entries: Vec<String>,
+            rgb: [f32; 3],
+            /// Saturation floor: 0 keeps whites white; higher tints white-hot cores too.
+            min_sat: f32,
+            /// Brightness factor for normal-blend emitters -- how a body is inked dark while its
+            /// additive glow keeps the hue. 1 leaves them alone.
+            normal_value: f32,
+            exclude: std::collections::HashMap<String, Vec<String>>,
+        }
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let recolors: Vec<Recolor> = list("recolor")
+            .iter()
+            .map(|r| {
+                let rgb = r["rgb"].as_array().expect("recolor: rgb");
+                Recolor {
+                    entries: strings(&r["entries"]),
+                    rgb: [0, 1, 2].map(|i| rgb[i].as_f64().expect("recolor: rgb is numeric") as f32),
+                    min_sat: r["min_sat"].as_f64().unwrap_or(0.0) as f32,
+                    normal_value: r["normal_value"].as_f64().unwrap_or(1.0) as f32,
+                    exclude: r["exclude"]
+                        .as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.clone(), strings(v))).collect())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+
+        // (set index, set name, flat emitter names) for one entry.
+        fn locate(bytes: &[u8], entry: &str) -> (usize, String, Vec<String>) {
+            let namco = effect_library::NamcoEffectFile::load(bytes).expect("eff parses");
+            let at = namco
+                .entry_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(entry))
+                .unwrap_or_else(|| panic!("entry {entry} is missing"));
+            let set_idx = (namco.entries[at].emitter_set_id as usize)
+                .checked_sub(1)
+                .unwrap_or_else(|| panic!("entry {entry} has no primary set"));
+            let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+            let set = &ptcl.emitter_list.emitter_sets[set_idx];
+            let mut names = Vec::new();
+            super::visit_emitters_ref(&set.emitters, &mut |em| names.push(em.data.display_name()));
+            (set_idx, set.name.clone(), names)
+        }
+
+        let original = std::fs::read(&carrier).expect("carrier reads");
+        let kept: Vec<(String, Vec<String>)> =
+            keep.iter().map(|e| (e.clone(), locate(&original, e).2)).collect();
+
+        // Phase 1: bring the effects in.
+        let phase1 = EffMod {
+            source_rel: carrier_rel.clone(),
+            transplants: moves
+                .iter()
+                .map(|(from, src, new)| TransplantOp {
+                    new_entry_name: new.clone(),
+                    src_file_rel: from.clone(),
+                    src_set_name: src.clone(),
+                    src_set_idx: 0,
+                    one_slot_slots: Vec::new(),
+                    replace_entry: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let cloned = super::rebuild_eff_bytes_for_slot(&original, &phase1, Some(&root), None)
+            .expect("phase 1: the effects come in");
+
+        /// A colour moved toward `hue`, keeping its brightness AND its saturation: a white
+        /// highlight stays white and a grey stays grey, and only what was already coloured
+        /// changes colour. Brightness is the channel maximum, which also carries HDR keys (>1).
+        /// `min_sat` raises the saturation to at least that, so whites take a pale tint of the
+        /// hue too; `value` scales the brightness.
+        fn toward_hue(c: [f32; 3], hue: [f32; 3], min_sat: f32, value: f32) -> [f32; 3] {
+            let v = c[0].max(c[1]).max(c[2]);
+            if v <= 1e-6 {
+                return c;
+            }
+            let sat = ((v - c[0].min(c[1]).min(c[2])) / v).max(min_sat);
+            let top = hue[0].max(hue[1]).max(hue[2]).max(1e-6);
+            [0, 1, 2].map(|i| v * value * ((1.0 - sat) + sat * hue[i] / top))
+        }
+        let cloned_namco =
+            effect_library::NamcoEffectFile::load(&cloned).expect("phase 1 output parses");
+        let cloned_ptcl = cloned_namco.ptcl_file.as_ref().expect("ptcl");
+        let mut recolor_edits: Vec<AuthoredEdit> = Vec::new();
+        for r in &recolors {
+            for entry in &r.entries {
+                let (set_idx, set_name, names) = locate(&cloned, entry);
+                let mut flat = Vec::new();
+                super::visit_emitters_ref(
+                    &cloned_ptcl.emitter_list.emitter_sets[set_idx].emitters,
+                    &mut |em| flat.push(em.data.clone()),
+                );
+                let skip = r.exclude.get(entry).cloned().unwrap_or_default();
+                for (idx, data) in flat.iter().enumerate() {
+                    if skip.contains(&names[idx]) {
+                        continue;
+                    }
+                    let read = |id: &str| {
+                        crate::eff_attrs::index_of(id)
+                            .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                            .map(|v| v.as_f32())
+                    };
+                    // Additive black is invisible, so only a normal-blend emitter can be inked.
+                    let value = if read("render_state.blend_type") == Some(0.0) { r.normal_value } else { 1.0 };
+                    let mut triplets: Vec<[String; 3]> = vec![
+                        ["r", "g", "b"].map(|c| format!("particle_color.color0_{c}")),
+                        ["r", "g", "b"].map(|c| format!("particle_color.color1_{c}")),
+                    ];
+                    // Only the live keys: the rest of the eight-slot table is inert padding.
+                    for slot in ["color0", "color1"] {
+                        let live = read(&format!("emitter_static.num_{slot}_keys")).unwrap_or(0.0).max(0.0) as usize;
+                        for k in 0..live.min(8) {
+                            triplets.push(["x", "y", "z"].map(|c| format!("emitter_static.{slot}.keys[{k}].{c}")));
+                        }
+                    }
+                    let mut attrs = std::collections::BTreeMap::new();
+                    for ids in &triplets {
+                        let (Some(x), Some(y), Some(z)) = (read(&ids[0]), read(&ids[1]), read(&ids[2])) else {
+                            continue;
+                        };
+                        let out = toward_hue([x, y, z], r.rgb, r.min_sat, value);
+                        for (k, (old, new)) in [x, y, z].into_iter().zip(out).enumerate() {
+                            if (old - new).abs() > 1e-4 {
+                                attrs.insert(ids[k].clone(), AttrValue::Float(new));
+                            }
+                        }
+                    }
+                    if !attrs.is_empty() {
+                        recolor_edits.push(AuthoredEdit {
+                            set_name: set_name.clone(),
+                            entry_name: entry.clone(),
+                            set_idx,
+                            emitter_name: names[idx].clone(),
+                            emitter_idx: idx,
+                            fields: EmitterFieldEdits { attrs, ..Default::default() },
+                        });
+                    }
+                }
+            }
+        }
+
+        // Retiming: named attributes multiplied on every emitter of the listed effects. A longer
+        // particle life plays the whole keyframed animation slower -- keys sit at fractions of
+        // life -- and slower velocities keep it covering the same ground.
+        let mut tune_edits: Vec<AuthoredEdit> = Vec::new();
+        for t in list("tune") {
+            let mul: Vec<(String, f32)> = t["mul"]
+                .as_object()
+                .map(|o| {
+                    o.iter().map(|(k, v)| (k.clone(), v.as_f64().expect("tune: factor is numeric") as f32)).collect()
+                })
+                .unwrap_or_default();
+            for entry in strings(&t["entries"]) {
+                let (set_idx, set_name, names) = locate(&cloned, &entry);
+                let mut flat = Vec::new();
+                super::visit_emitters_ref(
+                    &cloned_ptcl.emitter_list.emitter_sets[set_idx].emitters,
+                    &mut |em| flat.push(em.data.clone()),
+                );
+                for (idx, data) in flat.iter().enumerate() {
+                    let mut attrs = std::collections::BTreeMap::new();
+                    for (id, k) in &mul {
+                        let got = crate::eff_attrs::index_of(id)
+                            .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                            .unwrap_or_else(|| panic!("tune: {entry}/{}: {id} unreadable", names[idx]));
+                        let scaled = match got {
+                            AttrValue::Int(v) => AttrValue::Int(((v as f32) * k).round() as i64),
+                            AttrValue::Float(v) => AttrValue::Float(v * k),
+                            AttrValue::UInt(_) => panic!("tune: {id} is an id, not a quantity"),
+                        };
+                        attrs.insert(id.clone(), scaled);
+                    }
+                    if !attrs.is_empty() {
+                        tune_edits.push(AuthoredEdit {
+                            set_name: set_name.clone(),
+                            entry_name: entry.clone(),
+                            set_idx,
+                            emitter_name: names[idx].clone(),
+                            emitter_idx: idx,
+                            fields: EmitterFieldEdits { attrs, ..Default::default() },
+                        });
+                    }
+                }
+            }
+        }
+        println!("tune: {} emitters retimed", tune_edits.len());
+
+        // Phase 2: the art, addressed to where phase 1 put things.
+        let mut added: Vec<TextureAddition> = Vec::new();
+        for r in &retextures {
+            if !added.iter().any(|t| t.texture_name == r.texture) {
+                added.push(TextureAddition {
+                    texture_name: r.texture.clone(),
+                    template_name: r.template.clone(),
+                    png_path: mha.join(&r.png).to_string_lossy().into_owned(),
+                    raw: false,
+                });
+            }
+        }
+        let retexture_edits: Vec<AuthoredEdit> = retextures
+            .iter()
+            .map(|r| {
+                let (set_idx, set_name, names) = locate(&cloned, &r.entry);
+                AuthoredEdit {
+                    set_name,
+                    entry_name: r.entry.clone(),
+                    set_idx,
+                    emitter_name: r.emitter.clone(),
+                    emitter_idx: names
+                        .iter()
+                        .position(|n| n == &r.emitter)
+                        .unwrap_or_else(|| panic!("{} has no emitter {}: {names:?}", r.entry, r.emitter)),
+                    fields: EmitterFieldEdits {
+                        texture_name: Some(r.texture.clone()),
+                        attrs: r.attrs.iter().cloned().collect(),
+                        ..Default::default()
+                    },
+                }
+            })
+            .collect();
+        // Recolours first, so a retexture's explicit colours win on any emitter both touch.
+        let mut authored = recolor_edits.clone();
+        authored.extend(retexture_edits);
+        authored.extend(tune_edits);
+        let phase2 = EffMod {
+            source_rel: carrier_rel.clone(),
+            textures: swaps
+                .iter()
+                .map(|(name, png)| TextureImport {
+                    texture_name: name.clone(),
+                    png_path: mha.join(png).to_string_lossy().into_owned(),
+                    raw: false,
+                })
+                .collect(),
+            textures_added: added,
+            authored,
+            ..Default::default()
+        };
+        let built = super::rebuild_eff_bytes_for_slot(&cloned, &phase2, None, None)
+            .expect("phase 2: the art applies");
+
+        let namco = effect_library::NamcoEffectFile::load(&built).expect("staged eff parses");
+        let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+        let primitives: std::collections::HashSet<u64> = ptcl
+            .primitive_info
+            .as_ref()
+            .map(|info| info.descriptors.iter().map(|d| d.id).collect())
+            .unwrap_or_default();
+        let texture_ids: std::collections::HashMap<String, u64> = ptcl
+            .texture_info
+            .as_ref()
+            .map(|info| info.descriptors.iter().map(|d| (d.name.clone(), d.id)).collect())
+            .unwrap_or_default();
+        let mut donors: std::collections::HashMap<String, Vec<u8>> = Default::default();
+
+        for (from, src, new) in &moves {
+            let donor = donors
+                .entry(from.clone())
+                .or_insert_with(|| std::fs::read(root.join(from)).expect("donor reads"));
+            let (set_idx, _, names) = locate(&built, new);
+            assert_eq!(names, locate(donor, src).2, "{new} did not come across whole");
+            let mut missing = Vec::new();
+            super::visit_emitters_ref(&ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
+                let id = em.data.particle_data.primitive_id;
+                if id != 0 && id != u64::MAX && !primitives.contains(&id) {
+                    missing.push(format!("{}:{id}", em.data.display_name()));
+                }
+            });
+            assert!(missing.is_empty(), "{new}: meshes missing from the carrier: {missing:?}");
+        }
+        for (name, _) in &swaps {
+            assert!(texture_ids.contains_key(name), "{name} is not in the staged pool");
+        }
+        let mut read_back = 0usize;
+        for r in &retextures {
+            let (set_idx, _, names) = locate(&built, &r.entry);
+            let mut flat = Vec::new();
+            super::visit_emitters_ref(&ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
+                flat.push(em.data.clone())
+            });
+            let data = &flat[names.iter().position(|n| n == &r.emitter).unwrap()];
+            for (id, want) in &r.attrs {
+                let got = crate::eff_attrs::index_of(id)
+                    .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                    .unwrap_or_else(|| panic!("{}/{}: {id} unreadable", r.entry, r.emitter));
+                assert!(
+                    (got.as_f32() - want.as_f32()).abs() < 1e-4,
+                    "{}/{}: {id} is {got:?}, wanted {want:?}",
+                    r.entry,
+                    r.emitter
+                );
+                read_back += 1;
+            }
+            assert_eq!(
+                data.sampler0.as_ref().map(|s| s.texture_id),
+                texture_ids.get(&r.texture).copied(),
+                "{}/{} does not sample {}",
+                r.entry,
+                r.emitter,
+                r.texture
+            );
+        }
+        for (entry, before) in &kept {
+            assert_eq!(&locate(&built, entry).2, before, "{entry} changed");
+        }
+
+        println!(
+            "\nbatch staged: {} -> {} bytes | {} effects in ({}) | {} textures replaced | {} emitters retextured, {read_back} values read back | meshes all resolve | {} kept entries unchanged",
+            original.len(),
+            built.len(),
+            moves.len(),
+            moves.iter().map(|(_, _, n)| n.as_str()).collect::<Vec<_>>().join(", "),
+            swaps.len(),
+            retextures.len(),
+            kept.len()
+        );
+        let retextured: std::collections::HashSet<(String, String)> =
+            retextures.iter().map(|r| (r.entry.clone(), r.emitter.clone())).collect();
+        let mut recolored = 0usize;
+        for edit in &recolor_edits {
+            if retextured.contains(&(edit.entry_name.clone(), edit.emitter_name.clone())) {
+                continue;
+            }
+            let (set_idx, _, _) = locate(&built, &edit.entry_name);
+            let mut flat = Vec::new();
+            super::visit_emitters_ref(&ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
+                flat.push(em.data.clone())
+            });
+            let data = &flat[edit.emitter_idx];
+            for (id, want) in &edit.fields.attrs {
+                let got = crate::eff_attrs::index_of(id)
+                    .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                    .unwrap_or_else(|| panic!("{}/{}: {id} unreadable", edit.entry_name, edit.emitter_name));
+                assert!(
+                    (got.as_f32() - want.as_f32()).abs() < 1e-4,
+                    "{}/{}: {id} is {got:?}, recolour wanted {want:?}",
+                    edit.entry_name,
+                    edit.emitter_name
+                );
+                recolored += 1;
+            }
+        }
+        println!("recolour: {} emitters changed, {recolored} values read back", recolor_edits.len());
+
+        if let Ok(out) = std::env::var("VISIONARY_WRITE_OUT") {
+            let out = std::path::Path::new(&out);
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir).expect("staging dir");
+            }
+            std::fs::write(out, &built).expect("staged file writes");
+            let record = serde_json::json!({ "phase1_effects": &phase1, "phase2_art": &phase2 });
+            let record_path = mha.join("staged").join("batch.effmod.json");
+            std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap())
+                .expect("record writes");
+            println!("wrote {}\nrecorded ops in {}", out.display(), record_path.display());
+        }
+    }
+
+    /// Retextures PIKACHU_ELEC in the Shigaraki carrier as MHA dark lightning: black core, red rim.
+    ///
+    /// Why the texture carries the colour instead of the emitter. Every colour field and every
+    /// animated colour key of this effect was already red or black, and no texture it samples
+    /// has any blue in its pixels -- yet the bolts rendered blue. So for the bolt emitters the
+    /// colour is not coming from the colour fields: it comes from the texture as the shader and
+    /// the BNTX swizzle read it. That mode cannot be pinned down from the data, so the build is
+    /// arranged to come out right under every reading of it -- red baked into the rim, a black
+    /// core, colour0 white and colour1 black -- because texture-only, texture x colour, and a
+    /// colour1->colour0 blend driven by the texture all give the same answer then.
+    ///
+    /// Normal blending, not additive: additive ADDS light, black adds none, and a black core
+    /// drawn additively is simply not there.
+    ///
+    /// The MHA sheets are 4x4. `uv_div` is the grid; the random pattern mode is the one the
+    /// original bolts already used (type 4 with loop-random), pointed at a range of cells.
+    ///
+    /// `VISIONARY_CARRIER`, `VISIONARY_MHA_DIR`, and `VISIONARY_WRITE_OUT` to write.
+    #[test]
+    fn build_shiga_dark_lightning_into_pikachu_elec() {
+        use crate::eff_attrs::AttrValue::{self, Float, Int};
+        use crate::mod_project::{AuthoredEdit, EffMod, EmitterFieldEdits, TextureAddition};
+        let (Ok(carrier), Ok(mha)) =
+            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_MHA_DIR"))
+        else {
+            eprintln!("VISIONARY_CARRIER / VISIONARY_MHA_DIR not set — skipping");
+            return;
+        };
+        const ENTRY: &str = "PIKACHU_ELEC";
+        const THICK: &str = "ef_shiga_darkbolt00";
+        const THIN: &str = "ef_shiga_darkbolt01";
+        let carrier_rel = "effect/fighter/eflame/transplant/pikachu/ef_pikachu.eff";
+
+        // (set index, set name, flat emitter names) for one entry.
+        fn locate(bytes: &[u8], entry: &str) -> (usize, String, Vec<String>) {
+            let namco = effect_library::NamcoEffectFile::load(bytes).expect("eff parses");
+            let at = namco
+                .entry_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(entry))
+                .unwrap_or_else(|| panic!("entry {entry} is missing"));
+            let set_idx = (namco.entries[at].emitter_set_id as usize)
+                .checked_sub(1)
+                .unwrap_or_else(|| panic!("entry {entry} has no primary set"));
+            let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+            let set = &ptcl.emitter_list.emitter_sets[set_idx];
+            let mut names = Vec::new();
+            super::visit_emitters_ref(&set.emitters, &mut |em| names.push(em.data.display_name()));
+            (set_idx, set.name.clone(), names)
+        }
+
+        let original = std::fs::read(&carrier).expect("carrier reads");
+        let (set_idx, set_name, names) = locate(&original, ENTRY);
+        let untouched = ["SHIGA_TELEGRAPH_RING", "PIKACHU_ELEC_SHOCK", "PIKACHU_ELEC2"]
+            .map(|entry| (entry, locate(&original, entry).2));
+
+        // The attributes every retextured emitter shares.
+        let common = |cells: std::ops::Range<i32>| -> Vec<(String, AttrValue)> {
+            let mut attrs: Vec<(String, AttrValue)> = vec![
+                ("render_state.blend_type".into(), Int(0)),
+                ("particle_color.color0_type".into(), Int(0)),
+                ("particle_color.color0_r".into(), Float(1.0)),
+                ("particle_color.color0_g".into(), Float(1.0)),
+                ("particle_color.color0_b".into(), Float(1.0)),
+                ("particle_color.color1_r".into(), Float(0.0)),
+                ("particle_color.color1_g".into(), Float(0.0)),
+                ("particle_color.color1_b".into(), Float(0.0)),
+                // HDR headroom so the red rim blooms the way MHA's emissive does.
+                ("emitter_static.color_scale".into(), Float(1.6)),
+                ("emitter_static.tex_scroll_anim0.uv_div_x".into(), Float(4.0)),
+                ("emitter_static.tex_scroll_anim0.uv_div_y".into(), Float(4.0)),
+                ("texture_anim0.pattern_anim_type".into(), Int(4)),
+                ("texture_anim0.is_pat_anim_loop_random".into(), Int(1)),
+                ("emitter_static.tex_pattern_anim0.num_random".into(), Float(cells.len() as f32)),
+            ];
+            for (slot, cell) in cells.enumerate() {
+                attrs.push((format!("emitter_static.tex_pattern_anim0.table[{slot}]"), Int(cell as i64)));
+            }
+            attrs
+        };
+        // emitter -> (texture, cells of its sheet)
+        let plan: [(&str, &str, std::ops::Range<i32>); 3] = [
+            ("lightning2", THICK, 0..8),   // thick bolts: rows 1-2 of Thunder_001
+            ("lightning3", THIN, 0..16),   // thin bolts: all of Thunder_002
+            ("impactflash2", THICK, 8..16), // starbursts: rows 3-4 of Thunder_001
+        ];
+        let authored: Vec<AuthoredEdit> = plan
+            .iter()
+            .map(|(emitter, texture, cells)| AuthoredEdit {
+                set_name: set_name.clone(),
+                entry_name: ENTRY.into(),
+                set_idx,
+                emitter_name: emitter.to_string(),
+                emitter_idx: names
+                    .iter()
+                    .position(|n| n == emitter)
+                    .unwrap_or_else(|| panic!("{emitter} not in {ENTRY}: {names:?}")),
+                fields: EmitterFieldEdits {
+                    texture_name: Some(texture.to_string()),
+                    attrs: common(cells.clone()).into_iter().collect(),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let png = |file: &str| std::path::Path::new(&mha).join(file).to_string_lossy().into_owned();
+        let eff = EffMod {
+            source_rel: carrier_rel.into(),
+            textures_added: vec![
+                TextureAddition {
+                    texture_name: THICK.into(),
+                    template_name: "ef_cmn_impactflash00".into(),
+                    png_path: png("mha_darkbolt_red_512.png"),
+                    raw: false,
+                },
+                TextureAddition {
+                    texture_name: THIN.into(),
+                    template_name: "ef_cmn_impactflash00".into(),
+                    png_path: png("mha_darkbolt_thin_red_512.png"),
+                    raw: false,
+                },
+            ],
+            authored,
+            ..Default::default()
+        };
+        let built = super::rebuild_eff_bytes_for_slot(&original, &eff, None, None)
+            .expect("the retexture builds");
+
+        // Every edit reads back, on the emitter it was meant for...
+        let (_, _, after) = locate(&built, ENTRY);
+        assert_eq!(after, names, "PIKACHU_ELEC's emitter list changed");
+        let namco = effect_library::NamcoEffectFile::load(&built).expect("final eff parses");
+        let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+        let id_of = |tex: &str| {
+            ptcl.texture_info
+                .as_ref()
+                .and_then(|info| info.descriptors.iter().find(|d| d.name == tex))
+                .map(|d| d.id)
+                .unwrap_or_else(|| panic!("{tex} is not in the pool"))
+        };
+        let mut flat = Vec::new();
+        super::visit_emitters_ref(&ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
+            flat.push(em.data.clone())
+        });
+        let mut verified = 0usize;
+        for (emitter, texture, cells) in &plan {
+            let data = &flat[names.iter().position(|n| n == emitter).unwrap()];
+            for (id, want) in common(cells.clone()) {
+                let got = crate::eff_attrs::index_of(&id)
+                    .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                    .unwrap_or_else(|| panic!("{emitter}: {id} unreadable"));
+                assert!(
+                    (got.as_f32() - want.as_f32()).abs() < 1e-4,
+                    "{emitter}: {id} is {got:?}, wanted {want:?}"
+                );
+                verified += 1;
+            }
+            assert_eq!(
+                data.sampler0.as_ref().map(|s| s.texture_id),
+                Some(id_of(texture)),
+                "{emitter} does not sample {texture}"
+            );
+        }
+        // ...and nothing else Shigaraki spawns moved.
+        for (entry, before) in &untouched {
+            assert_eq!(&locate(&built, entry).2, before, "{entry} changed");
+        }
+
+        println!(
+            "\ndark lightning built: {} -> {} bytes, {verified} values verified across {:?}",
+            original.len(),
+            built.len(),
+            plan.iter().map(|(e, t, _)| format!("{e}->{t}")).collect::<Vec<_>>()
+        );
+        if let Ok(out) = std::env::var("VISIONARY_WRITE_OUT") {
+            std::fs::write(&out, &built).expect("carrier writes");
+            let record_path = std::path::Path::new(&mha).join("dark_lightning.effmod.json");
+            std::fs::write(&record_path, serde_json::to_string_pretty(&eff).unwrap())
+                .expect("record writes");
+            println!("wrote {out}\nrecorded ops in {}", record_path.display());
+        }
+    }
+
+    /// Builds SHIGA_TELEGRAPH_RING into the Shigaraki mod's Pikachu carrier.
+    ///
+    /// The ring every telegraph (counter, unblockable) shows around the chest. It is a clone of
+    /// PIKACHU_ELEC_SHOCK trimmed to its two fresnel spheres -- `sphere1_b` draws the back faces
+    /// and `sphere1_f` the front, which together sort as one shell -- because fresnel alpha is
+    /// what makes a sphere read as a RING: clear through the middle, bright at the silhouette.
+    ///
+    /// What each edit is for:
+    ///   * white base colour -- the plugin tints with `set_rgb`, which MULTIPLIES. The host is
+    ///     baked red, and yellow times red is still red, so the counter would never show yellow.
+    ///   * one particle with infinite life -- `telegraph::off` and its status-change expiry
+    ///     already decide when the ring ends, including early cancels, so the effect should
+    ///     simply last until killed. (The arc proved one-time/duration 1/rate 1 = one particle.)
+    ///   * MHA aura noise, additive, slow spin about Y -- MHA builds aura shells as fresnel plus
+    ///     a drifting noise; spinning the shell drifts the noise without texture-scroll fields.
+    ///
+    /// Two phases because the clone's set index only exists after the transplant runs; the
+    /// second phase resolves it by ENTRY name rather than assuming where it landed. Nothing is
+    /// written unless every edit reads back and the rest of the carrier is untouched.
+    ///
+    /// `VISIONARY_CARRIER`, `VISIONARY_MHA_DIR`, and `VISIONARY_WRITE_OUT` to write.
+    #[test]
+    fn build_shiga_telegraph_ring_into_the_pikachu_carrier() {
+        use crate::eff_attrs::AttrValue::{Float, Int};
+        use crate::mod_project::{
+            AuthoredEdit, EffMod, EmitterFieldEdits, EmitterRoster, EmitterSlot, TextureAddition,
+            TransplantOp,
+        };
+        let (Ok(carrier), Ok(mha)) =
+            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_MHA_DIR"))
+        else {
+            eprintln!("VISIONARY_CARRIER / VISIONARY_MHA_DIR not set — skipping");
+            return;
+        };
+        const ENTRY: &str = "SHIGA_TELEGRAPH_RING";
+        const TEXTURE: &str = "ef_shiga_auranoise00";
+        const KEEP: [&str; 2] = ["sphere1_b", "sphere1_f"];
+        let carrier_rel = "effect/fighter/eflame/transplant/pikachu/ef_pikachu.eff";
+
+        // (set index, set name, flat emitter names) for one entry.
+        fn locate(bytes: &[u8], entry: &str) -> (usize, String, Vec<String>) {
+            let namco = effect_library::NamcoEffectFile::load(bytes).expect("eff parses");
+            let at = namco
+                .entry_names
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(entry))
+                .unwrap_or_else(|| panic!("entry {entry} is missing"));
+            let set_idx = (namco.entries[at].emitter_set_id as usize)
+                .checked_sub(1)
+                .unwrap_or_else(|| panic!("entry {entry} has no primary set"));
+            let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+            let set = &ptcl.emitter_list.emitter_sets[set_idx];
+            let mut names = Vec::new();
+            super::visit_emitters_ref(&set.emitters, &mut |em| names.push(em.data.display_name()));
+            (set_idx, set.name.clone(), names)
+        }
+
+        let original = std::fs::read(&carrier).expect("carrier reads");
+        let (_, _, shock_before) = locate(&original, "PIKACHU_ELEC_SHOCK");
+        let (_, _, elec_before) = locate(&original, "PIKACHU_ELEC");
+
+        // Phase 1: the clone.
+        let phase1 = EffMod {
+            source_rel: carrier_rel.into(),
+            transplants: vec![TransplantOp {
+                new_entry_name: ENTRY.into(),
+                src_file_rel: String::new(),
+                src_set_name: "PIKACHU_ELEC_SHOCK".into(),
+                src_set_idx: 0,
+                one_slot_slots: Vec::new(),
+                replace_entry: None,
+            }],
+            ..Default::default()
+        };
+        let cloned = super::rebuild_eff_bytes_for_slot(&original, &phase1, None, None)
+            .expect("phase 1: the clone builds");
+        let (set_idx, set_name, cloned_names) = locate(&cloned, ENTRY);
+
+        // Phase 2: trim, retexture, retune -- all addressed to the clone.
+        let slots: Vec<EmitterSlot> = KEEP
+            .iter()
+            .map(|want| EmitterSlot {
+                source_idx: cloned_names
+                    .iter()
+                    .position(|n| n == want)
+                    .unwrap_or_else(|| panic!("{want} not in the clone: {cloned_names:?}")),
+                source_name: want.to_string(),
+                name: want.to_string(),
+                depth: 0,
+            })
+            .collect();
+        let tuning: Vec<(&str, crate::eff_attrs::AttrValue)> = vec![
+            ("emission.is_one_time", Int(1)),
+            ("emission.duration", Int(1)),
+            ("emission.rate", Float(1.0)),
+            ("particle_data.infinite_life", Int(1)),
+            ("particle_data.life_random", Int(0)),
+            ("particle_color.color0_r", Float(1.0)),
+            ("particle_color.color0_g", Float(1.0)),
+            ("particle_color.color0_b", Float(1.0)),
+            // The host's secondary colour was a darker shade of its primary; a neutral grey
+            // keeps that depth without fixing a hue the tint then cannot override.
+            ("particle_color.color1_r", Float(0.35)),
+            ("particle_color.color1_g", Float(0.35)),
+            ("particle_color.color1_b", Float(0.35)),
+            ("particle_scale.scale_random_x", Float(0.0)),
+            ("particle_scale.scale_random_y", Float(0.0)),
+            ("particle_scale.scale_random_z", Float(0.0)),
+            ("render_state.blend_type", Int(1)),
+            // MHA's aura materials drive emissive well past 1.0; 2.5 is the host's 2.0 pushed
+            // toward that without blowing the additive shell out to white.
+            ("emitter_static.color_scale", Float(2.5)),
+            ("particle_data.is_rotate_y", Int(1)),
+            // Two degrees a frame, the attack arc's own sweep rate.
+            ("emitter_static.rotate_add_y", Float(0.034906585)),
+        ];
+        let fields = EmitterFieldEdits {
+            texture_name: Some(TEXTURE.into()),
+            attrs: tuning.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..Default::default()
+        };
+        let phase2 = EffMod {
+            source_rel: carrier_rel.into(),
+            textures_added: vec![TextureAddition {
+                texture_name: TEXTURE.into(),
+                // 512x512 BC3Srgb: the shape the noise already is, so nothing is resampled.
+                template_name: "ef_cmn_impactflash00".into(),
+                png_path: std::path::Path::new(&mha)
+                    .join("mha_auranoise_512.png")
+                    .to_string_lossy()
+                    .into_owned(),
+                raw: false,
+            }],
+            rosters: vec![EmitterRoster {
+                set_name: set_name.clone(),
+                entry_name: ENTRY.into(),
+                set_idx,
+                slots,
+            }],
+            authored: KEEP
+                .iter()
+                .enumerate()
+                .map(|(index, name)| AuthoredEdit {
+                    set_name: set_name.clone(),
+                    entry_name: ENTRY.into(),
+                    set_idx,
+                    emitter_name: name.to_string(),
+                    emitter_idx: index,
+                    fields: fields.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let built = super::rebuild_eff_bytes_for_slot(&cloned, &phase2, None, None)
+            .expect("phase 2: the edits build");
+
+        // The ring is what it should be...
+        let (ring_idx, _, ring_names) = locate(&built, ENTRY);
+        assert_eq!(ring_names, KEEP.map(String::from).to_vec(), "the ring kept the wrong emitters");
+        let namco = effect_library::NamcoEffectFile::load(&built).expect("final eff parses");
+        let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+        let texture_id = ptcl
+            .texture_info
+            .as_ref()
+            .and_then(|info| info.descriptors.iter().find(|d| d.name == TEXTURE))
+            .map(|d| d.id)
+            .expect("the MHA texture is in the pool");
+        for em in &ptcl.emitter_list.emitter_sets[ring_idx].emitters {
+            let name = em.data.display_name();
+            for (id, want) in &tuning {
+                let got = crate::eff_attrs::index_of(id)
+                    .and_then(|i| (crate::eff_attrs::table()[i].get)(&em.data))
+                    .unwrap_or_else(|| panic!("{name}: {id} unreadable"));
+                assert!(
+                    (got.as_f32() - want.as_f32()).abs() < 1e-4,
+                    "{name}: {id} is {got:?}, wanted {want:?}"
+                );
+            }
+            assert_eq!(
+                em.data.sampler0.as_ref().map(|s| s.texture_id),
+                Some(texture_id),
+                "{name} does not sample the MHA noise"
+            );
+        }
+        // ...and nothing Shigaraki already spawns was touched.
+        assert_eq!(locate(&built, "PIKACHU_ELEC_SHOCK").2, shock_before, "the host changed");
+        assert_eq!(locate(&built, "PIKACHU_ELEC").2, elec_before, "pikachu_elec changed");
+
+        println!(
+            "\nring built: {} -> {} bytes, set {ring_idx}, emitters {ring_names:?}, \
+             {} attrs verified on each, texture {TEXTURE} bound",
+            original.len(),
+            built.len(),
+            tuning.len()
+        );
+        if let Ok(out) = std::env::var("VISIONARY_WRITE_OUT") {
+            std::fs::write(&out, &built).expect("carrier writes");
+            let record = serde_json::json!({ "phase1_clone": &phase1, "phase2_edits": &phase2 });
+            let record_path = std::path::Path::new(&mha).join("telegraph_ring.effmod.json");
+            std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap())
+                .expect("record writes");
+            println!("wrote {out}\nrecorded ops in {}", record_path.display());
+        }
+    }
+
+    /// A whole custom-effect op set, applied to the Shigaraki mod's transplanted ef_pikachu.
+    ///
+    /// The point is to prove the op set BEFORE it is handed over as a project file. Each piece
+    /// is individually plausible and the combination is what actually has to hold: a texture
+    /// added against a template of the right shape, an entry cloned within the same file under
+    /// a new name, and authored edits landing on the clone rather than on the original.
+    ///
+    /// `VISIONARY_PIKACHU_EFF` and `VISIONARY_RING_PNG`.
+    #[test]
+    fn a_custom_telegraph_ring_builds_on_the_transplanted_pikachu_eff() {
+        let (Ok(eff_path), Ok(png)) = (
+            std::env::var("VISIONARY_PIKACHU_EFF"),
+            std::env::var("VISIONARY_RING_PNG"),
+        ) else {
+            eprintln!("VISIONARY_PIKACHU_EFF / VISIONARY_RING_PNG not set — skipping");
+            return;
+        };
+        let original = std::fs::read(&eff_path).expect("ef_pikachu reads");
+        let before = effect_library::NamcoEffectFile::load(&original)
+            .unwrap()
+            .ptcl_file
+            .unwrap()
+            .emitter_list
+            .emitter_sets
+            .len();
+
+        let eff = crate::mod_project::EffMod {
+            source_rel: "effect/fighter/eflame/ef_eflame.eff".into(),
+            // A 512x512 texture of our own, shaped by one of the three 512x512 BC3Srgb
+            // templates this file holds. Added rather than overwriting the template: the
+            // template is sampled by other emitters, and editing it would change them too.
+            textures_added: vec![crate::mod_project::TextureAddition {
+                texture_name: "ef_shiga_ring00".into(),
+                template_name: "ef_cmn_impactflash00".into(),
+                png_path: png,
+                raw: false,
+            }],
+            // The telegraph ring as its own entry, cloned inside this file so the original
+            // Pikachu effect keeps working.
+            transplants: vec![crate::mod_project::TransplantOp {
+                new_entry_name: "SHIGA_TELEGRAPH_RING".into(),
+                src_file_rel: String::new(),
+                // The ENTRY name, not the emitter-set name: transplants resolve their donor
+                // against the kind table, which is a different namespace from the sets.
+                src_set_name: "PIKACHU_ROCKET_AURA".into(),
+                src_set_idx: 0,
+                one_slot_slots: vec![80],
+                replace_entry: None,
+            }],
+            ..Default::default()
+        };
+
+        let rebuilt = super::rebuild_eff_bytes_for_slot(&original, &eff, None, Some(80))
+            .expect("the op set rebuilds");
+        let parsed = effect_library::NamcoEffectFile::load(&rebuilt)
+            .expect("the rebuilt eff still parses");
+        let ptcl = parsed.ptcl_file.expect("ptcl survives");
+        assert!(
+            ptcl.emitter_list.emitter_sets.len() >= before,
+            "the rebuild lost emitter sets: {} -> {}",
+            before,
+            ptcl.emitter_list.emitter_sets.len()
+        );
+        let added = ptcl
+            .texture_info
+            .as_ref()
+            .map(|info| info.descriptors.iter().any(|d| d.name == "ef_shiga_ring00"))
+            .unwrap_or(false);
+        assert!(added, "the added pool texture is not in the rebuilt file");
+        println!(
+            "custom op set: {} -> {} bytes, {} -> {} emitter sets, ef_shiga_ring00 present",
+            original.len(),
+            rebuilt.len(),
+            before,
+            ptcl.emitter_list.emitter_sets.len()
+        );
+    }
+
+    /// ef_common can be edited and rebuilt like any other eff.
+    ///
+    /// The load-bearing assumption behind replacing SYSTEM effects -- hit sparks, counter
+    /// flashes, smoke -- rather than one fighter's. Nothing in the export is fighter-specific
+    /// (it joins `source_rel` onto the data root and writes the result back at the same
+    /// relative path), but ef_common is 33 MB with 196 pool textures and 1348 emitters, an
+    /// order of magnitude past any fighter file, so "it should work" is not the same as
+    /// knowing the rebuild survives it.
+    ///
+    /// `VISIONARY_EFF_ROOT` for the dump, `VISIONARY_TEST_PNG` for a 512x512 replacement.
+    #[test]
+    fn ef_common_survives_a_texture_swap_and_an_emitter_edit() {
+        let (Some(root), Ok(png)) = (
+            std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from),
+            std::env::var("VISIONARY_TEST_PNG"),
+        ) else {
+            eprintln!("VISIONARY_EFF_ROOT / VISIONARY_TEST_PNG not set — skipping");
+            return;
+        };
+        let relative = "effect/system/common/ef_common.eff";
+        let original = std::fs::read(root.join(relative)).expect("ef_common reads");
+
+        let eff = crate::mod_project::EffMod {
+            source_rel: relative.into(),
+            textures: vec![crate::mod_project::TextureImport {
+                // 512x512 BC3Srgb, one of the six templates that shape suits.
+                texture_name: "ef_cmn_impactflash00".into(),
+                png_path: png,
+                raw: false,
+            }],
+            authored: vec![crate::mod_project::AuthoredEdit {
+                set_name: "P_CmnCounterFlash".into(),
+                entry_name: "SYS_COUNTER_FLASH".into(),
+                set_idx: 0,
+                emitter_name: String::new(),
+                emitter_idx: 0,
+                fields: crate::mod_project::EmitterFieldEdits {
+                    attrs: [(
+                        "emitter_static.color_scale".to_string(),
+                        crate::eff_attrs::AttrValue::Float(2.0),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+
+        let rebuilt = super::rebuild_eff_bytes_for_slot(&original, &eff, Some(&root), None)
+            .expect("ef_common rebuilds");
+        assert_ne!(rebuilt, original, "the rebuild changed nothing");
+        let parsed = effect_library::NamcoEffectFile::load(&rebuilt)
+            .expect("the rebuilt ef_common still parses");
+        let ptcl = parsed.ptcl_file.expect("rebuilt file still holds a ptcl");
+        // The whole library has to survive, not just the bytes: a rebuild that drops emitter
+        // sets or pool textures parses fine and ships a game missing half its effects.
+        assert_eq!(
+            ptcl.emitter_list.emitter_sets.len(),
+            effect_library::NamcoEffectFile::load(&original)
+                .unwrap()
+                .ptcl_file
+                .unwrap()
+                .emitter_list
+                .emitter_sets
+                .len(),
+            "the rebuild lost emitter sets"
+        );
+        println!(
+            "ef_common rebuilt: {} -> {} bytes, {} emitter sets intact",
+            original.len(),
+            rebuilt.len(),
+            ptcl.emitter_list.emitter_sets.len()
+        );
+    }
     use super::{
         append_unique_resource_ids, destination_entry_kind, remap_shader_indices, shader_index_fits,
     };

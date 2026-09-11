@@ -3666,6 +3666,10 @@ impl VisionaryApp {
                 // How the script aims the effect. The same explosion points along the punch or
                 // up off the ground purely by this.
                 rotation: glam::Vec3::from(call.rotation),
+                // The spawn macro's `size` argument. Scripts lean on it hard -- Bakugo's tilts
+                // both spawn the shared arc at 0.75 -- so an effect drawn at 1.0 regardless is
+                // the wrong size on every call that is not already 1.0.
+                scale: call.scale,
             })
             .collect()
     }
@@ -13680,36 +13684,45 @@ impl VisionaryApp {
             .show(ui, |ui| {
                 ui.label(
                     RichText::new(
-                        "Effect files record a billboard type but not what it means. Type 0 is                          camera-facing; for the rest, pick the plane that looks right — a quad                          in the wrong plane is edge-on and looks like it is not drawing.",
+                        "Effect files record a billboard type but not what it means. Type 0 is                          camera-facing; for the rest, pick the mode that looks right. Hover a                          mode for what it does.",
                     )
                     .small()
                     .color(Color32::GRAY),
                 );
                 ui.label(
                     RichText::new(
-                        "An oriented quad turned edge-on is invisible, not sideways — if an                          effect vanishes, try Camera facing for its type.",
+                        "The three Local modes pin the quad to a plane and CAN go edge-on, which                          looks like the effect not drawing at all. Y billboard and Velocity                          never do — if an effect vanishes from some angles, it probably wants                          one of those rather than a plane.
+
+If you step every basis for a                          type and NONE of them match, stop stepping: that is the signature of                          something no orientation can fix — a mirrored texture, a randomised                          per-particle roll, or a type that is a stripe rather than a quad.",
                     )
                     .small()
                     .color(Color32::from_rgb(230, 190, 90)),
                 );
                 for kind in used {
                     let index = kind.clamp(0, 7) as usize;
-                    let current = self.effect_quad_planes.planes[index].min(3) as usize;
+                    let names = crate::eff_runtime::QuadPlanes::NAMES;
+                    let descriptions = crate::eff_runtime::QuadPlanes::DESCRIPTIONS;
+                    let current = (self.effect_quad_planes.planes[index] as usize)
+                        .min(names.len() - 1);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("Type {kind}")).small().strong());
                         egui::ComboBox::from_id_salt(("quad_plane", kind))
                             .width(110.0)
-                            .selected_text(crate::eff_runtime::QuadPlanes::NAMES[current])
+                            .selected_text(names[current])
                             .show_ui(ui, |ui| {
-                                for (value, label) in
-                                    crate::eff_runtime::QuadPlanes::NAMES.iter().enumerate()
-                                {
+                                for (value, label) in names.iter().enumerate() {
                                     let mut chosen = current;
-                                    if ui.selectable_value(&mut chosen, value, *label).clicked() {
+                                    if ui
+                                        .selectable_value(&mut chosen, value, *label)
+                                        .on_hover_text(descriptions[value])
+                                        .clicked()
+                                    {
                                         self.effect_quad_planes.planes[index] = value as u32;
                                     }
                                 }
-                            });
+                            })
+                            .response
+                            .on_hover_text(descriptions[current]);
                         // Degrees, matching the spawn's own rotation units.
                         for (axis, slot) in ["X", "Y", "Z"].iter().zip(0..3) {
                             ui.add(
@@ -13722,6 +13735,48 @@ impl VisionaryApp {
                                 .suffix("°"),
                             );
                         }
+
+                        // The correction between two coordinate conventions can only send each
+                        // axis to another axis, so the whole space is the 24 turns of a cube.
+                        // Stepping that beats dragging three angles: it is finite, every stop
+                        // is a candidate worth looking at, and it cannot land somewhere no
+                        // format disagreement could explain.
+                        let offsets = self.effect_quad_planes.offsets[index];
+                        let bases = crate::eff_runtime::QuadPlanes::cube_bases().len();
+                        let at = crate::eff_runtime::QuadPlanes::basis_index_of(offsets);
+                        let mut step = |ui: &mut Ui, label: &str, delta: i64| {
+                            if ui.small_button(label).clicked() {
+                                let next = match at {
+                                    Some(current) => {
+                                        (current as i64 + delta).rem_euclid(bases as i64) as usize
+                                    }
+                                    // Off the lattice: the first press snaps onto it rather
+                                    // than jumping somewhere unrelated.
+                                    None => 0,
+                                };
+                                self.effect_quad_planes.offsets[index] =
+                                    crate::eff_runtime::QuadPlanes::basis_degrees(next);
+                            }
+                        };
+                        step(ui, "◀", -1);
+                        ui.label(
+                            RichText::new(match at {
+                                Some(current) => format!("basis {}/{bases}", current + 1),
+                                None => "off-axis".to_string(),
+                            })
+                            .small()
+                            .color(match at {
+                                Some(_) => Color32::GRAY,
+                                // Worth flagging rather than styling like the rest: an
+                                // off-lattice value is not a relabelling of axes, so it is
+                                // either a real discovery or a slipped drag.
+                                None => Color32::from_rgb(230, 190, 90),
+                            }),
+                        )
+                        .on_hover_text(
+                            "A correction between coordinate conventions is always a quarter                              turn, so the 24 cube rotations are the whole search space. Step                              through them instead of dragging angles. \"off-axis\" means the                              current value is not one of them.",
+                        );
+                        step(ui, "▶", 1);
                     });
                 }
             });

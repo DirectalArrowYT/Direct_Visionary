@@ -449,6 +449,19 @@ pub struct LiveEffect {
     /// leaves every effect at whatever angle its emitter happens to carry, which for most is
     /// none at all.
     pub rotation: glam::Vec3,
+    /// The call's own size multiplier -- the `size` argument of the spawn macro.
+    ///
+    /// Scales the effect's whole geometry: how big each particle is AND how far it spreads
+    /// from the emitter, because in the game an effect at half size is the same effect
+    /// smaller, not the same spread with smaller dots in it. It does NOT scale the call's
+    /// placement offset, which is a position in the bone's frame rather than part of the
+    /// effect.
+    ///
+    /// A literal multiply, including zero. Only 2 of the 8732 `EFFECT_FOLLOW` calls in the
+    /// script dump pass 0, so treating it as "invisible" costs nothing and matches what the
+    /// game does, where reading it as "unset, use 1.0" would silently show two effects the
+    /// game does not.
+    pub scale: f32,
 }
 
 /// Put a decoded effect texture into one form the shader can treat uniformly.
@@ -491,12 +504,25 @@ pub struct PendingTexture {
 }
 
 /// Everything one frame of effects needs handed to the GPU.
-/// Which plane each `billboard_type` draws its quads in, indexed by type.
+/// Which orientation mode each `billboard_type` draws its quads with, indexed by type.
 ///
 /// Type 0 is camera-facing and certain. The rest are not documented anywhere and are not
-/// derivable from the file — which plane is right is something you can see and the data cannot
+/// derivable from the file — which mode is right is something you can see and the data cannot
 /// tell you — so the mapping is a setting rather than a constant, and the viewport lets it be
 /// changed while looking at the effect.
+///
+/// Not every billboard type is a quad, and no mode here can cover the ones that are not.
+/// `render/common/effect_param.prc` budgets the runtime's pools separately: 800 emitters, 120
+/// emitter sets -- and 32 STRIPES. A stripe is a ribbon threaded through a particle's history
+/// rather than a quad at a position, so whichever type values select one, they cannot be drawn
+/// by choosing axes for a quad. Stepping every basis for such a type and finding that none
+/// match is the expected outcome, not a missing entry in this list.
+///
+/// The modes are a closed set of six real techniques rather than a plane plus free rotation,
+/// which is the point: picking from six things you can tell apart by eye converges, and
+/// hand-turning three Euler angles per type does not. Two of the six — Y-billboard and
+/// velocity — depend on where the camera is and where the particle is going, so no amount of
+/// tuning a fixed plane will ever reach them.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuadPlanes {
     pub planes: [u32; 8],
@@ -540,10 +566,32 @@ impl Default for QuadPlanes {
 }
 
 impl QuadPlanes {
-    pub const NAMES: [&'static str; 4] = ["Camera facing", "Local XY", "Local XZ", "Local ZY"];
+    pub const NAMES: [&'static str; 6] = [
+        "Camera facing",
+        "Local XY",
+        "Local XZ",
+        "Local ZY",
+        "Y billboard",
+        "Velocity",
+    ];
+
+    /// What each mode does, for the tooltip beside the picker. The distinction that matters
+    /// when choosing is whether the quad can go edge-on: the plane modes can, the axis-locked
+    /// ones cannot, and "it disappears from some angles" is the fastest way to tell them apart.
+    pub const DESCRIPTIONS: [&'static str; 6] = [
+        "Always square to the viewer. Never edge-on. The default, and most of the corpus.",
+        "Pinned to the effect's XY plane. Goes edge-on from the side.",
+        "Pinned to the effect's XZ plane — flat to the ground. Goes edge-on from level with it.",
+        "Pinned to the effect's ZY plane. Goes edge-on from the front.",
+        "Upright, spinning about the effect's up axis to face the viewer. Never edge-on. \
+         For flames and columns that should stay vertical from every angle.",
+        "Long axis follows the particle's travel, spinning about it to face the viewer. \
+         Never edge-on. For sparks and streaks, which point where they are going.",
+    ];
 
     pub fn plane_for(&self, billboard_type: i64) -> u32 {
-        self.planes[billboard_type.clamp(0, 7) as usize].min(3)
+        self.planes[billboard_type.clamp(0, 7) as usize]
+            .min(Self::NAMES.len() as u32 - 1)
     }
 
     /// The per-type extra turn, as a quaternion.
@@ -558,6 +606,73 @@ impl QuadPlanes {
             y.to_radians(),
             z.to_radians(),
         )
+    }
+
+    /// Every way the effect's axes can be relabelled onto ours: the 24 rotations of a cube.
+    ///
+    /// This is the whole search space for a per-type correction, and it being FINITE is the
+    /// point. A correction between two coordinate conventions can only ever send each axis to
+    /// another axis -- it cannot send X to somewhere 37 degrees off X, because no file format
+    /// disagrees with another by 37 degrees. So the honest control is "which of these 24", not
+    /// three free angles, and the evidence that this is the right model is that the values
+    /// found by eye keep landing on multiples of 90.
+    ///
+    /// Built rather than tabulated so the convention `offset_for` reads them back with cannot
+    /// drift from the convention they were written in.
+    pub fn cube_bases() -> Vec<glam::Quat> {
+        let axes = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z];
+        let mut out = Vec::with_capacity(24);
+        for perm in [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+            for signs in 0..8u8 {
+                let col = |i: usize| {
+                    let sign = if signs & (1 << i) != 0 { -1.0 } else { 1.0 };
+                    axes[perm[i]] * sign
+                };
+                let m = glam::Mat3::from_cols(col(0), col(1), col(2));
+                // Half of the 48 signed permutations are reflections. A reflection is not a
+                // rotation and would mirror the effect rather than turn it.
+                if m.determinant() > 0.0 {
+                    out.push(glam::Quat::from_mat3(&m));
+                }
+            }
+        }
+        out
+    }
+
+    /// One cube basis as the X/Y/Z degrees `offsets` stores, so stepping through them writes
+    /// the same field the free-angle drags do and nothing downstream needs to know the
+    /// difference.
+    pub fn basis_degrees(index: usize) -> [f32; 3] {
+        let bases = Self::cube_bases();
+        let q = bases[index % bases.len()];
+        let (x, y, z) = q.to_euler(glam::EulerRot::XYZ);
+        // Snapped because these are exact quarter turns and floating point renders them as
+        // 89.99999. A stored 90 also makes the settings readable as what they are.
+        let snap = |v: f32| (v.to_degrees() / 90.0).round() * 90.0;
+        [snap(x), snap(y), snap(z)]
+    }
+
+    /// Which cube basis the current angles are, when they are one. `None` for a setting that
+    /// has been dragged off the lattice -- that is a real answer, not a failure: it says the
+    /// correction being applied is not a relabelling of axes, which is worth knowing.
+    pub fn basis_index_of(degrees: [f32; 3]) -> Option<usize> {
+        let on_lattice = degrees
+            .iter()
+            .all(|v| (v / 90.0 - (v / 90.0).round()).abs() < 1e-3);
+        if !on_lattice {
+            return None;
+        }
+        let want = glam::Quat::from_euler(
+            glam::EulerRot::XYZ,
+            degrees[0].to_radians(),
+            degrees[1].to_radians(),
+            degrees[2].to_radians(),
+        );
+        Self::cube_bases()
+            .iter()
+            // Quaternions double-cover rotations, so q and -q are the same turn and comparing
+            // components directly would miss half the matches.
+            .position(|q| q.dot(want).abs() > 0.999)
     }
 }
 
@@ -612,6 +727,7 @@ pub fn build_particle_batches(
         age,
         offset: call_offset,
         rotation: call_rotation,
+        scale,
     } in live
     {
         let Ok(resolved) = resolver.resolve(name) else {
@@ -702,17 +818,36 @@ pub fn build_particle_batches(
                     call_rotation.y.to_radians(),
                     call_rotation.z.to_radians(),
                 );
-                let orientation = bone_rotation
-                    * call_turn
-                    * emitter_rotation
-                    * planes.offset_for(sim.billboard_type);
+                // Where the effect points, before any convention correction. Bone, then the
+                // call's aim, then the emitter's own -- all three are real data.
+                let placed = bone_rotation * call_turn * emitter_rotation;
+                // The per-type basis correction applies to BILLBOARDS ONLY.
+                //
+                // A billboard has no geometry: the shader synthesises its axes from a rule, so
+                // "which axes" is a convention question and a correction is the answer to it.
+                // A mesh is the opposite -- its orientation is in its vertices, already, and
+                // turning it by a per-type constant rotates a shape that was authored pointing
+                // the right way.
+                //
+                // Measured, not assumed. All three attack arcs are meshes of type 3, and their
+                // geometry is thin in Y -- 29.66 x 5.37 x 22.33, 20.06 x 2.98 x 11.11,
+                // 26.19 x 4.78 x 26.19 -- so each is authored flat in the XZ plane, which is
+                // exactly the plane the tilt observations independently say an arc lies in.
+                // They need no correction. Applying one to all of them at once is also why
+                // dialling in the correction for one arc moved the others: a single per-type
+                // constant cannot serve three differently-shaped meshes.
+                let orientation = placed * planes.offset_for(sim.billboard_type);
                 // The ACMD call's own offset is in the effect's local frame, as is the
                 // emitter's; both ride through the bone's rotation to reach world space.
                 // The emitter's own offset is inside the effect's rotated frame; the call's is
                 // in the bone's. Rotating both, or neither, puts multi-emitter effects in the
                 // wrong shape as soon as a script aims one.
-                let origin =
-                    matrix.transform_point3(*call_offset + call_turn * sim.translation);
+                // The emitter's own offset is part of the effect, so it rides the call's size:
+                // a half-size SYS_TURN_SMOKE is a smaller cloud, not five smaller puffs spread
+                // as widely as before. The call's own offset does not -- that is where the
+                // script put the effect, not how big it is.
+                let origin = matrix
+                    .transform_point3(*call_offset + call_turn * (sim.translation * *scale));
                 let seed = (part.set_idx as u64) << 32 ^ (emitter_index as u64) << 8 ^ index as u64;
                 let particle_age = age - part.start_frame as f32;
                 if particle_age < 0.0 {
@@ -726,6 +861,20 @@ pub fn build_particle_batches(
                 // An emitter whose primitive_id resolves draws geometry instead of a quad --
                 // about half of them do. A ring drawn as a camera-facing square is the shape a
                 // shockwave was showing, and no billboard setting fixes it.
+                // Where the particle's own turn has to be applied depends on how the quad is
+                // built, and the mesh path does not use the scalar roll at all.
+                //
+                //   camera-facing: the axes come from the camera, so the only expressible turn
+                //     is a roll about the view axis -- the scalar, which the shader applies.
+                //   everything else: the axes come from `orientation`, so folding the turn in
+                //     here is what makes it visible, and it carries all three axes rather than
+                //     just the one a scalar can hold.
+                //
+                // SYS_ATTACK_ARC is the case that proves it. It is a mesh, it sweeps about Y
+                // at 2 degrees a frame, and `vs_mesh` never reads the scalar -- so before
+                // this the arc simply did not move.
+                let quad_mode = planes.plane_for(sim.billboard_type);
+                let camera_facing = quad_mode == 0;
                 let mesh_key = sim.primitive_id.and_then(|id| {
                     meshes
                         .descriptor_for(&file, id)
@@ -740,73 +889,102 @@ pub fn build_particle_batches(
                             pending_meshes.push((mesh_key.clone(), mesh.clone()));
                         }
                     }
-                    let batch_index = match mesh_batches
-                        .iter()
-                        .position(|batch| batch.mesh == mesh_key && batch.texture == key)
+                    let additive = is_additive(sim.blend_type);
+                    let batch_index = match mesh_batches.iter().position(|batch| {
+                        batch.mesh == mesh_key && batch.texture == key && batch.additive == additive
+                    })
                     {
                         Some(found) => found,
                         None => {
                             mesh_batches.push(MeshBatch {
                                 mesh: mesh_key,
                                 texture: key.clone(),
-                                additive: true,
+                                additive: is_additive(sim.blend_type),
                                 instances: Vec::new(),
                             });
                             mesh_batches.len() - 1
                         }
                     };
                     for particle in simulated {
+                        let spun = placed
+                            * glam::Quat::from_euler(
+                                glam::EulerRot::XYZ,
+                                particle.spin.x,
+                                particle.spin.y,
+                                particle.spin.z,
+                            );
                         mesh_batches[batch_index].instances.push(ParticleInstance {
-                            position: (origin + orientation * particle.offset).to_array(),
-                            size: particle.size,
+                            position: (origin + placed * (particle.offset * *scale))
+                                .to_array(),
+                            size: particle.size * *scale,
                             color: [
                                 particle.color[0] * tint[0],
                                 particle.color[1] * tint[1],
                                 particle.color[2] * tint[2],
                                 particle.color[3] * alpha,
                             ],
-                            rotation: particle.rotation,
+                            // A mesh keeps its own geometry, so its turn belongs in the
+                            // orientation; the scalar would be ignored anyway.
+                            rotation: 0.0,
                             uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
-                            orientation: orientation.to_array(),
-                            plane: planes.plane_for(sim.billboard_type),
-                            _padding: [0.0; 2],
+                            orientation: spun.to_array(),
+                            plane: quad_mode,
+                            velocity: (orientation * particle.velocity).to_array(),
+                            _padding: [0.0; 3],
                         });
                     }
                     continue;
                 }
 
+                let additive = is_additive(sim.blend_type);
                 let batch_index = match batches
                     .iter()
-                    .position(|batch| batch.texture == key && batch.additive)
+                    .position(|batch| batch.texture == key && batch.additive == additive)
                 {
                     Some(found) => found,
                     None => {
                         batches.push(ParticleBatch {
                             texture: key.clone(),
-                            // Additive until the emitter's own render state is read. Most
-                            // effects are additive, and an additive particle drawn as alpha
-                            // reads as a grey box, which is worse than the reverse.
-                            additive: true,
+                            // The emitter's own render state, not an assumption. Forcing this
+                            // additive drew roughly three quarters of the game's emitters in
+                            // the wrong mode -- every smoke and dust puff glowing like fire.
+                            additive,
                             instances: Vec::new(),
                         });
                         batches.len() - 1
                     }
                 };
                 for particle in simulated {
+                    let spun = if camera_facing {
+                        orientation
+                    } else {
+                        orientation
+                            * glam::Quat::from_euler(
+                                glam::EulerRot::XYZ,
+                                particle.spin.x,
+                                particle.spin.y,
+                                particle.spin.z,
+                            )
+                    };
                     batches[batch_index].instances.push(ParticleInstance {
-                        position: (origin + orientation * particle.offset).to_array(),
-                        size: particle.size,
+                        position: (origin + orientation * (particle.offset * *scale))
+                            .to_array(),
+                        size: particle.size * *scale,
                         color: [
                             particle.color[0] * tint[0],
                             particle.color[1] * tint[1],
                             particle.color[2] * tint[2],
                             particle.color[3] * alpha,
                         ],
-                        rotation: particle.rotation,
+                        // Applied once, in whichever place the mode can express it: as a
+                        // screen roll for a camera-facing quad, and folded into the axes for
+                        // every other mode. Doing both would turn the quad twice.
+                        rotation: if camera_facing { particle.rotation } else { 0.0 },
                         uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
-                        orientation: orientation.to_array(),
-                        plane: planes.plane_for(sim.billboard_type),
-                        _padding: [0.0; 2],
+                        orientation: spun.to_array(),
+                        plane: quad_mode,
+                        velocity: (orientation * particle.velocity).to_array(),
+                        _padding: [0.0; 3],
                     });
                 }
             }
@@ -822,6 +1000,16 @@ pub fn build_particle_batches(
         },
         undecodable,
     )
+}
+
+/// Whether an emitter's particles add to what is behind them or blend over it.
+///
+/// The format numbers these 0 normal, 1 additive, 2 subtractive. Only two pipelines exist, so
+/// subtractive -- 3% of emitters, and a darkening operation -- is drawn as normal rather than
+/// as additive: getting it slightly wrong in the direction of "does not glow" is much closer
+/// than lighting up something meant to darken.
+pub fn is_additive(blend_type: i64) -> bool {
+    blend_type == 1
 }
 
 /// Bone lookup that tolerates the case difference between ACMD and the skeleton.
@@ -860,6 +1048,817 @@ mod tests {
     /// Set `VISIONARY_EFF_ROOT` to the dump root (the folder holding `effect/`).
     fn root() -> Option<PathBuf> {
         std::env::var_os("VISIONARY_EFF_ROOT").map(PathBuf::from)
+    }
+
+    /// The correction space is the cube group, and it is closed: 24 turns, no reflections.
+    ///
+    /// A reflection slipping in would mirror an effect rather than turn it, and a mirrored arc
+    /// reads as a plausible-but-wrong swing rather than as an obvious bug.
+    #[test]
+    fn the_basis_corrections_are_the_twenty_four_rotations_of_a_cube() {
+        let bases = QuadPlanes::cube_bases();
+        assert_eq!(bases.len(), 24);
+        for q in &bases {
+            let m = glam::Mat3::from_quat(*q);
+            assert!((m.determinant() - 1.0).abs() < 1e-4, "{q:?} is a reflection");
+        }
+        // Distinct as ROTATIONS: q and -q are the same turn, so a naive component compare
+        // would call the list distinct while holding duplicates.
+        for (i, a) in bases.iter().enumerate() {
+            for (j, b) in bases.iter().enumerate().skip(i + 1) {
+                assert!(a.dot(*b).abs() < 0.999, "bases {i} and {j} are the same turn");
+            }
+        }
+    }
+
+    /// Every basis round-trips through the degrees `offsets` stores, so stepping the picker
+    /// and then reading the setting back cannot land on a different turn than the one shown.
+    #[test]
+    fn a_basis_survives_being_written_as_degrees_and_read_back() {
+        for index in 0..QuadPlanes::cube_bases().len() {
+            let degrees = QuadPlanes::basis_degrees(index);
+            for value in degrees {
+                assert_eq!(value, (value / 90.0).round() * 90.0, "{degrees:?} is off-lattice");
+            }
+            assert_eq!(
+                QuadPlanes::basis_index_of(degrees),
+                Some(index),
+                "basis {index} wrote {degrees:?}, which reads back as something else"
+            );
+        }
+        // An angle that is not a quarter turn is not a relabelling of axes, and saying so is
+        // the point of the lookup.
+        assert_eq!(QuadPlanes::basis_index_of([55.0, 0.0, 0.0]), None);
+    }
+
+    /// What the type 3 setting found by eye actually IS: a ground-plane arc.
+    ///
+    /// This is the one measured fact in the orientation model, and it was worth chasing
+    /// because it turns a tuned pair of numbers into a statement about the format.
+    ///
+    /// The setting is mode "Local XY" -- quad spanned by the effect's X and Y -- plus a
+    /// correction of (-90, 0, 90). That correction sends X to -Z and Y to -X, so the quad is
+    /// really spanned by the effect's Z and X: its normal is the effect's Y, and it lies in
+    /// the effect's XZ plane. A horizontal sweep, which is what a swing arc is.
+    ///
+    /// Four independent things agree on that plane. This setting, tuned by eye against the
+    /// game; and three arc spawns whose on-screen shape is known because they are correct in
+    /// the game already and needed no editing:
+    ///
+    ///   Bakugo  down tilt   rot [-90,  0, 0]   reads as ")"
+    ///   Bakugo  side tilt   rot [ 55,-90, 0]   reads as "U"
+    ///   Pit     up tilt     rot [ 80, 15, 0]   reads as ")"
+    ///
+    /// Start each of those from a plane whose normal is the effect's Y and all three come out
+    /// facing the camera -- |normal.z| of 1.00, 0.82 and 0.99 -- which is the only way a U or
+    /// a ) is what you see, since an arc turned edge-on reads as a streak. Start them from a
+    /// plane whose normal is X or Z instead and at least one of the three goes edge-on. That
+    /// rules out both alternatives outright rather than merely preferring Y.
+    ///
+    /// The same check says nothing about the Euler ORDER, and cannot: all three calls leave
+    /// one of the three angles at zero, and with a zero angle the orders collapse onto each
+    /// other. 98% of the corpus is like that, which is why the order has never been the thing
+    /// worth chasing.
+    ///
+    /// What is left over is only the ROLL inside that plane, which is four options rather
+    /// than a continuum, because the arc texture has an up and the plane does not say which
+    /// way it points.
+    #[test]
+    fn the_type_three_correction_puts_the_arc_in_the_ground_plane() {
+        let degrees = [-90.0, 0.0, 90.0];
+        let index = QuadPlanes::basis_index_of(degrees)
+            .expect("a pair of quarter turns has to be one of the 24");
+        let q = QuadPlanes::cube_bases()[index];
+        let near = |a: glam::Vec3, b: glam::Vec3| (a - b).length() < 1e-4;
+
+        // Mode "Local XY" spans the quad with the corrected X and Y.
+        let right = q * glam::Vec3::X;
+        let up = q * glam::Vec3::Y;
+        assert!(near(right, -glam::Vec3::Z), "right is {right:?}");
+        assert!(near(up, -glam::Vec3::X), "up is {up:?}");
+
+        // Which makes the quad's normal the effect's own Y -- the defining property of a
+        // ground-plane arc, and the thing that survives however the arc is rolled.
+        let normal = right.cross(up);
+        assert!(near(normal, glam::Vec3::Y), "normal is {normal:?}");
+    }
+
+    /// The shape and orientation of specific primitives, by id. `VISIONARY_EFF_IDS` is a
+    /// comma-separated list.
+    ///
+    /// The question this answers: when two effects that look alike need different orientation
+    /// corrections, is it because their MESHES are authored at different angles? A per-type
+    /// setting cannot tell two meshes apart, so if the geometry differs, no value of that
+    /// setting can serve both.
+    #[test]
+    fn what_shape_are_these_primitive_ids() {
+        let (Some(root), Ok(ids)) = (root(), std::env::var("VISIONARY_EFF_IDS")) else {
+            eprintln!("VISIONARY_EFF_ROOT / VISIONARY_EFF_IDS not set — skipping");
+            return;
+        };
+        let path = EffectResolver::common_eff_path(&root);
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+        println!();
+        for token in ids.split(',') {
+            let id: u64 = token.trim().parse().expect("primitive id");
+            let Some(descriptor) = meshes.descriptor_for(&path, id) else {
+                println!("  id {id:<12} does not resolve");
+                continue;
+            };
+            let key = crate::eff_mesh::MeshKey { file: path.clone(), descriptor };
+            let Some(mesh) = meshes.mesh(&key) else {
+                println!("  id {id:<12} desc {descriptor} has no geometry");
+                continue;
+            };
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in &mesh.vertices {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(v.position[a]);
+                    hi[a] = hi[a].max(v.position[a]);
+                }
+            }
+            let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            let flat = ["X", "Y", "Z"]
+                .iter()
+                .zip(ext)
+                .filter(|(_, e)| *e < 0.05)
+                .map(|(a, _)| *a)
+                .collect::<Vec<_>>();
+            println!(
+                "  id {id:<12} desc {descriptor:<4} verts={:<5} extent=({:7.2},{:7.2},{:7.2})  flat in: {}",
+                mesh.vertices.len(), ext[0], ext[1], ext[2],
+                if flat.is_empty() { "nothing (solid)".to_string() } else { flat.join("+") }
+            );
+        }
+    }
+
+    /// Which named effects use a given primitive descriptor. `VISIONARY_EFF_DESC` selects it.
+    ///
+    /// The other half of the primitive search: knowing that descriptor 31 is a ground disc is
+    /// only useful once you know which effect to clone to get one.
+    #[test]
+    fn which_effects_use_a_given_primitive() {
+        let (Some(root), Ok(want)) = (root(), std::env::var("VISIONARY_EFF_DESC")) else {
+            eprintln!("VISIONARY_EFF_ROOT / VISIONARY_EFF_DESC not set — skipping");
+            return;
+        };
+        let want: usize = want.parse().expect("descriptor index");
+        // Any file when one is named, so this reaches a mod's own eff or a transplant donor.
+        let path = std::env::var_os("VISIONARY_EFF_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| EffectResolver::common_eff_path(&root));
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(path.clone()));
+        let loaded = resolver.loaded(&path).expect("ef_common loads").clone();
+        let table = crate::eff_attrs::table();
+        let slot = table.iter().position(|a| a.id == "particle_data.primitive_id");
+
+        // set index -> the entry names that reach it, so a hit reports something spawnable.
+        let mut names_for: std::collections::HashMap<usize, Vec<String>> = Default::default();
+        for entry in &loaded.entries {
+            if let Some(idx) = entry.set_idx {
+                names_for.entry(idx).or_default().push(entry.name.clone());
+            }
+        }
+        println!("
+=== effects using descriptor {want} ===");
+        let mut hits = 0usize;
+        for (set_idx, set) in loaded.ptcl.emitter_sets.iter().enumerate() {
+            for emitter in &set.emitters {
+                let Some(Some(value)) = slot.and_then(|i| emitter.attrs.get(i)) else { continue };
+                let id = match value {
+                    crate::eff_attrs::AttrValue::UInt(v) => *v,
+                    crate::eff_attrs::AttrValue::Int(v) if *v > 0 => *v as u64,
+                    _ => continue,
+                };
+                if meshes.descriptor_for(&path, id) != Some(want) {
+                    continue;
+                }
+                hits += 1;
+                if hits <= 20 {
+                    println!(
+                        "  set '{}' emitter '{}'  spawned as: {}",
+                        set.name,
+                        emitter.name,
+                        names_for.get(&set_idx).map(|n| n.join(", ")).unwrap_or_else(|| "(no entry)".into())
+                    );
+                }
+            }
+        }
+        println!("  {hits} emitters total");
+    }
+
+    /// Every primitive a file holds, by shape. Finding a flat disc, a ring or a cone in the
+    /// game's own pool means an effect can borrow geometry instead of importing it.
+    #[test]
+    fn what_shape_is_every_primitive_in_a_file() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+        let mut rows: Vec<(String, usize)> = Vec::new();
+        for descriptor in 0..256usize {
+            let key = crate::eff_mesh::MeshKey { file: path.clone(), descriptor };
+            let Some(mesh) = meshes.mesh(&key) else { continue };
+            if mesh.vertices.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in &mesh.vertices {
+                for a in 0..3 {
+                    lo[a] = lo[a].min(v.position[a]);
+                    hi[a] = hi[a].max(v.position[a]);
+                }
+            }
+            let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            // A primitive with one near-zero extent is a flat card or disc; that is the shape
+            // a ground ring needs, and it is the one worth finding by search rather than by
+            // opening every effect that might have one.
+            let thin = ext.iter().filter(|e| **e < 0.02).count();
+            let shape = if thin >= 1 { "FLAT" } else { "solid" };
+            rows.push((
+                format!(
+                    "  desc {descriptor:<4} {:<6} verts={:<6} tris={:<6} extent=({:6.2},{:6.2},{:6.2})",
+                    shape, mesh.vertices.len(), mesh.indices.len() / 3, ext[0], ext[1], ext[2]
+                ),
+                descriptor,
+            ));
+        }
+        println!("
+=== {} : {} primitives ===", path.display(), rows.len());
+        for (line, _) in &rows {
+            println!("{line}");
+        }
+    }
+
+    /// Which effects use each pool texture, across every part of every entry.
+    ///
+    /// The question before replacing a texture BY NAME: a pool texture is shared by every emitter
+    /// that samples it, so an import meant for one effect reskins all the others that use it too.
+    /// `VISIONARY_EFF_FILE`; `VISIONARY_EFF_MATCH` (comma-separated substrings) restricts the
+    /// printout to textures that some matching entry uses, and still lists ALL of their users.
+    #[test]
+    fn which_entries_use_each_texture() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let wanted: Vec<String> = std::env::var("VISIONARY_EFF_MATCH")
+            .unwrap_or_default()
+            .split(',')
+            .map(|w| w.trim().to_lowercase())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let bytes = std::fs::read(&path).expect("eff reads");
+        let namco = effect_library::NamcoEffectFile::load(&bytes).expect("eff parses");
+        let loaded = load_effect(&path).expect("eff loads");
+        let by_id = texture_names(&namco);
+        let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+
+        let mut users: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            Default::default();
+        for entry in &loaded.entries {
+            for part in parts_of(entry) {
+                let Some(set) = ptcl.emitter_list.emitter_sets.get(part.set_idx) else { continue };
+                let mut flat = Vec::new();
+                flat_emitters(&set.emitters, 0, &mut flat);
+                for (_, emitter) in &flat {
+                    for sampler in [&emitter.data.sampler0, &emitter.data.sampler1, &emitter.data.sampler2]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(tex) = by_id.get(&sampler.texture_id) {
+                            users.entry(tex.clone()).or_default().insert(entry.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let shape = |tex: &str| {
+            loaded
+                .ptcl
+                .bntx_textures
+                .iter()
+                .find(|t| t.tex_name == tex)
+                .map(|t| format!("{}x{} {}", t.width, t.height, t.format))
+                .unwrap_or_else(|| "?".into())
+        };
+        println!();
+        for (tex, who) in &users {
+            let relevant = wanted.is_empty()
+                || who.iter().any(|e| wanted.iter().any(|w| e.to_lowercase().contains(w)));
+            if !relevant {
+                continue;
+            }
+            let shared = who.iter().any(|e| !wanted.iter().any(|w| e.to_lowercase().contains(w)));
+            println!(
+                "  {tex:<30} {:<18} {} {}",
+                shape(tex),
+                if shared && !wanted.is_empty() { "SHARED " } else { "private" },
+                who.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
+    /// Decode named pool textures to PNG, and say what colour they actually hold.
+    ///
+    /// For "is the colour in the texture or somewhere else": the mean RGB over the visible
+    /// pixels tells a neutral mask (R, G and B roughly equal, or a two-channel format with
+    /// blue at zero) from a texture with a hue baked into it, which no colour field can undo.
+    ///
+    /// `VISIONARY_EFF_FILE`, `VISIONARY_TEX_NAMES` (comma-separated), `VISIONARY_TEX_OUT` (a dir).
+    #[test]
+    fn export_named_pool_textures() {
+        let (Some(path), Ok(names), Some(out)) = (
+            std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from),
+            std::env::var("VISIONARY_TEX_NAMES"),
+            std::env::var_os("VISIONARY_TEX_OUT").map(PathBuf::from),
+        ) else {
+            eprintln!("VISIONARY_EFF_FILE / VISIONARY_TEX_NAMES / VISIONARY_TEX_OUT not set — skipping");
+            return;
+        };
+        std::fs::create_dir_all(&out).expect("output dir");
+        let loaded = load_effect(&path).expect("eff loads");
+        let pool = loaded.texture_pool.as_ref().expect("eff has a texture pool");
+        println!();
+        for name in names.split(',').map(str::trim) {
+            let Some(index) = loaded.ptcl.bntx_textures.iter().position(|t| t.tex_name == name) else {
+                println!("  {name}: not in this pool");
+                continue;
+            };
+            let info = &loaded.ptcl.bntx_textures[index];
+            // Editable form when asked: swizzle applied and single-channel masks flattened to
+            // black-and-white, which is also the form an import with `raw: false` reads back.
+            let editable = std::env::var("VISIONARY_TEX_FORM").map(|f| f == "editable").unwrap_or(false);
+            let layout = crate::texture_import::layout_of_public(pool, index, name)
+                .map(|l| format!("{l:?}"))
+                .unwrap_or_else(|_| "?".into());
+            let decoded = if editable {
+                crate::texture_import::decode_form(
+                    pool,
+                    index,
+                    name,
+                    crate::texture_import::Form::Editable,
+                    None,
+                )
+            } else {
+                crate::texture_import::decode_rgba(pool, index, name, None)
+            };
+            match decoded {
+                Ok(image) => {
+                    let file = out.join(format!("{name}.png"));
+                    image.save(&file).expect("png writes");
+                    // "Visible" by any channel, since a two-channel texture keeps its shape in R.
+                    let (mut sum, mut n) = ([0u64; 4], 0u64);
+                    for px in image.pixels() {
+                        if px.0[..3].iter().copied().max().unwrap_or(0) > 24 {
+                            for c in 0..4 {
+                                sum[c] += px.0[c] as u64;
+                            }
+                            n += 1;
+                        }
+                    }
+                    let mean = |c: usize| if n == 0 { 0 } else { sum[c] / n };
+                    println!(
+                        "  {name:<28} {}x{} {:<10} {layout:<26} visible mean rgba=({}, {}, {}, {}) over {n} px -> {}",
+                        info.width, info.height, info.format,
+                        mean(0), mean(1), mean(2), mean(3),
+                        file.display()
+                    );
+                }
+                Err(error) => println!("  {name}: {error}"),
+            }
+        }
+    }
+
+    /// Flatten an emitter tree parent-first, keeping each emitter's depth.
+    fn flat_emitters(
+        emitters: &[effect_library::structs::Emitter],
+        depth: usize,
+        out: &mut Vec<(usize, effect_library::structs::Emitter)>,
+    ) {
+        for emitter in emitters {
+            out.push((depth, emitter.clone()));
+            flat_emitters(&emitter.children, depth + 1, out);
+        }
+    }
+
+    /// The emitters of one entry's primary set in a raw file, flattened.
+    fn emitters_of(
+        namco: &effect_library::NamcoEffectFile,
+        entry: &str,
+    ) -> Option<Vec<(usize, effect_library::structs::Emitter)>> {
+        let at = namco.entry_names.iter().position(|n| n.eq_ignore_ascii_case(entry))?;
+        let set_idx = (namco.entries[at].emitter_set_id as usize).checked_sub(1)?;
+        let set = namco.ptcl_file.as_ref()?.emitter_list.emitter_sets.get(set_idx)?;
+        let mut out = Vec::new();
+        flat_emitters(&set.emitters, 0, &mut out);
+        Some(out)
+    }
+
+    fn texture_names(namco: &effect_library::NamcoEffectFile) -> HashMap<u64, String> {
+        namco
+            .ptcl_file
+            .as_ref()
+            .and_then(|ptcl| ptcl.texture_info.as_ref())
+            .map(|info| info.descriptors.iter().map(|d| (d.id, d.name.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// What every emitter of one effect samples, and how its colour is produced.
+    ///
+    /// The question behind it: when recolouring every colour field an editor exposes still
+    /// leaves part of an effect the wrong colour, the colour is coming from somewhere those
+    /// fields do not reach -- baked into a texture, read from a second sampler (a gradient
+    /// "grade" ramp), or picked by a combiner mode that ignores the particle colour. This
+    /// prints all three per emitter. `VISIONARY_EFF_FILE`, `VISIONARY_EFF_NAME`.
+    #[test]
+    fn what_each_emitter_of_an_effect_samples() {
+        let (Some(path), Ok(name)) = (
+            std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from),
+            std::env::var("VISIONARY_EFF_NAME"),
+        ) else {
+            eprintln!("VISIONARY_EFF_FILE / VISIONARY_EFF_NAME not set — skipping");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("eff reads");
+        let namco = effect_library::NamcoEffectFile::load(&bytes).expect("eff parses");
+        let loaded = load_effect(&path).expect("eff loads");
+        let by_id = texture_names(&namco);
+        let shape = |tex: &str| {
+            loaded
+                .ptcl
+                .bntx_textures
+                .iter()
+                .find(|t| t.tex_name == tex)
+                .map(|t| format!("{}x{} {}", t.width, t.height, t.format))
+                .unwrap_or_else(|| "?".into())
+        };
+        let table = crate::eff_attrs::table();
+        let emitters = emitters_of(&namco, &name).expect("entry and its set exist");
+        println!("\n=== {name}: {} emitters ===", emitters.len());
+        for (depth, emitter) in &emitters {
+            let data = &emitter.data;
+            println!("{}- {}", "  ".repeat(*depth), data.display_name());
+            let pad = "  ".repeat(*depth + 2);
+            for (slot, sampler) in [(0, &data.sampler0), (1, &data.sampler1), (2, &data.sampler2)] {
+                if let Some(sampler) = sampler {
+                    if let Some(tex) = by_id.get(&sampler.texture_id) {
+                        println!("{pad}sampler{slot}: {tex} [{}]", shape(tex));
+                    }
+                }
+            }
+            let mut line = Vec::new();
+            for attr in table.iter() {
+                let interesting = attr.id.starts_with("combiner.")
+                    || attr.id.starts_with("particle_color.")
+                    || attr.id.starts_with("texture_anim0.")
+                    || matches!(
+                        attr.id,
+                        "render_state.blend_type"
+                            | "particle_data.billboard_type"
+                            | "particle_data.primitive_id"
+                            | "emitter_static.color_scale"
+                            | "emitter_static.num_color0_keys"
+                            | "emitter_static.num_color1_keys"
+                            | "emitter_static.num_alpha0_keys"
+                            | "shader_references.shader_index"
+                            | "particle_data.life"
+                            | "particle_scale.scale_x"
+                    );
+                if !interesting {
+                    continue;
+                }
+                if let Some(value) = (attr.get)(data) {
+                    let zero = value.as_f32() == 0.0;
+                    // Zeros are the default and say nothing -- except the two fields where
+                    // zero is itself the answer (normal blend, constant colour).
+                    if zero && !matches!(attr.id, "render_state.blend_type" | "particle_color.color0_type") {
+                        continue;
+                    }
+                    line.push(format!("{}={:?}", attr.id, value));
+                }
+            }
+            for chunk in line.chunks(4) {
+                println!("{pad}{}", chunk.join("  "));
+            }
+        }
+    }
+
+    /// Every difference between two files, per effect and per pool texture.
+    ///
+    /// For finding what a hand edit in another tool actually changed. Attributes are compared
+    /// through the same table the editor uses; textures by their decoded pixels, because a
+    /// re-encode that changes nothing visible still changes bytes. `VISIONARY_EFF_FILE` is the
+    /// edited file, `VISIONARY_EFF_BASE` the reference.
+    #[test]
+    fn how_two_files_differ() {
+        let (Some(edited), Some(base)) = (
+            std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from),
+            std::env::var_os("VISIONARY_EFF_BASE").map(PathBuf::from),
+        ) else {
+            eprintln!("VISIONARY_EFF_FILE / VISIONARY_EFF_BASE not set — skipping");
+            return;
+        };
+        let load_raw = |path: &PathBuf| {
+            effect_library::NamcoEffectFile::load(&std::fs::read(path).expect("reads"))
+                .expect("parses")
+        };
+        let (a, b) = (load_raw(&edited), load_raw(&base));
+        let (names_a, names_b) = (texture_names(&a), texture_names(&b));
+        let table = crate::eff_attrs::table();
+
+        println!("\n=== effects ===");
+        for entry in &a.entry_names {
+            if !b.entry_names.iter().any(|n| n.eq_ignore_ascii_case(entry)) {
+                println!("  {entry}: only in the edited file");
+                continue;
+            }
+            let (Some(ea), Some(eb)) = (emitters_of(&a, entry), emitters_of(&b, entry)) else {
+                continue;
+            };
+            let mut diffs = Vec::new();
+            if ea.len() != eb.len() {
+                diffs.push(format!("emitter count {} vs {}", ea.len(), eb.len()));
+            }
+            for ((_, x), (_, y)) in ea.iter().zip(eb.iter()) {
+                let who = x.data.display_name();
+                for attr in table.iter() {
+                    let (va, vb) = ((attr.get)(&x.data), (attr.get)(&y.data));
+                    let same = match (va, vb) {
+                        (Some(p), Some(q)) => (p.as_f32() - q.as_f32()).abs() < 1e-5,
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if !same {
+                        diffs.push(format!("{who}.{}: {:?} -> {:?}", attr.id, vb, va));
+                    }
+                }
+                for (slot, sx, sy) in [
+                    (0, &x.data.sampler0, &y.data.sampler0),
+                    (1, &x.data.sampler1, &y.data.sampler1),
+                    (2, &x.data.sampler2, &y.data.sampler2),
+                ] {
+                    let ta = sx.as_ref().and_then(|s| names_a.get(&s.texture_id));
+                    let tb = sy.as_ref().and_then(|s| names_b.get(&s.texture_id));
+                    if ta != tb {
+                        diffs.push(format!("{who}.sampler{slot}: {tb:?} -> {ta:?}"));
+                    }
+                }
+            }
+            if !diffs.is_empty() {
+                println!("  {entry}: {} differences", diffs.len());
+                for d in diffs.iter().take(40) {
+                    println!("      {d}");
+                }
+            }
+        }
+
+        println!("\n=== pool textures ===");
+        let (la, lb) = (load_effect(&edited).expect("loads"), load_effect(&base).expect("loads"));
+        let hash = |loaded: &LoadedEffect, index: usize| -> Option<u64> {
+            let pool = loaded.texture_pool.as_ref()?;
+            let name = &loaded.ptcl.bntx_textures.get(index)?.tex_name;
+            let image = crate::texture_import::decode_rgba(pool, index, name, None).ok()?;
+            let mut h: u64 = 0xcbf29ce484222325;
+            for byte in image.as_raw() {
+                h = (h ^ *byte as u64).wrapping_mul(0x100000001b3);
+            }
+            Some(h)
+        };
+        for (index, tex) in la.ptcl.bntx_textures.iter().enumerate() {
+            match lb.ptcl.bntx_textures.iter().position(|t| t.tex_name == tex.tex_name) {
+                None => println!("  {} only in the edited file", tex.tex_name),
+                Some(other) => {
+                    let o = &lb.ptcl.bntx_textures[other];
+                    if (tex.width, tex.height, &tex.format) != (o.width, o.height, &o.format) {
+                        println!(
+                            "  {}: {}x{} {} -> {}x{} {}",
+                            tex.tex_name, o.width, o.height, o.format, tex.width, tex.height, tex.format
+                        );
+                    } else if hash(&la, index) != hash(&lb, other) {
+                        println!("  {}: pixels changed ({}x{} {})", tex.tex_name, tex.width, tex.height, tex.format);
+                    }
+                }
+            }
+        }
+        let _ = names_b;
+    }
+
+    /// Effect names a file offers, filtered by substring. `VISIONARY_EFF_MATCH` is the needle.
+    ///
+    /// The starting point for "what does the game call the thing I want to replace".
+    #[test]
+    fn what_effects_is_a_file_named_after() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let needle = std::env::var("VISIONARY_EFF_MATCH").unwrap_or_default().to_lowercase();
+        let loaded = load_effect(&path).expect("eff loads");
+        let mut hits = 0usize;
+        println!();
+        for entry in &loaded.entries {
+            if !needle.is_empty() && !entry.name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            let parts = parts_of(entry);
+            let emitters: usize = parts
+                .iter()
+                .filter_map(|part| loaded.ptcl.emitter_sets.get(part.set_idx))
+                .map(|set| set.emitters.len())
+                .sum();
+            println!("  {:<44} parts={} emitters={emitters}", entry.name, parts.len());
+            hits += 1;
+        }
+        println!("  {hits} of {} entries match '{needle}'", loaded.entries.len());
+    }
+
+    /// The pool textures a file offers, by size and format.
+    ///
+    /// Adding a texture of your own means naming an existing one as its template, which
+    /// supplies the format, the swizzle and the required dimensions -- so "which templates
+    /// are 1024x1024" is the first question when bringing in outside art.
+    #[test]
+    fn what_texture_templates_a_file_offers() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let loaded = load_effect(&path).expect("eff loads");
+        let want = std::env::var("VISIONARY_TEX_SIZE").unwrap_or_default();
+        let mut by_shape: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
+        for texture in &loaded.ptcl.bntx_textures {
+            by_shape
+                .entry(format!("{}x{} {}", texture.width, texture.height, texture.format))
+                .or_default()
+                .push(&texture.tex_name);
+        }
+        println!("
+=== {} : {} pool textures ===", path.display(), loaded.ptcl.bntx_textures.len());
+        for (shape, names) in &by_shape {
+            if !want.is_empty() && !shape.starts_with(&want) {
+                continue;
+            }
+            let show = if std::env::var("VISIONARY_TEX_ALL").is_ok() { names.len() } else { 3 };
+            println!("  {shape:<28} {:>4}   {}", names.len(), names.iter().take(show).cloned().collect::<Vec<_>>().join(", "));
+        }
+    }
+
+    /// Does the primitive an emitter names actually resolve to geometry?
+    ///
+    /// An emitter that declares a primitive and cannot find it silently falls back to a flat
+    /// quad, which for a curved ribbon is the difference between an arc and a square.
+    #[test]
+    fn how_many_declared_primitives_resolve() {
+        let Some(root) = root() else {
+            eprintln!("VISIONARY_EFF_ROOT not set — skipping");
+            return;
+        };
+        let path = EffectResolver::common_eff_path(&root);
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(None, Vec::new(), Some(path.clone()));
+        let ids = resolver.descriptor_ids(&path);
+        let loaded = resolver.loaded(&path).expect("ef_common loads");
+        let table = crate::eff_attrs::table();
+        let slot = table.iter().position(|a| a.id == "particle_data.primitive_id");
+
+        let (mut declared, mut resolved) = (0usize, 0usize);
+        let mut missing: Vec<u64> = Vec::new();
+        for set in &loaded.ptcl.emitter_sets {
+            for emitter in &set.emitters {
+                let Some(Some(value)) = slot.and_then(|i| emitter.attrs.get(i)) else { continue };
+                let id = match value {
+                    crate::eff_attrs::AttrValue::UInt(v) => *v,
+                    crate::eff_attrs::AttrValue::Int(v) => *v as u64,
+                    crate::eff_attrs::AttrValue::Float(v) => *v as u64,
+                };
+                if id == 0 || id == u64::MAX {
+                    continue;
+                }
+                declared += 1;
+                if ids.contains(&id) {
+                    resolved += 1;
+                } else if !missing.contains(&id) {
+                    missing.push(id);
+                }
+            }
+        }
+        println!(
+            "
+ef_common: {declared} emitters declare a primitive, {resolved} resolve,              {} distinct ids reach nothing",
+            missing.len()
+        );
+        println!("  descriptor table holds {} ids", ids.len());
+        for id in missing.iter().take(10) {
+            println!("  unresolved: {id}");
+        }
+    }
+
+    /// Every attribute of every emitter of one named effect. The tool for asking "what does
+    /// the game actually say this effect is", rather than inferring it from how it looks.
+    ///
+    /// `VISIONARY_EFF_ROOT` for the dump, `VISIONARY_EFF_NAME` for the effect, and
+    /// `VISIONARY_EFF_GREP` to narrow to attributes whose id contains a substring.
+    #[test]
+    fn every_attribute_of_one_named_effect() {
+        let (Some(root), Some(name)) = (root(), std::env::var("VISIONARY_EFF_NAME").ok()) else {
+            eprintln!("VISIONARY_EFF_ROOT / VISIONARY_EFF_NAME not set — skipping");
+            return;
+        };
+        let needle = std::env::var("VISIONARY_EFF_GREP").unwrap_or_default();
+        let mut resolver = EffectResolver::default();
+        // A specific file when one is named, so this reaches a transplant donor or a mod's
+        // own eff and not just the system library.
+        let fighter = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from);
+        resolver.set_search_path(
+            fighter,
+            Vec::new(),
+            Some(EffectResolver::common_eff_path(&root)),
+        );
+        let resolved = resolver.resolve(&name).expect("effect resolves");
+        let file = resolved.file.clone();
+        let parts = resolved.parts.clone();
+        let loaded = resolver.loaded(&file).expect("file stays loaded");
+        let table = crate::eff_attrs::table();
+
+        for part in &parts {
+            let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
+            for emitter in &set.emitters {
+                println!("
+--- {} / {} ---", name, emitter.name);
+                for (i, attr) in table.iter().enumerate() {
+                    if !needle.is_empty() && !attr.id.contains(&needle) {
+                        continue;
+                    }
+                    let Some(Some(value)) = emitter.attrs.get(i) else { continue };
+                    // Zeros are the overwhelming majority and say nothing; what an emitter
+                    // sets is the signal.
+                    let zero = match value {
+                        crate::eff_attrs::AttrValue::Int(v) => *v == 0,
+                        crate::eff_attrs::AttrValue::UInt(v) => *v == 0,
+                        crate::eff_attrs::AttrValue::Float(v) => *v == 0.0,
+                    };
+                    if zero && needle.is_empty() {
+                        continue;
+                    }
+                    println!("  {:<44} {:?}", attr.id, value);
+                }
+            }
+        }
+    }
+
+    /// What the emitters of a real fighter file actually ask for, as opposed to what the
+    /// renderer assumes. Point `VISIONARY_EFF_FILE` at any `.eff` and run with --nocapture.
+    #[test]
+    fn what_the_emitters_of_one_file_ask_for() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let loaded = load_effect(&path).expect("eff loads");
+        let table = crate::eff_attrs::table();
+        let at = |id: &str| table.iter().position(|a| a.id == id);
+        let (blend, billboard, side, blend_on) = (
+            at("render_state.blend_type"),
+            at("particle_data.billboard_type"),
+            at("render_state.display_side"),
+            at("render_state.is_blend_enable"),
+        );
+        let mut counts: std::collections::BTreeMap<(&str, i64), usize> = Default::default();
+        let mut total = 0usize;
+        for set in &loaded.ptcl.emitter_sets {
+            for emitter in &set.emitters {
+                total += 1;
+                let f = |slot: Option<usize>| -> Option<i64> {
+                    match emitter.attrs.get(slot?).and_then(|a| a.as_ref())? {
+                        crate::eff_attrs::AttrValue::Int(v) => Some(*v),
+                        crate::eff_attrs::AttrValue::UInt(v) => Some(*v as i64),
+                        crate::eff_attrs::AttrValue::Float(v) => Some(*v as i64),
+                    }
+                };
+                for (label, slot) in [
+                    ("blend_type", blend),
+                    ("billboard_type", billboard),
+                    ("display_side", side),
+                    ("is_blend_enable", blend_on),
+                    ("is_rotate_x", at("particle_data.is_rotate_x")),
+                    ("is_rotate_y", at("particle_data.is_rotate_y")),
+                    ("is_rotate_z", at("particle_data.is_rotate_z")),
+                ] {
+                    if let Some(v) = f(slot) {
+                        *counts.entry((label, v)).or_default() += 1;
+                    }
+                }
+            }
+        }
+        println!("
+=== {} : {total} emitters ===", path.display());
+        for ((label, value), n) in counts {
+            println!("  {label:<16} = {value:<4} {n:>5}  ({:.0}%)", 100.0 * n as f32 / total as f32);
+        }
     }
 
     #[test]
@@ -1050,6 +2049,7 @@ mod tests {
             age: 4.0,
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
+            scale: 1.0,
         }];
         let (effects, _) =
             build_particle_batches(
@@ -1126,6 +2126,7 @@ mod tests {
             age: 4.0,
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
+            scale: 1.0,
         }];
         let (none_effects, _) =
             build_particle_batches(
@@ -1858,6 +2859,7 @@ mod tests {
             age: 4.0,
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
+            scale: 1.0,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver,
@@ -1997,6 +2999,7 @@ EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,             
             age: 3.0,
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
+            scale: 1.0,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, QuadPlanes::default(), &bones, &live,
@@ -2211,7 +3214,14 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
                             None => 0.0,
                         }
                     };
-                    let id = f(prim) as u64;
+                    // As u64, NEVER through the f32 reader below: 1811533741 does not survive
+                    // a round trip through f32, and reading it that way reports a resolvable
+                    // primitive as missing.
+                    let id = match prim.and_then(|slot| emitter.attrs.get(slot)).and_then(|v| v.as_ref()) {
+                        Some(crate::eff_attrs::AttrValue::UInt(v)) => *v,
+                        Some(crate::eff_attrs::AttrValue::Int(v)) if *v > 0 => *v as u64,
+                        _ => 0,
+                    };
                     println!(
                         "  '{}' rot=[{:.3}, {:.3}, {:.3}] billboard={} mesh={} tex={:?}",
                         emitter.name,
@@ -2248,6 +3258,7 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
                 tint: [1.0, 1.0, 1.0],
                 alpha: 1.0,
                 age: 2.0,
+                scale: 1.0,
                 offset: glam::Vec3::ZERO,
                 rotation,
             }];
