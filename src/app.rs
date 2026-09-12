@@ -13819,8 +13819,15 @@ If you step every basis for a                          type and NONE of them mat
 
         let has_effect_data =
             !self.state.effect_script.stmts.is_empty() || !self.state.effects.is_empty();
+        // A move whose source was read but has no `effect_` function is still a loaded move, and
+        // adding its first call is the only way to give it one. Gating on the effect list alone
+        // hid the add buttons for exactly those moves — the common case for a modded fighter
+        // whose source only carries `game_` scripts. An unfetched move stays gated: adding there
+        // would export a whole effect function over one the user never saw.
+        let move_loaded =
+            !self.state.acmd_source.is_empty() && self.state.selected_move.is_some();
 
-        if !has_effect_data {
+        if !has_effect_data && !move_loaded {
             ui.colored_label(egui::Color32::GRAY, "Effect data unavailable");
             ui.label(
                 egui::RichText::new("Fetch ACMD to load effect data.")
@@ -13849,7 +13856,9 @@ If you step every basis for a                          type and NONE of them mat
                 .map(|(i, _)| i)
                 .collect();
 
-            if visible.is_empty() {
+            if self.state.effects.is_empty() {
+                ui.colored_label(egui::Color32::GRAY, "This move has no effect calls yet");
+            } else if visible.is_empty() {
                 ui.colored_label(egui::Color32::GRAY, "No effects on this frame");
             } else {
                 egui::ScrollArea::vertical()
