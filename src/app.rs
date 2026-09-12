@@ -13665,20 +13665,29 @@ impl VisionaryApp {
             .map(|call| call.effect_name.clone())
             .filter(|name| !name.is_empty() && name != "null")
             .collect();
+        // Types some quad actually draws with. A type used only by mesh emitters -- every attack
+        // arc -- ignores its mode and offset, and without saying so the controls just look dead.
+        // Coarse by design: the summary counts meshes per effect, not per type, so an effect
+        // mixing both counts all its types as drawing quads.
+        let mut quad_used: Vec<i64> = Vec::new();
         for name in &names {
             if let Ok(summary) = self.effect_resolver.describe(name) {
+                let all_meshes = summary.mesh_emitters >= summary.emitters;
                 for kind in summary.billboard_types {
                     if !used.contains(&kind) {
                         used.push(kind);
                     }
+                    if !all_meshes && !quad_used.contains(&kind) {
+                        quad_used.push(kind);
+                    }
                 }
             }
         }
-        if used.is_empty() {
-            return;
-        }
         used.sort_unstable();
 
+        // Every type is listed, not only the ones this move's effects use: a setting that
+        // appears and disappears with the selected move cannot be compared across moves or set
+        // up before the effect that needs it is on screen. Types in use are marked instead.
         egui::CollapsingHeader::new("Quad orientation")
             .default_open(false)
             .show(ui, |ui| {
@@ -13698,14 +13707,63 @@ If you step every basis for a                          type and NONE of them mat
                     .small()
                     .color(Color32::from_rgb(230, 190, 90)),
                 );
-                for kind in used {
-                    let index = kind.clamp(0, 7) as usize;
+                // How the spawn's own rotation arguments are read. Global rather than per type,
+                // and applied to meshes too: it is a question about the ACMD call, not about a
+                // billboard convention.
+                // Buttons rather than dropdowns: these get flipped back and forth while watching
+                // the viewport, and a row shows every option and the current one at a glance.
+                let planes = &mut self.effect_quad_planes;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Spawn rotation").small().strong()).on_hover_text(
+                        "The order the call's X, Y and Z angles are applied in, each about the \
+                         fixed axes. Only matters when a spawn sets more than one angle. Applies \
+                         to every effect, meshes included.",
+                    );
+                    for (value, label) in crate::eff_runtime::SPAWN_ORDER_NAMES.iter().enumerate() {
+                        ui.selectable_value(
+                            &mut planes.spawn_order,
+                            value,
+                            RichText::new(*label).small().monospace(),
+                        );
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Frame turn").small().strong()).on_hover_text(
+                        "A turn about up between the bone and the frame the spawn's rotation and \
+                         geometry live in. The call's position offset is not turned.",
+                    );
+                    for turns in 0..4u8 {
+                        ui.selectable_value(
+                            &mut planes.spawn_frame_turns,
+                            turns,
+                            RichText::new(format!("{}°", u32::from(turns) * 90)).small().monospace(),
+                        );
+                    }
+                });
+                ui.separator();
+
+                for kind in 0..8i64 {
+                    let index = kind as usize;
+                    let in_use = used.contains(&kind);
                     let names = crate::eff_runtime::QuadPlanes::NAMES;
                     let descriptions = crate::eff_runtime::QuadPlanes::DESCRIPTIONS;
                     let current = (self.effect_quad_planes.planes[index] as usize)
                         .min(names.len() - 1);
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("Type {kind}")).small().strong());
+                        let label = RichText::new(format!("Type {kind}")).small().strong();
+                        if in_use && quad_used.contains(&kind) {
+                            ui.label(label.color(Color32::from_rgb(255, 165, 0)))
+                                .on_hover_text("Used by an effect in this move");
+                        } else if in_use {
+                            ui.label(label.color(Color32::from_rgb(120, 170, 230)))
+                                .on_hover_text(
+                                    "Used in this move only by mesh emitters, which keep their \
+                                     own geometry: this type's mode and X/Y/Z offset do not \
+                                     affect them. Use Spawn rotation / Frame turn above instead.",
+                                );
+                        } else {
+                            ui.label(label.color(Color32::GRAY));
+                        }
                         egui::ComboBox::from_id_salt(("quad_plane", kind))
                             .width(110.0)
                             .selected_text(names[current])

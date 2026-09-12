@@ -534,6 +534,15 @@ pub struct QuadPlanes {
     /// does not model yet, it is measurable by eye and not readable from the file, so it is a
     /// setting until it is understood well enough to be a constant.
     pub offsets: [[f32; 3]; 8],
+    /// Which of [`SPAWN_ORDERS`] a spawn's rotation arguments are applied in.
+    ///
+    /// Unlike `offsets` this is not per billboard type: it is how the ACMD call is read, so it
+    /// applies to every effect, meshes included.
+    pub spawn_order: usize,
+    /// Quarter turns about up between the bone's frame and the frame a spawn's rotation and
+    /// geometry live in. Applies to every effect, meshes included; the call's position offset
+    /// stays in the bone's frame.
+    pub spawn_frame_turns: u8,
 }
 
 impl Default for QuadPlanes {
@@ -561,6 +570,11 @@ impl Default for QuadPlanes {
         Self {
             planes: [0, 1, 1, 1, 1, 1, 1, 1],
             offsets,
+            // Y, Z, X with a quarter frame turn: stepped through live against Dabi's jabs,
+            // the one reading that matched all three. See
+            // `spawn_rotation_defaults_match_dabis_jabs_in_game`.
+            spawn_order: 3,
+            spawn_frame_turns: 1,
         }
     }
 }
@@ -588,6 +602,14 @@ impl QuadPlanes {
         "Long axis follows the particle's travel, spinning about it to face the viewer. \
          Never edge-on. For sparks and streaks, which point where they are going.",
     ];
+
+    /// A spawn's rotation arguments (degrees) as the turn from the bone's frame: the frame
+    /// turn, then the angles in the chosen order.
+    pub fn spawn_turn(&self, degrees: glam::Vec3) -> glam::Quat {
+        glam::Quat::from_rotation_y(
+            f32::from(self.spawn_frame_turns % 4) * std::f32::consts::FRAC_PI_2,
+        ) * spawn_rotation_in(degrees, self.spawn_order)
+    }
 
     pub fn plane_for(&self, billboard_type: i64) -> u32 {
         self.planes[billboard_type.clamp(0, 7) as usize]
@@ -674,6 +696,41 @@ impl QuadPlanes {
             // components directly would miss half the matches.
             .position(|q| q.dot(want).abs() > 0.999)
     }
+}
+
+/// Every order a spawn's three angles can be applied in, each about the FIXED axes, as the
+/// axis indices in application order. [`QuadPlanes::default`] picks index 3 (Y, Z, X); index 5
+/// (Z, Y, X) is glam's intrinsic `XYZ`, which is what the renderer used originally.
+pub const SPAWN_ORDERS: [[usize; 3]; 6] =
+    [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+
+/// [`SPAWN_ORDERS`] as the picker shows them.
+pub const SPAWN_ORDER_NAMES: [&str; 6] = [
+    "X, Y, Z",
+    "X, Z, Y",
+    "Y, X, Z",
+    "Y, Z, X",
+    "Z, X, Y",
+    "Z, Y, X",
+];
+
+/// An ACMD spawn's rotation arguments (degrees), applied in `SPAWN_ORDERS[order]`.
+///
+/// Orders only disagree when more than one angle is set, so single-axis spawns look right under
+/// any of them and cannot tell them apart. Dabi's jabs can: they spawn one flat ring at three
+/// combined rotations. No order alone matched them -- attack13's plane faced the camera under
+/// every one -- until the effect frame was also turned a quarter turn about up from the bone's.
+/// With that turn, Y, Z, X is the order that matched all three; X, Z, Y got two of them and
+/// swung attack11 out of plane. Both stay selectable in case another effect disagrees.
+pub fn spawn_rotation_in(degrees: glam::Vec3, order: usize) -> glam::Quat {
+    let angles = [degrees.x, degrees.y, degrees.z];
+    let axes = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z];
+    SPAWN_ORDERS[order.min(SPAWN_ORDERS.len() - 1)]
+        .iter()
+        .fold(glam::Quat::IDENTITY, |turn, &axis| {
+            // Fixed axes: each later turn is applied on the outside.
+            glam::Quat::from_axis_angle(axes[axis], angles[axis].to_radians()) * turn
+        })
 }
 
 #[derive(Default)]
@@ -812,12 +869,7 @@ pub fn build_particle_batches(
                 // Bone, then the call's aim, then the emitter's own. Order matters: the call
                 // rotates the whole effect in the bone's frame, and the emitter is a further
                 // turn inside that.
-                let call_turn = glam::Quat::from_euler(
-                    glam::EulerRot::XYZ,
-                    call_rotation.x.to_radians(),
-                    call_rotation.y.to_radians(),
-                    call_rotation.z.to_radians(),
-                );
+                let call_turn = planes.spawn_turn(*call_rotation);
                 // Where the effect points, before any convention correction. Bone, then the
                 // call's aim, then the emitter's own -- all three are real data.
                 let placed = bone_rotation * call_turn * emitter_rotation;
@@ -1156,7 +1208,10 @@ mod tests {
             eprintln!("VISIONARY_EFF_ROOT / VISIONARY_EFF_IDS not set — skipping");
             return;
         };
-        let path = EffectResolver::common_eff_path(&root);
+        // Any file when one is named, so this reaches a mod's own eff or a transplant donor.
+        let path = std::env::var_os("VISIONARY_EFF_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| EffectResolver::common_eff_path(&root));
         let mut meshes = crate::eff_mesh::MeshLibrary::default();
         println!();
         for token in ids.split(',') {
@@ -3374,6 +3429,7 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         let mut planes = QuadPlanes {
             planes: [0; 8],
             offsets: [[0.0; 3]; 8],
+            ..QuadPlanes::default()
         };
         assert_eq!(planes.offset_for(5), glam::Quat::IDENTITY);
 
@@ -3394,6 +3450,76 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
             .angle_between(glam::Vec3::X)
             .to_degrees();
         assert!(nudge < 1.5, "one degree of turn moved {nudge} degrees");
+    }
+
+    /// Every order is its three fixed-axis turns composed in sequence, and the old intrinsic
+    /// `XYZ` reading is one of them -- so picking it reproduces the renderer as it was.
+    #[test]
+    fn spawn_orders_are_fixed_axis_compositions() {
+        let degrees = glam::Vec3::new(178.0, 236.0, 90.0);
+        let (x, y, z) = (
+            glam::Quat::from_rotation_x(degrees.x.to_radians()),
+            glam::Quat::from_rotation_y(degrees.y.to_radians()),
+            glam::Quat::from_rotation_z(degrees.z.to_radians()),
+        );
+        let expected = [z * y * x, y * z * x, z * x * y, x * z * y, y * x * z, x * y * z];
+        for (order, want) in expected.iter().enumerate() {
+            let got = spawn_rotation_in(degrees, order);
+            assert!(got.dot(*want).abs() > 0.9999, "order {order}");
+        }
+        let intrinsic = glam::Quat::from_euler(
+            glam::EulerRot::XYZ,
+            degrees.x.to_radians(),
+            degrees.y.to_radians(),
+            degrees.z.to_radians(),
+        );
+        assert!(spawn_rotation_in(degrees, 5).dot(intrinsic).abs() > 0.9999);
+    }
+
+    /// The default spawn reading, matched by eye against Dabi's jabs in game. All three spawn
+    /// the same ring mesh -- flat in its XZ plane, normal on local Y -- on `top`, at
+    ///
+    ///   attack12  (0, 0, -30)     flat, on a `\` tilt
+    ///   attack13  (178, 180, 90)  a half moon top to bottom
+    ///   attack11  (178, 236, 90)  attack13's arc turned within its plane, peaking overhead
+    ///
+    /// In the viewer's side view, screen right is the bone's +Z, up is +Y and toward the camera
+    /// is -X. Each candidate was stepped through live; Y, Z, X with a quarter frame turn is the
+    /// one that matched all three.
+    #[test]
+    fn spawn_rotation_defaults_match_dabis_jabs_in_game() {
+        let planes = QuadPlanes::default();
+        assert_eq!(SPAWN_ORDER_NAMES[planes.spawn_order], "Y, Z, X");
+        assert_eq!(planes.spawn_frame_turns, 1);
+
+        // (right, up, toward camera) for a local axis of the ring.
+        let screen = |planes: &QuadPlanes, deg: [f32; 3], local: glam::Vec3| {
+            let v = planes.spawn_turn(glam::Vec3::from(deg)) * local;
+            glam::Vec3::new(v.z, v.y, -v.x)
+        };
+        let (jab11, jab12, jab13) = ([178.0, 236.0, 90.0], [0.0, 0.0, -30.0], [178.0, 180.0, 90.0]);
+
+        // attack12 tilts left/right, not toward the camera: the `\` needs its normal in the
+        // screen plane.
+        let n12 = screen(&planes, jab12, glam::Vec3::Y);
+        assert!(n12.y > 0.85 && n12.z.abs() < 0.01, "attack12 normal {n12:?}");
+
+        // attack11 shares attack13's plane and is turned 56 degrees within it -- the Y argument.
+        let (n11, n13) = (
+            screen(&planes, jab11, glam::Vec3::Y),
+            screen(&planes, jab13, glam::Vec3::Y),
+        );
+        assert!(n11.dot(n13).abs() > 0.99, "attack11 {n11:?} is off attack13's plane {n13:?}");
+        let roll = screen(&planes, jab11, glam::Vec3::X)
+            .angle_between(screen(&planes, jab13, glam::Vec3::X))
+            .to_degrees();
+        assert!((roll - 56.0).abs() < 1.0, "in-plane turn was {roll}");
+
+        // The near miss, X, Z, Y: attack12 and attack13 come out identical, but the Y argument
+        // lands last as a turn about up, swinging attack11 out of the plane like an open door.
+        let door = QuadPlanes { spawn_order: 1, ..planes };
+        assert!(screen(&door, jab13, glam::Vec3::Y).dot(n13) > 0.99);
+        assert!(screen(&door, jab11, glam::Vec3::Y).dot(n13).abs() < 0.7);
     }
 
     /// The dialled-in orientation defaults. These came from comparing the viewport against the
