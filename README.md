@@ -1,5 +1,7 @@
 # Visionary
-
+---
+A copy of visionary that adds scuffed effects to be viewed in the editor. Its not 1:1 and expect things to not to be 1:1. But this serves as a quicker way of adding effects to moves
+---
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
 ## Components
