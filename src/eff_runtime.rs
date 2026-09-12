@@ -530,7 +530,7 @@ pub struct QuadPlanes {
     ///
     /// Several effects come out a quarter or half turn off in a way the plane alone cannot
     /// express -- MIIGUNNER_ATK_SHOT_S and RIDLEY_SMASH_BOMB both want +90 on Y, and
-    /// SYS_ATTACK_ARC wants +90 on Z. Whether that is a basis difference or a convention this
+    /// SYS_ATTACK_ARC wants X 180, Z -90. Whether that is a basis difference or a convention this
     /// does not model yet, it is measurable by eye and not readable from the file, so it is a
     /// setting until it is understood well enough to be a constant.
     pub offsets: [[f32; 3]; 8],
@@ -549,14 +549,14 @@ impl Default for QuadPlanes {
         // worth separating if a type ever needs different values for the two.
         //
         //   0  camera facing   X 90, Y 90   (particle motion frame)
-        //   3  local XY        Z 90         SYS_ATTACK_ARC
+        //   3  local XY        X 180, Z -90 SYS_ATTACK_ARC
         //   5  local XY        X 90         MIIGUNNER_ATK_SHOT_S, RIDLEY_SMASH_BOMB
         //
         // 1, 4, 6 and 7 are untouched: no effect using them has been checked against the game,
         // and a guessed default is worse than an obvious one because it looks deliberate.
         let mut offsets = [[0.0f32; 3]; 8];
         offsets[0] = [90.0, 90.0, 0.0];
-        offsets[3] = [0.0, 0.0, 90.0];
+        offsets[3] = [180.0, 0.0, -90.0];
         offsets[5] = [90.0, 0.0, 0.0];
         Self {
             planes: [0, 1, 1, 1, 1, 1, 1, 1],
@@ -3410,7 +3410,7 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         // SYS_ATTACK_ARC and MIIGUNNER_ATK_SHOT_S both sit in the effect's local XY plane and
         // differ only in the turn they need.
         assert_eq!(planes.plane_for(3), 1);
-        assert_eq!(planes.offsets[3], [0.0, 0.0, 90.0]);
+        assert_eq!(planes.offsets[3], [180.0, 0.0, -90.0]);
         assert_eq!(planes.plane_for(5), 1);
         assert_eq!(planes.offsets[5], [90.0, 0.0, 0.0]);
 
