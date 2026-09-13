@@ -72,6 +72,17 @@ pub struct EmitterSim {
     /// nowhere else, and inferring a grid from a square texture's proportions returns "one
     /// cell", which draws the whole sheet on every particle.
     pub uv_div: (u32, u32),
+    /// The texture's own animation inside the particle, from `tex_scroll_anim0`: an offset
+    /// and a zoom, each with a per-frame rate.
+    ///
+    /// This is what sweeps an attack arc. SYS_ATTACK_ARC_D scrolls V by 0.27 and zooms it
+    /// 1.4x, both moving every frame, which slides a window across a slash frame so the arc
+    /// is drawn from one end to the other. Without it the frame sits still, whole, and tapers
+    /// at both ends.
+    pub uv_scroll: glam::Vec2,
+    pub uv_scroll_add: glam::Vec2,
+    pub uv_scale: glam::Vec2,
+    pub uv_scale_add: glam::Vec2,
     /// The shape particles are born in: nw::eft's volume enum. 0 point, 1 circle,
     /// 2 circle-same-divide, 3 filled circle, 4 sphere, 5 sphere-same-divide, 7 filled sphere,
     /// 8 cylinder, 9 filled cylinder, 12 line, 13 line-same-divide.
@@ -217,6 +228,10 @@ pub struct Slots {
     velocity_random: Option<usize>,
     scale: [Option<usize>; 3],
     uv_div: [Option<usize>; 2],
+    uv_scroll: [Option<usize>; 2],
+    uv_scroll_add: [Option<usize>; 2],
+    uv_scale: [Option<usize>; 2],
+    uv_scale_add: [Option<usize>; 2],
     volume_type: Option<usize>,
     volume_radius: [Option<usize>; 3],
     sweep_longitude: Option<usize>,
@@ -317,6 +332,22 @@ impl Slots {
             uv_div: [
                 at("emitter_static.tex_scroll_anim0.uv_div_x"),
                 at("emitter_static.tex_scroll_anim0.uv_div_y"),
+            ],
+            uv_scroll: [
+                at("emitter_static.tex_scroll_anim0.scroll_x"),
+                at("emitter_static.tex_scroll_anim0.scroll_y"),
+            ],
+            uv_scroll_add: [
+                at("emitter_static.tex_scroll_anim0.scroll_add_x"),
+                at("emitter_static.tex_scroll_anim0.scroll_add_y"),
+            ],
+            uv_scale: [
+                at("emitter_static.tex_scroll_anim0.scale_x"),
+                at("emitter_static.tex_scroll_anim0.scale_y"),
+            ],
+            uv_scale_add: [
+                at("emitter_static.tex_scroll_anim0.scale_add_x"),
+                at("emitter_static.tex_scroll_anim0.scale_add_y"),
             ],
             volume_type: at("shape_info.volume_type"),
             volume_radius: [
@@ -435,6 +466,29 @@ impl EmitterSim {
                     scale
                 }
             },
+            uv_scroll: glam::Vec2::new(
+                get(slots.uv_scroll[0]).unwrap_or(0.0),
+                get(slots.uv_scroll[1]).unwrap_or(0.0),
+            ),
+            uv_scroll_add: glam::Vec2::new(
+                get(slots.uv_scroll_add[0]).unwrap_or(0.0),
+                get(slots.uv_scroll_add[1]).unwrap_or(0.0),
+            ),
+            uv_scale: {
+                let scale = glam::Vec2::new(
+                    get(slots.uv_scale[0]).unwrap_or(1.0),
+                    get(slots.uv_scale[1]).unwrap_or(1.0),
+                );
+                // A zero zoom is "unset", not "collapse the texture to one texel".
+                glam::Vec2::new(
+                    if scale.x.abs() <= f32::EPSILON { 1.0 } else { scale.x },
+                    if scale.y.abs() <= f32::EPSILON { 1.0 } else { scale.y },
+                )
+            },
+            uv_scale_add: glam::Vec2::new(
+                get(slots.uv_scale_add[0]).unwrap_or(0.0),
+                get(slots.uv_scale_add[1]).unwrap_or(0.0),
+            ),
             uv_div: {
                 let axis = |slot| get(slot).unwrap_or(1.0).round().clamp(1.0, 64.0) as u32;
                 (axis(slots.uv_div[0]), axis(slots.uv_div[1]))
@@ -560,6 +614,8 @@ pub struct SimParticle {
     /// velocity-oriented billboard looks like a spark and not a square. Unused by the plane
     /// modes, which take their axes from the emitter instead.
     pub velocity: glam::Vec3,
+    /// The texture's animation at this age: (scroll u, scroll v, zoom u, zoom v).
+    pub uv_anim: [f32; 4],
 }
 
 /// Sample a keyframe list at a normalised age.
@@ -934,6 +990,12 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             // d/dt of `offset`. Taking the birth velocity instead would point every particle
             // of a falling burst upwards for its whole life.
             velocity: velocity + sim.gravity * age,
+            // Rates are per frame, so the animation at this age is its start plus rate x age.
+            uv_anim: {
+                let scroll = sim.uv_scroll + sim.uv_scroll_add * age;
+                let scale = sim.uv_scale + sim.uv_scale_add * age;
+                [scroll.x, scroll.y, scale.x, scale.y]
+            },
         });
     }
     particles
@@ -946,6 +1008,10 @@ mod tests {
     fn emitter() -> EmitterSim {
         EmitterSim {
             uv_div: (1, 1),
+            uv_scroll: glam::Vec2::ZERO,
+            uv_scroll_add: glam::Vec2::ZERO,
+            uv_scale: glam::Vec2::ONE,
+            uv_scale_add: glam::Vec2::ZERO,
             volume_type: 0,
             volume_radius: glam::Vec3::ZERO,
             sweep_longitude: std::f32::consts::TAU,
@@ -996,6 +1062,31 @@ mod tests {
             rotation: glam::Vec3::ZERO,
             color0: Vec::new(),
             alpha0: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_texture_animation_moves_with_the_particles_age() {
+        // SYS_ATTACK_ARC_D's own values: V scrolls from 0.27 at -0.08 a frame and zooms from
+        // 1.4 at -0.045 a frame. That motion is what sweeps the arc across its slash frame.
+        let mut sim = emitter();
+        sim.uv_scroll = glam::Vec2::new(0.0, 0.27);
+        sim.uv_scroll_add = glam::Vec2::new(0.0, -0.08);
+        sim.uv_scale = glam::Vec2::new(1.0, 1.4);
+        sim.uv_scale_add = glam::Vec2::new(0.0, -0.045);
+        let particles = evaluate(&sim, 5.0, 7);
+        let oldest = particles
+            .iter()
+            .max_by(|a, b| a.uv_anim[1].partial_cmp(&b.uv_anim[1]).unwrap().reverse())
+            .expect("particles");
+        // The oldest particle has moved furthest: its scroll has dropped and its zoom shrunk.
+        assert!(oldest.uv_anim[1] < 0.27, "scroll did not move: {:?}", oldest.uv_anim);
+        assert!(oldest.uv_anim[3] < 1.4, "zoom did not move: {:?}", oldest.uv_anim);
+
+        // An emitter without the animation carries the identity, so nothing it draws shifts.
+        let still = evaluate(&emitter(), 5.0, 7);
+        for particle in &still {
+            assert_eq!(particle.uv_anim, [0.0, 0.0, 1.0, 1.0]);
         }
     }
 

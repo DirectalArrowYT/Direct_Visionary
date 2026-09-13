@@ -5526,6 +5526,7 @@ dependencies = [
  "image",
  "image_dds",
  "motion_list_rs",
+ "naga",
  "prc-rs",
  "proc-macro2",
  "reqwest",

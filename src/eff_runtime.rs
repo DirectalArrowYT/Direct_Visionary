@@ -1008,7 +1008,7 @@ pub fn build_particle_batches(
                             plane: quad_mode,
                             velocity: (orientation * particle.velocity).to_array(),
                             flags: combiner_flags(&sim, key1.is_some()),
-                            _padding: [0.0; 2],
+                            uv_anim: particle.uv_anim,
                         });
                     }
                     continue;
@@ -1067,7 +1067,7 @@ pub fn build_particle_batches(
                         plane: quad_mode,
                         velocity: (orientation * particle.velocity).to_array(),
                         flags: combiner_flags(&sim, key1.is_some()),
-                        _padding: [0.0; 2],
+                        uv_anim: particle.uv_anim,
                     });
                 }
             }

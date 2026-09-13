@@ -15565,7 +15565,7 @@ If you step every basis for a                          type and NONE of them mat
                 );
             }
 
-            let mut row = |ui: &mut Ui, name: &String, file: Option<&String>, picked: &mut Option<String>| {
+            let row = |ui: &mut Ui, name: &String, file: Option<&String>, picked: &mut Option<String>| {
                 let mut label = ui.selectable_label(false, name);
                 if let Some(file) = file {
                     label = label.on_hover_text(file);

@@ -86,3 +86,8 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 1
+
+[dev-dependencies]
+# Compiles the WGSL in tests: wgpu only validates a shader when a pipeline is created, so a
+# broken particle shader would otherwise surface as a crash on opening the preview.
+naga = { version = "29.0.1", features = ["wgsl-in"] }

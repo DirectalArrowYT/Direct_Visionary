@@ -62,7 +62,9 @@ pub struct ParticleInstance {
     /// 2 opaque), bits 2-3 the colour source (0 texture RGB, 1 the emitter's colour alone).
     /// Taken out of the padding, so the instance stride is what it was.
     pub flags: u32,
-    pub _padding: [f32; 2],
+    /// The texture's animation inside this particle: (scroll u, scroll v, zoom u, zoom v).
+    /// Applied in the cell's own space, so a sheet frame scrolls within its frame.
+    pub uv_anim: [f32; 4],
 }
 
 /// How a batch blends with what is already on screen: the emitter's own `blend_type`.
@@ -199,6 +201,7 @@ struct Instance {
     @location(8) plane: u32,
     @location(9) velocity: vec3<f32>,
     @location(10) flags: u32,
+    @location(11) uv_anim: vec4<f32>,
 };
 
 struct VertexOut {
@@ -206,6 +209,9 @@ struct VertexOut {
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
     @location(2) @interpolate(flat) flags: u32,
+    /// The sheet cell this particle samples, carried flat so the fragment can keep an animated
+    /// UV inside it rather than scrolling into the neighbouring frame.
+    @location(3) @interpolate(flat) cell: vec4<f32>,
 };
 
 fn rotate_by(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
@@ -308,16 +314,36 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     // in the orientation model could ever have corrected it. Stepping all 24 basis
     // corrections and finding that none match is the signature of this bug, not of a missing
     // basis.
-    out.uv = (vec2<f32>(corner.x, -corner.y) * 0.5 + 0.5) * instance.uv_rect.zw
-        + instance.uv_rect.xy;
+    out.uv = animate_uv(vec2<f32>(corner.x, -corner.y) * 0.5 + 0.5, instance.uv_anim);
+    out.cell = instance.uv_rect;
     out.color = instance.color;
     out.flags = instance.flags;
     return out;
 }
 
+/// The emitter's UV animation: zoom about the centre, then scroll. A zoom of 1 and a scroll
+/// of 0 is the identity, which is what an emitter without the animation carries.
+fn animate_uv(uv: vec2<f32>, anim: vec4<f32>) -> vec2<f32> {
+    return (uv - vec2<f32>(0.5, 0.5)) * anim.zw + vec2<f32>(0.5, 0.5) + anim.xy;
+}
+
+/// Where an animated UV lands on the texture.
+///
+/// A sheet cell is clamped to its own frame -- scrolling past its edge must not pull in the
+/// next frame of the strip. A whole texture repeats, which is how a scrolling fire or noise
+/// texture keeps moving instead of smearing its edge.
+fn cell_uv_of(uv: vec2<f32>, cell: vec4<f32>) -> vec2<f32> {
+    var inside = clamp(uv, vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0));
+    if (cell.z >= 0.999 && cell.w >= 0.999) {
+        inside = fract(uv);
+    }
+    return inside * cell.zw + cell.xy;
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    let sampled = textureSample(particle_texture, particle_sampler, in.uv);
+    let uv = cell_uv_of(in.uv, in.cell);
+    let sampled = textureSample(particle_texture, particle_sampler, uv);
     // The upload normalised the texture: RGB is its shading, alpha its shape, whichever family
     // it came from. Sampling red as the mask unconditionally rendered every BC3 effect as a
     // solid white quad -- red averages 225 of 255 on ef_cmn_impact05_ani, while the smoke lives
@@ -339,9 +365,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     var texel = sampled;
     if (shader_type == 2u && has_second) {
         let shift = (sampled.rg - vec2<f32>(0.5, 0.5)) * 0.05;
-        texel = textureSample(particle_texture1, particle_sampler, in.uv + shift);
+        texel = textureSample(particle_texture1, particle_sampler, uv + shift);
     } else if (has_second) {
-        let second = textureSample(particle_texture1, particle_sampler, in.uv);
+        let second = textureSample(particle_texture1, particle_sampler, uv);
         if (second_blend == 1u) {
             texel = texel + second;
         } else if (second_blend == 2u) {
@@ -382,7 +408,8 @@ fn vs_mesh(vertex: MeshVertexIn, instance: Instance) -> VertexOut {
     var out: VertexOut;
     out.clip_position = camera.view_projection * vec4<f32>(world, 1.0);
     // The model's own UVs, mapped into the particle's cell of the sheet.
-    out.uv = vertex.uv * instance.uv_rect.zw + instance.uv_rect.xy;
+    out.uv = animate_uv(vertex.uv, instance.uv_anim);
+    out.cell = instance.uv_rect;
     out.color = instance.color;
     out.flags = instance.flags;
     return out;
@@ -511,6 +538,11 @@ impl ParticleRenderer {
                     format: wgpu::VertexFormat::Uint32,
                     offset: 84,
                     shader_location: 10,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 88,
+                    shader_location: 11,
                 },
             ],
         };
@@ -1004,6 +1036,21 @@ mod tests {
     /// wrong colours, which reads as a simulation bug and is nearly impossible to trace back
     /// to a struct offset.
     #[test]
+    fn the_particle_shader_compiles() {
+        // wgpu validates WGSL only when the pipeline is created, which no other test does. A
+        // shader error would otherwise first show up as the preview failing to open.
+        let module = naga::front::wgsl::parse_str(SHADER)
+            .unwrap_or_else(|error| panic!("particle shader does not parse:
+{}", error.emit_to_string(SHADER)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("particle shader does not validate: {error:?}"));
+    }
+
+    #[test]
     fn the_instance_layout_matches_the_shader_attribute_offsets() {
         use std::mem::{align_of, offset_of, size_of};
         assert_eq!(offset_of!(ParticleInstance, position), 0);
@@ -1016,7 +1063,7 @@ mod tests {
         assert_eq!(offset_of!(ParticleInstance, velocity), 72);
         // The padding keeps the stride 16-byte aligned. Dropping it would silently misalign
         // every instance after the first.
-        assert_eq!(size_of::<ParticleInstance>(), 96);
+        assert_eq!(size_of::<ParticleInstance>(), 104);
         assert_eq!(align_of::<ParticleInstance>(), 4);
     }
 
