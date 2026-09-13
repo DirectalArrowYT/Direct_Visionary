@@ -60,6 +60,7 @@ struct EmitterSnapshot {
     color1: Vec<ColorKey>,
     alpha0_keys: Vec<ColorKey>,
     texture_index: Option<u32>,
+    texture_index1: Option<u32>,
 }
 
 impl EmitterSnapshot {
@@ -73,6 +74,7 @@ impl EmitterSnapshot {
             color1: e.color1.clone(),
             alpha0_keys: e.alpha0_keys.clone(),
             texture_index: e.texture_index,
+            texture_index1: e.texture_index1,
         }
     }
 
@@ -83,6 +85,7 @@ impl EmitterSnapshot {
         e.color1 = self.color1.clone();
         e.alpha0_keys = self.alpha0_keys.clone();
         e.texture_index = self.texture_index;
+        e.texture_index1 = self.texture_index1;
     }
 
     /// The emitter this snapshot was taken of, as the file has it.
@@ -101,6 +104,7 @@ impl EmitterSnapshot {
             color1: self.color1.clone(),
             alpha0_keys: self.alpha0_keys.clone(),
             texture_index: self.texture_index,
+            texture_index1: self.texture_index1,
         }
     }
 }
@@ -4078,6 +4082,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            texture_index1: None,
         };
         // A blank emitter is all zeros; give the one value these tests tune a baseline of its
         // own so "put it back to 1.0" is genuinely a return to pristine.
@@ -4450,6 +4455,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            texture_index1: None,
         };
         //  0  A
         //  1    A1
@@ -4481,6 +4487,7 @@ mod tests {
             color1: Vec::new(),
             alpha0_keys: Vec::new(),
             texture_index: None,
+            texture_index1: None,
         };
         // X, A(A1(A1a), A2), B. Nesting A under X must shift A's entire subtree.
         let mut list: Vec<_> = [0u8, 0, 1, 2, 1, 0].iter().map(|d| at(*d)).collect();

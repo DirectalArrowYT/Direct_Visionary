@@ -56,6 +56,10 @@ pub struct EmitterDef {
     /// used to fall back to 0, which showed every textureless emitter as sampling the pool's
     /// first texture and offered a swap that had nothing to swap.
     pub texture_index: Option<u32>,
+    /// The emitter's second texture, where it has one. What it means depends on the combiner's
+    /// shader type: under type 2 this is the art and `texture_index` is the map that displaces
+    /// it; otherwise it is mixed into the first by `texture1_color_blend`.
+    pub texture_index1: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -305,15 +309,16 @@ fn convert_emitter(
     index: usize,
 ) -> EmitterDef {
     let data = &emitter.data;
-    let texture_index = data
-        .sampler0
-        .as_ref()
-        .and_then(|sampler| {
+    let resolve = |sampler: &Option<effect_library::TextureSampler>| {
+        sampler.as_ref().and_then(|sampler| {
             textures
                 .iter()
                 .position(|texture| texture.id == sampler.texture_id)
+                .map(|index| index as u32)
         })
-        .map(|index| index as u32);
+    };
+    let texture_index = resolve(&data.sampler0);
+    let texture_index1 = resolve(&data.sampler1);
 
     EmitterDef {
         name: data.display_name(),
@@ -332,6 +337,7 @@ fn convert_emitter(
         color1: color_keys(data, 1),
         alpha0_keys: alpha_keys(data),
         texture_index,
+        texture_index1,
     }
 }
 

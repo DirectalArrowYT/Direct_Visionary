@@ -2035,6 +2035,94 @@ mod tests {
     /// parses fine and draws nothing); every replaced texture is in the pool; every retexture
     /// reads back -- attributes and the sampler both; and every `keep` entry is unchanged.
     ///
+    /// Where an attribute actually lives in the file: set it, rebuild, and report which bytes
+    /// moved, as an offset from the emitter's data block.
+    ///
+    /// The engine reads emitter fields at fixed offsets from that block -- Smash's own copy
+    /// loop (13.0.1, `FUN_00087530`) pulls 0x778, 0x790, 0x7a8, 0x800, 0x870, 0x964 and more
+    /// into the live emitter -- so naming those offsets is what connects an attribute we edit
+    /// to the value the engine and its shader consume. See tools/effect_runtime_notes.md.
+    ///
+    /// `VISIONARY_EFF_FILE`, `VISIONARY_EFF_NAME`, `VISIONARY_ATTRS` (comma separated).
+    #[test]
+    fn where_each_attribute_lives() {
+        use crate::eff_attrs::AttrValue;
+        let (Ok(path), Ok(entry_name), Ok(ids)) = (
+            std::env::var("VISIONARY_EFF_FILE"),
+            std::env::var("VISIONARY_EFF_NAME"),
+            std::env::var("VISIONARY_ATTRS"),
+        ) else {
+            eprintln!("VISIONARY_EFF_FILE / VISIONARY_EFF_NAME / VISIONARY_ATTRS not set — skipping");
+            return;
+        };
+        let original = std::fs::read(&path).expect("eff reads");
+        let namco = effect_library::NamcoEffectFile::load(&original).expect("eff parses");
+        let at = namco
+            .entry_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&entry_name))
+            .unwrap_or_else(|| panic!("entry {entry_name} is missing"));
+        let set_idx = (namco.entries[at].emitter_set_id as usize) - 1;
+        let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
+        let set = &ptcl.emitter_list.emitter_sets[set_idx];
+        let (mut names, mut datas) = (Vec::new(), Vec::new());
+        super::visit_emitters_ref(&set.emitters, &mut |em| {
+            names.push(em.data.display_name());
+            datas.push(em.data.clone());
+        });
+        println!("\n{entry_name}: emitter {} of set {set_idx} ({})", names[0], set.name);
+
+        // "*" probes the whole attribute table; anything else is a comma-separated list.
+        let all: Vec<String> = crate::eff_attrs::table().iter().map(|a| a.id.to_string()).collect();
+        let wanted: Vec<String> = if ids.trim() == "*" {
+            all
+        } else {
+            ids.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+        };
+        for id in wanted.iter().map(String::as_str) {
+            let index = crate::eff_attrs::index_of(id).unwrap_or_else(|| panic!("no attribute {id}"));
+            let Some(before) = (crate::eff_attrs::table()[index].get)(&datas[0]) else {
+                continue;   // not present on this emitter
+            };
+            // Two probe values, so the union of what moves is the field's whole footprint: one
+            // value can leave bytes untouched (1.0 -> 0.25 only alters a float's top byte), which
+            // would report the field as starting later than it does.
+            let probes = match before {
+                AttrValue::Int(v) => [AttrValue::Int(if v == 3 { 5 } else { 3 }), AttrValue::Int(if v == 1 { 2 } else { 1 })],
+                AttrValue::UInt(v) => [AttrValue::UInt(if v == 3 { 5 } else { 3 }), AttrValue::UInt(if v == 1 { 2 } else { 1 })],
+                AttrValue::Float(v) => [
+                    AttrValue::Float(if (v - 0.25).abs() < 1e-6 { 0.75 } else { 0.25 }),
+                    AttrValue::Float(f32::from_bits(v.to_bits() ^ 0x00ff_ffff)),
+                ],
+            };
+            let after = probes[0];
+            // Serialise the emitter alone, before and after: rebuilding the whole file rewrites
+            // every byte of it, which says nothing about where this field sits.
+            let version = ptcl.vfx_version;
+            let was = datas[0].write(version).expect("emitter serialises");
+            let mut moved = std::collections::BTreeSet::new();
+            for probe in probes {
+                let mut edited = datas[0].clone();
+                (crate::eff_attrs::table()[index].set)(&mut edited, probe);
+                let now = edited.write(version).expect("emitter serialises");
+                if now.len() != was.len() {
+                    moved.insert(usize::MAX);   // length changed: offsets are not comparable
+                    continue;
+                }
+                moved.extend(was.iter().zip(&now).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i));
+            }
+            let changed: Vec<usize> = moved.into_iter().filter(|&i| i != usize::MAX).collect();
+            let span = match (changed.first(), changed.last()) {
+                (Some(&first), Some(&last)) => format!("emitter data +0x{first:x}..=+0x{last:x}"),
+                _ => "nothing changed".to_string(),
+            };
+            println!(
+                "  {id:<44} {before:?} -> {after:?}   {} bytes, {span}",
+                changed.len()
+            );
+        }
+    }
+
     /// `VISIONARY_CARRIER`, `VISIONARY_EFF_ROOT`, `VISIONARY_MHA_DIR`, `VISIONARY_WRITE_OUT`.
     #[test]
     fn stage_carrier_from_manifest() {
@@ -2103,7 +2191,12 @@ mod tests {
             /// Brightness factor for normal-blend emitters -- how a body is inked dark while its
             /// additive glow keeps the hue. 1 leaves them alone.
             normal_value: f32,
+            /// Ceiling on on-screen brightness, colour x the emitter's color_scale: an HDR key
+            /// clips every channel toward white, so a boosted purple reads as white.
+            max_brightness: f32,
             exclude: std::collections::HashMap<String, Vec<String>>,
+            /// When an entry is listed here, only these of its emitters are recoloured.
+            only: std::collections::HashMap<String, Vec<String>>,
         }
         let strings = |v: &serde_json::Value| -> Vec<String> {
             v.as_array()
@@ -2119,7 +2212,12 @@ mod tests {
                     rgb: [0, 1, 2].map(|i| rgb[i].as_f64().expect("recolor: rgb is numeric") as f32),
                     min_sat: r["min_sat"].as_f64().unwrap_or(0.0) as f32,
                     normal_value: r["normal_value"].as_f64().unwrap_or(1.0) as f32,
+                    max_brightness: r["max_brightness"].as_f64().map_or(f32::INFINITY, |v| v as f32),
                     exclude: r["exclude"]
+                        .as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.clone(), strings(v))).collect())
+                        .unwrap_or_default(),
+                    only: r["only"]
                         .as_object()
                         .map(|o| o.iter().map(|(k, v)| (k.clone(), strings(v))).collect())
                         .unwrap_or_default(),
@@ -2199,6 +2297,9 @@ mod tests {
                     if skip.contains(&names[idx]) {
                         continue;
                     }
+                    if r.only.get(entry).is_some_and(|keep| !keep.contains(&names[idx])) {
+                        continue;
+                    }
                     let read = |id: &str| {
                         crate::eff_attrs::index_of(id)
                             .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
@@ -2206,6 +2307,7 @@ mod tests {
                     };
                     // Additive black is invisible, so only a normal-blend emitter can be inked.
                     let value = if read("render_state.blend_type") == Some(0.0) { r.normal_value } else { 1.0 };
+                    let boost = read("emitter_static.color_scale").unwrap_or(1.0).max(1e-6);
                     let mut triplets: Vec<[String; 3]> = vec![
                         ["r", "g", "b"].map(|c| format!("particle_color.color0_{c}")),
                         ["r", "g", "b"].map(|c| format!("particle_color.color1_{c}")),
@@ -2222,7 +2324,11 @@ mod tests {
                         let (Some(x), Some(y), Some(z)) = (read(&ids[0]), read(&ids[1]), read(&ids[2])) else {
                             continue;
                         };
-                        let out = toward_hue([x, y, z], r.rgb, r.min_sat, value);
+                        let mut out = toward_hue([x, y, z], r.rgb, r.min_sat, value);
+                        let peak = out[0].max(out[1]).max(out[2]) * boost;
+                        if peak > r.max_brightness {
+                            out = out.map(|c| c * r.max_brightness / peak);
+                        }
                         for (k, (old, new)) in [x, y, z].into_iter().zip(out).enumerate() {
                             if (old - new).abs() > 1e-4 {
                                 attrs.insert(ids[k].clone(), AttrValue::Float(new));
@@ -2288,6 +2394,54 @@ mod tests {
             }
         }
         println!("tune: {} emitters retimed", tune_edits.len());
+
+        // Inked art keeps its black core in the colour and the silhouette in alpha. A
+        // normal-blend emitter reading alpha from RED cuts the core away and shows only the
+        // light rim, so on the listed textures it reads the texture's own alpha instead.
+        // (Additive emitters keep red: their black would be invisible either way.)
+        let inked: std::collections::HashSet<String> =
+            strings(&manifest["alpha_from_alpha"]["textures"]).into_iter().collect();
+        let texture_name_of: std::collections::HashMap<u64, String> = cloned_ptcl
+            .texture_info
+            .as_ref()
+            .map(|info| info.descriptors.iter().map(|d| (d.id, d.name.clone())).collect())
+            .unwrap_or_default();
+        for (_, _, new) in &moves {
+            let (set_idx, set_name, names) = locate(&cloned, new);
+            let mut flat = Vec::new();
+            super::visit_emitters_ref(&cloned_ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
+                flat.push(em.data.clone())
+            });
+            for (idx, data) in flat.iter().enumerate() {
+                let read = |id: &str| {
+                    crate::eff_attrs::index_of(id)
+                        .and_then(|i| (crate::eff_attrs::table()[i].get)(data))
+                        .map(|v| v.as_f32())
+                };
+                let samples_inked = data
+                    .sampler0
+                    .as_ref()
+                    .and_then(|s| texture_name_of.get(&s.texture_id))
+                    .is_some_and(|name| inked.contains(name));
+                if samples_inked
+                    && read("combiner.tex_alpha0_input_type") == Some(1.0)
+                    && read("render_state.blend_type") == Some(0.0)
+                {
+                    tune_edits.push(AuthoredEdit {
+                        set_name: set_name.clone(),
+                        entry_name: new.clone(),
+                        set_idx,
+                        emitter_name: names[idx].clone(),
+                        emitter_idx: idx,
+                        fields: EmitterFieldEdits {
+                            attrs: [("combiner.tex_alpha0_input_type".to_string(), AttrValue::Int(0))].into(),
+                            ..Default::default()
+                        },
+                    });
+                    println!("alpha from alpha: {new}/{}", names[idx]);
+                }
+            }
+        }
 
         // Phase 2: the art, addressed to where phase 1 put things.
         let mut added: Vec<TextureAddition> = Vec::new();

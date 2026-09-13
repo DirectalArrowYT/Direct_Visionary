@@ -75,6 +75,27 @@ pub struct EmitterSim {
     /// quarters of every emitter in the game, and wrong in the direction that makes smoke and
     /// dust glow like fire.
     pub blend_type: i64,
+    /// Brightness multiplier on the emitter's colour, straight out of the emitter's constant
+    /// buffer (`emitter_static.color_scale`). Values run about 1.0 to 5.0 in the game's own
+    /// effects, so ignoring it draws everything dimmer and flatter than it plays -- and the
+    /// ones that clip to white in game, which is what makes a hit spark read as a flash,
+    /// never clip here at all.
+    pub color_scale: f32,
+    /// Which texture channel carries the particle's shape: 0 the texture's alpha, 1 its red,
+    /// 2 nothing (fully opaque).
+    ///
+    /// Confirmed in game rather than inferred: a decal set to 1 with black art disappeared,
+    /// because its shape lives in alpha and its red is zero everywhere.
+    pub alpha_input: i64,
+    /// Where the particle's colour comes from: 0 the texture's RGB, 1 the emitter's colour
+    /// alone, with the texture contributing only shape.
+    pub color_input: i64,
+    /// How the emitter's textures are meant to be read. 2 is the indirect path, where the
+    /// first texture displaces the lookup into the second rather than being drawn itself --
+    /// every emitter using it in ef_common binds a second texture, and it is how fire is built.
+    pub shader_type: i64,
+    /// How a plain second texture folds into the first: 0 multiply, 1 add, 2 subtract.
+    pub tex1_blend: i64,
     /// The particle's own roll about the quad's normal, and how it changes.
     ///
     /// `init` is where the particle starts, `init_rand` a symmetric spread on that, `add` the
@@ -166,6 +187,11 @@ pub struct Slots {
     num_scale_keys: Option<usize>,
     scale_keys: Vec<[Option<usize>; 4]>,
     billboard_type: Option<usize>,
+    color_scale: Option<usize>,
+    alpha_input: Option<usize>,
+    color_input: Option<usize>,
+    shader_type: Option<usize>,
+    tex1_blend: Option<usize>,
     blend_type: Option<usize>,
     rotate_init: [Option<usize>; 3],
     rotate_init_rand: [Option<usize>; 3],
@@ -240,6 +266,11 @@ impl Slots {
                 })
                 .collect(),
             billboard_type: at("particle_data.billboard_type"),
+            color_scale: at("emitter_static.color_scale"),
+            alpha_input: at("combiner.tex_alpha0_input_type"),
+            color_input: at("combiner.tex_color0_input_type"),
+            shader_type: at("combiner.shader_type"),
+            tex1_blend: at("combiner.texture1_color_blend"),
             blend_type: at("render_state.blend_type"),
             rotate_init: [
                 at("emitter_static.rotate_init_x"),
@@ -314,6 +345,11 @@ impl EmitterSim {
             designated_dir_scale: get(slots.designated_dir_scale).unwrap_or(0.0),
             diffusion: vec3(&slots.diffusion),
             velocity_random: get(slots.velocity_random).unwrap_or(0.0),
+            color_scale: get(slots.color_scale).unwrap_or(1.0).max(0.0),
+            alpha_input: get(slots.alpha_input).unwrap_or(0.0) as i64,
+            color_input: get(slots.color_input).unwrap_or(0.0) as i64,
+            shader_type: get(slots.shader_type).unwrap_or(0.0) as i64,
+            tex1_blend: get(slots.tex1_blend).unwrap_or(0.0) as i64,
             scale: {
                 let scale = vec3(&slots.scale);
                 // An all-zero scale draws nothing. Treated as "unset" rather than "invisible",
@@ -705,7 +741,12 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             // Emitter scale multiplies the particle's own curve, which is how the data is
             // laid out: the curve is the shape of the size over life, the emitter scales it.
             size: (curve.x.max(curve.y) * sim.scale.x.max(sim.scale.y)).max(0.01),
-            color: [color[0], color[1], color[2], alpha * fade],
+            color: [
+                color[0] * sim.color_scale,
+                color[1] * sim.color_scale,
+                color[2] * sim.color_scale,
+                alpha * fade,
+            ],
             rotation: spin.z,
             spin,
             cell,
@@ -723,6 +764,11 @@ mod tests {
 
     fn emitter() -> EmitterSim {
         EmitterSim {
+            color_scale: 1.0,
+            alpha_input: 0,
+            color_input: 0,
+            shader_type: 0,
+            tex1_blend: 0,
             rate: 2.0,
             rate_random: 0.0,
             interval: 0.0,
@@ -758,6 +804,33 @@ mod tests {
             rotation: glam::Vec3::ZERO,
             color0: Vec::new(),
             alpha0: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_emitters_colour_scale_multiplies_its_particles() {
+        // The game multiplies by this on the way to the shader -- it is in the emitter's own
+        // constant buffer -- so a preview that ignores it draws every effect dimmer than it
+        // plays, and never reaches the clipping that makes a hit spark read as a flash.
+        let mut sim = emitter();
+        sim.color_scale = 1.0;
+        let plain = evaluate(&sim, 3.0, 7);
+        sim.color_scale = 2.5;
+        let scaled = evaluate(&sim, 3.0, 7);
+        assert_eq!(plain.len(), scaled.len());
+        assert!(!plain.is_empty(), "no particles to compare");
+        for (a, b) in plain.iter().zip(&scaled) {
+            for channel in 0..3 {
+                assert!(
+                    (b.color[channel] - a.color[channel] * 2.5).abs() < 1e-5,
+                    "channel {channel}: {} is not 2.5x {}",
+                    b.color[channel],
+                    a.color[channel]
+                );
+            }
+            // Alpha is the particle's shape over time, not its brightness: the scale is a
+            // colour multiplier and leaving alpha alone is what keeps a fade a fade.
+            assert_eq!(a.color[3], b.color[3]);
         }
     }
 
@@ -834,11 +907,14 @@ mod tests {
     /// mode, and in the direction that makes smoke and dust glow.
     #[test]
     fn only_the_emitters_that_ask_for_additive_get_it() {
-        assert!(!super::super::eff_runtime::is_additive(0), "0 is normal alpha");
-        assert!(super::super::eff_runtime::is_additive(1), "1 is additive");
-        // Subtractive darkens. With no subtractive pipeline, normal is far closer than
-        // additive, which would light up the very thing meant to dim.
-        assert!(!super::super::eff_runtime::is_additive(2), "2 is subtractive");
+        use crate::eff_render::BlendMode;
+        assert_eq!(BlendMode::from_blend_type(0), BlendMode::Alpha, "0 is normal alpha");
+        assert_eq!(BlendMode::from_blend_type(1), BlendMode::Additive, "1 is additive");
+        // Subtractive darkens what is behind it. It used to fall back to normal alpha, which
+        // was the closer of the two wrong answers; it now has a pipeline of its own.
+        assert_eq!(BlendMode::from_blend_type(2), BlendMode::Subtract, "2 is subtractive");
+        // Anything the format has not defined draws the way the format's zero does.
+        assert_eq!(BlendMode::from_blend_type(7), BlendMode::Alpha, "unknown falls back to alpha");
     }
 
     /// The arc sweeps about Y, and the axis comes from the data.

@@ -812,23 +812,25 @@ pub fn build_particle_batches(
             let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else {
                 continue;
             };
-            for (emitter_index, emitter) in set.emitters.iter().enumerate() {
-                let Some(texture_index) = emitter.texture_index else {
-                    continue;
-                };
-                let index = texture_index as usize;
-                let Some(info) = loaded.ptcl.bntx_textures.get(index) else {
-                    continue;
-                };
+            // Decode one of an emitter's textures if it is not already on the GPU, and say
+            // whether it can be drawn. An emitter can bind two, so this is a closure rather
+            // than the body of the loop it used to be.
+            //
+            // A texture that will not decode must be recorded as such. Without this the decode
+            // is retried every frame the effect is live, which both costs the decode and floods
+            // the console with the same line forever.
+            let want = |index: usize,
+                        pending: &mut Vec<PendingTexture>,
+                        decoded: &mut std::collections::HashSet<TextureKey>,
+                        undecodable: &mut Vec<TextureKey>|
+             -> Option<TextureKey> {
+                let info = loaded.ptcl.bntx_textures.get(index)?;
                 let key = TextureKey {
                     file: file.clone(),
                     index,
                 };
-                // A texture that will not decode must be recorded as such. Without this the
-                // decode is retried every frame the effect is live, which both costs the
-                // decode and floods the console with the same line forever.
                 if failed(&key) {
-                    continue;
+                    return None;
                 }
                 if !uploaded(&key) && decoded.insert(key.clone()) {
                     match crate::texture_import::decode_rgba(&pool, index, &info.tex_name, None) {
@@ -839,10 +841,29 @@ pub fn build_particle_batches(
                         Err(error) => {
                             eprintln!("[eff] texture '{}' not drawable: {error}", info.tex_name);
                             undecodable.push(key.clone());
-                            continue;
+                            return None;
                         }
                     }
                 }
+                Some(key)
+            };
+
+            for (emitter_index, emitter) in set.emitters.iter().enumerate() {
+                let Some(texture_index) = emitter.texture_index else {
+                    continue;
+                };
+                let index = texture_index as usize;
+                let Some(info) = loaded.ptcl.bntx_textures.get(index) else {
+                    continue;
+                };
+                let Some(key) = want(index, &mut pending, &mut decoded, &mut undecodable) else {
+                    continue;
+                };
+                // The emitter's second texture, where it binds one. Undrawable is not fatal
+                // here the way it is for the first: the particle still has its own art.
+                let key1 = emitter.texture_index1.and_then(|second| {
+                    want(second as usize, &mut pending, &mut decoded, &mut undecodable)
+                });
 
                 let sim = crate::eff_sim::EmitterSim::read(emitter, &slots);
                 // The sheet layout needs the texture's real size, which lives with the pool
@@ -941,9 +962,12 @@ pub fn build_particle_batches(
                             pending_meshes.push((mesh_key.clone(), mesh.clone()));
                         }
                     }
-                    let additive = is_additive(sim.blend_type);
+                    let blend = crate::eff_render::BlendMode::from_blend_type(sim.blend_type);
                     let batch_index = match mesh_batches.iter().position(|batch| {
-                        batch.mesh == mesh_key && batch.texture == key && batch.additive == additive
+                        batch.mesh == mesh_key
+                            && batch.texture == key
+                            && batch.texture1 == key1
+                            && batch.blend == blend
                     })
                     {
                         Some(found) => found,
@@ -951,7 +975,8 @@ pub fn build_particle_batches(
                             mesh_batches.push(MeshBatch {
                                 mesh: mesh_key,
                                 texture: key.clone(),
-                                additive: is_additive(sim.blend_type),
+                                texture1: key1.clone(),
+                                blend,
                                 instances: Vec::new(),
                             });
                             mesh_batches.len() - 1
@@ -982,25 +1007,30 @@ pub fn build_particle_batches(
                             orientation: spun.to_array(),
                             plane: quad_mode,
                             velocity: (orientation * particle.velocity).to_array(),
-                            _padding: [0.0; 3],
+                            flags: combiner_flags(&sim, key1.is_some()),
+                            _padding: [0.0; 2],
                         });
                     }
                     continue;
                 }
 
-                let additive = is_additive(sim.blend_type);
+                let blend = crate::eff_render::BlendMode::from_blend_type(sim.blend_type);
                 let batch_index = match batches
                     .iter()
-                    .position(|batch| batch.texture == key && batch.additive == additive)
+                    .position(|batch| {
+                        batch.texture == key && batch.texture1 == key1 && batch.blend == blend
+                    })
                 {
                     Some(found) => found,
                     None => {
                         batches.push(ParticleBatch {
                             texture: key.clone(),
-                            // The emitter's own render state, not an assumption. Forcing this
-                            // additive drew roughly three quarters of the game's emitters in
-                            // the wrong mode -- every smoke and dust puff glowing like fire.
-                            additive,
+                            texture1: key1.clone(),
+                            // The emitter's own render state, not an assumption. Forcing
+                            // this additive drew roughly three quarters of the game's emitters
+                            // in the wrong mode -- every smoke and dust puff glowing like fire
+                            // -- and the subtractive few darken rather than cover.
+                            blend,
                             instances: Vec::new(),
                         });
                         batches.len() - 1
@@ -1036,7 +1066,8 @@ pub fn build_particle_batches(
                         orientation: spun.to_array(),
                         plane: quad_mode,
                         velocity: (orientation * particle.velocity).to_array(),
-                        _padding: [0.0; 3],
+                        flags: combiner_flags(&sim, key1.is_some()),
+                        _padding: [0.0; 2],
                     });
                 }
             }
@@ -1062,6 +1093,20 @@ pub fn build_particle_batches(
 /// than lighting up something meant to darken.
 pub fn is_additive(blend_type: i64) -> bool {
     blend_type == 1
+}
+
+/// The emitter's combiner settings, packed for the shader. See `ParticleInstance::flags`.
+///
+/// Bits 0-1 the alpha source, 2-3 the colour source, 4-5 the shader type, 6-7 how a second
+/// texture folds in, and bit 8 whether there is a second texture to fold. The last one is not
+/// in the data: an emitter can name a texture that failed to decode, and the shader has to
+/// draw something either way.
+pub fn combiner_flags(sim: &crate::eff_sim::EmitterSim, has_second: bool) -> u32 {
+    (sim.alpha_input.clamp(0, 3) as u32)
+        | ((sim.color_input.clamp(0, 3) as u32) << 2)
+        | ((sim.shader_type.clamp(0, 3) as u32) << 4)
+        | ((sim.tex1_blend.clamp(0, 3) as u32) << 6)
+        | ((has_second as u32) << 8)
 }
 
 /// Bone lookup that tolerates the case difference between ACMD and the skeleton.
@@ -1522,6 +1567,52 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The loader resolves an emitter's second texture, and every emitter that asks for the
+    /// indirect shader has one.
+    ///
+    /// Measured over ef_common: 243 of 1348 emitters bind a second texture, and all 112 that
+    /// set shader type 2 do -- that shader reads the first texture as a displacement map and
+    /// the second as the art, so one without a second texture would be drawing its own
+    /// distortion map. `VISIONARY_EFF_FILE`.
+    #[test]
+    fn the_second_texture_is_resolved_where_the_data_has_one() {
+        let Some(path) = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from) else {
+            eprintln!("VISIONARY_EFF_FILE not set — skipping");
+            return;
+        };
+        let loaded = load_effect(&path).expect("eff loads");
+        let shader_type = crate::eff_attrs::index_of("combiner.shader_type").expect("attribute");
+        let (mut emitters, mut with_second, mut indirect, mut indirect_without) = (0, 0, 0, 0);
+        for set in &loaded.ptcl.emitter_sets {
+            for emitter in &set.emitters {
+                emitters += 1;
+                let second = emitter.texture_index1.is_some();
+                with_second += usize::from(second);
+                let kind = emitter
+                    .attrs
+                    .get(shader_type)
+                    .and_then(|v| v.as_ref())
+                    .map(|v| v.as_f32() as i64)
+                    .unwrap_or(0);
+                if kind == 2 {
+                    indirect += 1;
+                    indirect_without += usize::from(!second);
+                }
+            }
+        }
+        println!(
+            "
+{}: {emitters} emitters, {with_second} with a second texture, {indirect} indirect",
+            path.display()
+        );
+        assert!(with_second > 0, "no second texture resolved in {}", path.display());
+        assert_eq!(
+            indirect_without, 0,
+            "{indirect_without} emitters want the indirect shader with nothing to displace into"
+        );
+    }
+
+    #[test]
     /// What every emitter of one effect samples, and how its colour is produced.
     ///
     /// The question behind it: when recolouring every colour field an editor exposes still
@@ -2117,7 +2208,8 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
         batches.extend(effects.mesh_batches.into_iter().map(|mesh| {
             crate::eff_render::ParticleBatch {
                 texture: mesh.texture,
-                additive: mesh.additive,
+                texture1: mesh.texture1,
+                blend: mesh.blend,
                 instances: mesh.instances,
             }
         }));

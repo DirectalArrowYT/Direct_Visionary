@@ -58,13 +58,44 @@ pub struct ParticleInstance {
     /// particle that is not moving, which those modes fall back to camera-facing for rather
     /// than collapsing the quad to nothing.
     pub velocity: [f32; 3],
-    pub _padding: [f32; 3],
+    /// Combiner inputs, packed: bits 0-1 are the alpha source (0 texture alpha, 1 red,
+    /// 2 opaque), bits 2-3 the colour source (0 texture RGB, 1 the emitter's colour alone).
+    /// Taken out of the padding, so the instance stride is what it was.
+    pub flags: u32,
+    pub _padding: [f32; 2],
+}
+
+/// How a batch blends with what is already on screen: the emitter's own `blend_type`.
+///
+/// Across two real fighter files the split is about 73 / 25 / 3. The last 3% is the reason
+/// this is an enum and not a bool: subtractive emitters darken what is behind them, and drawn
+/// as straight alpha they read as ordinary smoke sitting in front of the fighter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlendMode {
+    /// Straight alpha, and the format's default.
+    Alpha,
+    /// Adds light. Black adds nothing, which is why an inked core drawn additively vanishes.
+    Additive,
+    /// Takes light away.
+    Subtract,
+}
+
+impl BlendMode {
+    pub fn from_blend_type(blend_type: i64) -> Self {
+        match blend_type {
+            1 => Self::Additive,
+            2 => Self::Subtract,
+            _ => Self::Alpha,
+        }
+    }
 }
 
 /// A run of particles sharing one texture and one blend mode — the unit of a draw call.
 pub struct ParticleBatch {
     pub texture: TextureKey,
-    pub additive: bool,
+    /// The emitter's second texture, if it binds one.
+    pub texture1: Option<TextureKey>,
+    pub blend: BlendMode,
     pub instances: Vec<ParticleInstance>,
 }
 
@@ -77,7 +108,8 @@ pub struct ParticleBatch {
 pub struct MeshBatch {
     pub mesh: crate::eff_mesh::MeshKey,
     pub texture: TextureKey,
-    pub additive: bool,
+    pub texture1: Option<TextureKey>,
+    pub blend: BlendMode,
     pub instances: Vec<ParticleInstance>,
 }
 
@@ -91,7 +123,10 @@ pub struct TextureKey {
 }
 
 struct UploadedTexture {
+    /// This texture on its own, bound to both slots: an emitter with no second texture still
+    /// has to satisfy a layout that has two.
     bind_group: wgpu::BindGroup,
+    view: wgpu::TextureView,
 }
 
 struct UploadedMesh {
@@ -103,20 +138,24 @@ struct UploadedMesh {
 pub struct ParticleRenderer {
     pipeline_alpha: wgpu::RenderPipeline,
     pipeline_additive: wgpu::RenderPipeline,
+    pipeline_subtract: wgpu::RenderPipeline,
     camera_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     textures: std::collections::HashMap<TextureKey, UploadedTexture>,
+    /// Bind groups for the texture pairs seen this session, built on demand.
+    pairs: std::collections::HashMap<(TextureKey, TextureKey), wgpu::BindGroup>,
     instance_buffer: wgpu::Buffer,
     instance_capacity: usize,
-    /// (offset, count, texture, additive) for each batch queued this frame.
-    draws: Vec<(u32, u32, TextureKey, bool)>,
+    /// (offset, count, texture, second texture, blend) for each batch queued this frame.
+    draws: Vec<(u32, u32, TextureKey, Option<TextureKey>, BlendMode)>,
     pipeline_mesh_alpha: wgpu::RenderPipeline,
     pipeline_mesh_additive: wgpu::RenderPipeline,
+    pipeline_mesh_subtract: wgpu::RenderPipeline,
     meshes: std::collections::HashMap<crate::eff_mesh::MeshKey, UploadedMesh>,
-    /// (offset, count, mesh, texture, additive) for each mesh batch queued this frame.
-    mesh_draws: Vec<(u32, u32, crate::eff_mesh::MeshKey, TextureKey, bool)>,
+    /// (offset, count, mesh, texture, second texture, blend) for each mesh batch this frame.
+    mesh_draws: Vec<(u32, u32, crate::eff_mesh::MeshKey, TextureKey, Option<TextureKey>, BlendMode)>,
 }
 
 /// Camera data the particle shader needs. A separate, smaller uniform than the model
@@ -147,7 +186,8 @@ struct Camera {
 
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var particle_texture: texture_2d<f32>;
-@group(1) @binding(1) var particle_sampler: sampler;
+@group(1) @binding(1) var particle_texture1: texture_2d<f32>;
+@group(1) @binding(2) var particle_sampler: sampler;
 
 struct Instance {
     @location(0) position: vec3<f32>,
@@ -158,12 +198,14 @@ struct Instance {
     @location(7) orientation: vec4<f32>,
     @location(8) plane: u32,
     @location(9) velocity: vec3<f32>,
+    @location(10) flags: u32,
 };
 
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) flags: u32,
 };
 
 fn rotate_by(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
@@ -269,17 +311,59 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: Instance) -> Vert
     out.uv = (vec2<f32>(corner.x, -corner.y) * 0.5 + 0.5) * instance.uv_rect.zw
         + instance.uv_rect.xy;
     out.color = instance.color;
+    out.flags = instance.flags;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let sampled = textureSample(particle_texture, particle_sampler, in.uv);
-    // Uniform because the upload normalised it: RGB is the texture's own shading and alpha is
-    // the particle's shape, whichever family the texture came from. Sampling red as the mask
-    // instead rendered every BC3 effect as a solid white quad -- red averages 225 of 255 on
-    // ef_cmn_impact05_ani, while the smoke lives entirely in alpha.
-    return in.color * sampled;
+    // The upload normalised the texture: RGB is its shading, alpha its shape, whichever family
+    // it came from. Sampling red as the mask unconditionally rendered every BC3 effect as a
+    // solid white quad -- red averages 225 of 255 on ef_cmn_impact05_ani, while the smoke lives
+    // entirely in alpha. So the default stays alpha, and only an emitter that asks for red
+    // gets red: the game's own combiner input, which a decal in Shigaraki's side smash proved
+    // is real -- set to red with black art, it drew nothing at all.
+    let alpha_source = in.flags & 3u;
+    let color_source = (in.flags >> 2u) & 3u;
+    let shader_type = (in.flags >> 4u) & 3u;
+    let second_blend = (in.flags >> 6u) & 3u;
+    let has_second = ((in.flags >> 8u) & 1u) == 1u;
+
+    // Shader type 2 is the indirect path: the first texture is a displacement map and the
+    // second carries the art, so drawing the first is drawing the distortion instead of the
+    // flame. Every emitter using it in ef_common binds a second texture.
+    //
+    // How far it displaces is a guess: the format field for it is not one this parser exposes,
+    // so this is a small offset that reads as heat shimmer rather than a measured value.
+    var texel = sampled;
+    if (shader_type == 2u && has_second) {
+        let shift = (sampled.rg - vec2<f32>(0.5, 0.5)) * 0.05;
+        texel = textureSample(particle_texture1, particle_sampler, in.uv + shift);
+    } else if (has_second) {
+        let second = textureSample(particle_texture1, particle_sampler, in.uv);
+        if (second_blend == 1u) {
+            texel = texel + second;
+        } else if (second_blend == 2u) {
+            texel = texel - second;
+        } else {
+            texel = texel * second;
+        }
+    }
+
+    var shape = texel.a;
+    if (alpha_source == 1u) {
+        shape = texel.r;
+    } else if (alpha_source == 2u) {
+        shape = 1.0;
+    }
+
+    var shading = texel.rgb;
+    if (color_source == 1u) {
+        shading = vec3<f32>(1.0, 1.0, 1.0);
+    }
+
+    return vec4<f32>(in.color.rgb * shading, in.color.a * shape);
 }
 
 struct MeshVertexIn {
@@ -300,6 +384,7 @@ fn vs_mesh(vertex: MeshVertexIn, instance: Instance) -> VertexOut {
     // The model's own UVs, mapped into the particle's cell of the sheet.
     out.uv = vertex.uv * instance.uv_rect.zw + instance.uv_rect.xy;
     out.color = instance.color;
+    out.flags = instance.flags;
     return out;
 }
 "#;
@@ -340,6 +425,16 @@ impl ParticleRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -412,6 +507,11 @@ impl ParticleRenderer {
                     offset: 72,
                     shader_location: 9,
                 },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Uint32,
+                    offset: 84,
+                    shader_location: 10,
+                },
             ],
         };
 
@@ -473,6 +573,18 @@ impl ParticleRenderer {
                     src_factor: wgpu::BlendFactor::SrcAlpha,
                     dst_factor: wgpu::BlendFactor::One,
                     operation: wgpu::BlendOperation::Add,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+        );
+
+        let pipeline_subtract = make_pipeline(
+            "particle subtract",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
                 },
                 alpha: wgpu::BlendComponent::OVER,
             },
@@ -569,19 +681,34 @@ impl ParticleRenderer {
             mapped_at_creation: false,
         });
 
+        let pipeline_mesh_subtract = make_mesh_pipeline(
+            "particle mesh subtract",
+            wgpu::BlendState {
+                color: wgpu::BlendComponent {
+                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                    dst_factor: wgpu::BlendFactor::One,
+                    operation: wgpu::BlendOperation::ReverseSubtract,
+                },
+                alpha: wgpu::BlendComponent::OVER,
+            },
+        );
+
         Self {
             pipeline_alpha,
             pipeline_additive,
+            pipeline_subtract,
             camera_bind_group,
             camera_buffer,
             texture_layout,
             sampler,
             textures: std::collections::HashMap::new(),
+            pairs: std::collections::HashMap::new(),
             instance_buffer,
             instance_capacity,
             draws: Vec::new(),
             pipeline_mesh_alpha,
             pipeline_mesh_additive,
+            pipeline_mesh_subtract,
             meshes: std::collections::HashMap::new(),
             mesh_draws: Vec::new(),
         }
@@ -671,11 +798,48 @@ impl ParticleRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
                 },
             ],
         });
-        self.textures.insert(key, UploadedTexture { bind_group });
+        self.textures.insert(key, UploadedTexture { bind_group, view });
+    }
+
+    /// The bind group for a texture pair, built on first use.
+    ///
+    /// A batch with no second texture uses the first texture's own group, which binds it to
+    /// both slots -- the layout has two either way.
+    fn pair_group(&mut self, device: &wgpu::Device, first: &TextureKey, second: &TextureKey) {
+        let key = (first.clone(), second.clone());
+        if self.pairs.contains_key(&key) {
+            return;
+        }
+        let (Some(a), Some(b)) = (self.textures.get(first), self.textures.get(second)) else {
+            return;
+        };
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("particle texture pair bind group"),
+            layout: &self.texture_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&a.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&b.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+        self.pairs.insert(key, group);
     }
 
     /// Stage this frame's particles. Call once per frame, before `draw`.
@@ -730,11 +894,15 @@ impl ParticleRenderer {
             }
             let offset = packed.len() as u32;
             packed.extend_from_slice(&batch.instances);
+            if let Some(second) = &batch.texture1 {
+                self.pair_group(device, &batch.texture, second);
+            }
             self.draws.push((
                 offset,
                 batch.instances.len() as u32,
                 batch.texture.clone(),
-                batch.additive,
+                batch.texture1.clone(),
+                batch.blend,
             ));
         }
         for batch in mesh_batches {
@@ -746,12 +914,16 @@ impl ParticleRenderer {
             }
             let offset = packed.len() as u32;
             packed.extend_from_slice(&batch.instances);
+            if let Some(second) = &batch.texture1 {
+                self.pair_group(device, &batch.texture, second);
+            }
             self.mesh_draws.push((
                 offset,
                 batch.instances.len() as u32,
                 batch.mesh.clone(),
                 batch.texture.clone(),
-                batch.additive,
+                batch.texture1.clone(),
+                batch.blend,
             ));
         }
         if !packed.is_empty() {
@@ -774,16 +946,20 @@ impl ParticleRenderer {
         }
         render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        for (offset, count, key, additive) in &self.draws {
+        for (offset, count, key, key1, blend) in &self.draws {
             let Some(texture) = self.textures.get(key) else {
                 continue;
             };
-            render_pass.set_pipeline(if *additive {
-                &self.pipeline_additive
-            } else {
-                &self.pipeline_alpha
+            let group = key1
+                .as_ref()
+                .and_then(|second| self.pairs.get(&(key.clone(), second.clone())))
+                .unwrap_or(&texture.bind_group);
+            render_pass.set_pipeline(match blend {
+                BlendMode::Additive => &self.pipeline_additive,
+                BlendMode::Subtract => &self.pipeline_subtract,
+                BlendMode::Alpha => &self.pipeline_alpha,
             });
-            render_pass.set_bind_group(1, &texture.bind_group, &[]);
+            render_pass.set_bind_group(1, group, &[]);
             render_pass.draw(0..4, *offset..(*offset + *count));
         }
     }
@@ -793,19 +969,23 @@ impl ParticleRenderer {
             return;
         }
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        for (offset, count, mesh_key, texture_key, additive) in &self.mesh_draws {
+        for (offset, count, mesh_key, texture_key, texture_key1, blend) in &self.mesh_draws {
             let (Some(mesh), Some(texture)) = (
                 self.meshes.get(mesh_key),
                 self.textures.get(texture_key),
             ) else {
                 continue;
             };
-            render_pass.set_pipeline(if *additive {
-                &self.pipeline_mesh_additive
-            } else {
-                &self.pipeline_mesh_alpha
+            let group = texture_key1
+                .as_ref()
+                .and_then(|second| self.pairs.get(&(texture_key.clone(), second.clone())))
+                .unwrap_or(&texture.bind_group);
+            render_pass.set_pipeline(match blend {
+                BlendMode::Additive => &self.pipeline_mesh_additive,
+                BlendMode::Subtract => &self.pipeline_mesh_subtract,
+                BlendMode::Alpha => &self.pipeline_mesh_alpha,
             });
-            render_pass.set_bind_group(1, &texture.bind_group, &[]);
+            render_pass.set_bind_group(1, group, &[]);
             render_pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
             render_pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint16);
