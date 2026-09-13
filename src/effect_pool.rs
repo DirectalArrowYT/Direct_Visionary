@@ -16,6 +16,10 @@ struct PoolFile {
 
 pub struct EffectPool {
     root: PathBuf,
+    /// Mod folders to scan beside the root. A mod keeps its own effect files -- a transplant
+    /// carrier is one -- and those are exactly the effects a moveset spawns by name, so a pool
+    /// without them cannot answer "what can this fighter use".
+    extra_roots: Vec<PathBuf>,
     /// rel path (forward slashes) → cached entry list.
     cache: HashMap<String, PoolFile>,
     /// Files still awaiting a scan this session.
@@ -56,12 +60,18 @@ fn file_stamp(path: &Path) -> (u64, u64) {
 
 impl EffectPool {
     pub fn new(root: PathBuf) -> Self {
+        Self::with_mod_roots(root, Vec::new())
+    }
+
+    /// The pool, plus the mod folders whose effect files should be indexed with it.
+    pub fn with_mod_roots(root: PathBuf, extra_roots: Vec<PathBuf>) -> Self {
         let cache = std::fs::read_to_string(cache_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         Self {
             root,
+            extra_roots,
             cache,
             queue: Vec::new(),
             queued: false,
@@ -75,10 +85,19 @@ impl EffectPool {
     }
 
     fn rel_of(&self, path: &Path) -> String {
-        path.strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/")
+        if let Ok(under) = path.strip_prefix(&self.root) {
+            return under.to_string_lossy().replace('\\', "/");
+        }
+        for extra in &self.extra_roots {
+            if let Ok(under) = path.strip_prefix(extra) {
+                let label = extra
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "mod".to_string());
+                return format!("{label}/{}", under.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        path.to_string_lossy().replace('\\', "/")
     }
 
     /// Queue every .eff under the root exactly once per session; cached-and-unchanged
@@ -92,6 +111,9 @@ impl EffectPool {
         walk_effs(&self.root.join("effect"), &mut files);
         if files.is_empty() {
             walk_effs(&self.root, &mut files);
+        }
+        for extra in self.extra_roots.clone() {
+            walk_effs(&extra, &mut files);
         }
         self.total = files.len();
         for f in files {
@@ -271,6 +293,40 @@ fn entry_names_deduped(idx: &crate::effects::EffIndex) -> Vec<String> {
 }
 
 /// Return the normalized parent directory used as a source-group identity.
+/// Where an effect comes from, as the move picker groups them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectOrigin {
+    /// This fighter's own: its effect file, or a carrier a mod added under its directory.
+    Fighter,
+    /// Shared across every fighter.
+    System,
+    /// Some other fighter's, or a file that belongs to nothing in particular.
+    Elsewhere,
+}
+
+/// Which bucket an effect belongs in for `fighter`.
+///
+/// The file decides it, not the name: a transplanted effect is named for the character it was
+/// drawn for rather than the fighter it rides on -- Dabi's `dabi_*` live in a carrier under
+/// `fighter/snake/`, and nothing about either string mentions the other. The name is a
+/// fallback for the ordinary case where an effect is named after its fighter.
+pub fn origin_of(rel: &str, name: &str, fighter: Option<&str>) -> EffectOrigin {
+    let rel = rel.to_lowercase();
+    let name = name.to_lowercase();
+    if let Some(fighter) = fighter.map(str::to_lowercase).filter(|f| !f.is_empty()) {
+        if rel.contains(&format!("/fighter/{fighter}/"))
+            || rel.starts_with(&format!("fighter/{fighter}/"))
+            || name.starts_with(&format!("{fighter}_"))
+        {
+            return EffectOrigin::Fighter;
+        }
+    }
+    if rel.contains("effect/system/") || name.starts_with("sys_") {
+        return EffectOrigin::System;
+    }
+    EffectOrigin::Elsewhere
+}
+
 pub(crate) fn source_dir_of_rel(rel: &str) -> String {
     let normalized = rel.replace('\\', "/");
     normalized
@@ -322,6 +378,7 @@ mod tests {
             .collect();
         EffectPool {
             root: PathBuf::from("root"),
+            extra_roots: Vec::new(),
             cache,
             queue: Vec::new(),
             queued: true,
@@ -388,5 +445,65 @@ mod tests {
             "effect/fighter/pickel"
         );
         assert_eq!(source_dir_of_rel("ef_common.eff"), "ef_common.eff");
+    }
+}
+
+#[cfg(test)]
+mod picker_tests {
+    use super::{origin_of, EffectOrigin};
+
+    /// A mod's transplanted effects belong to the fighter that carries them.
+    ///
+    /// This is the case the old picker could not express at all: Dabi's effects are named
+    /// `dabi_*` and ride on snake, so neither the fighter's name nor the effect's mentions the
+    /// other. The file path is what connects them.
+    #[test]
+    fn a_transplanted_effect_belongs_to_the_fighter_that_carries_it() {
+        assert_eq!(
+            origin_of(
+                "Dabi (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
+                "dabi_attack_dash",
+                Some("snake"),
+            ),
+            EffectOrigin::Fighter
+        );
+        // And not to whoever the carrier was borrowed from.
+        assert_eq!(
+            origin_of(
+                "Dabi (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
+                "dabi_attack_dash",
+                Some("pikachu"),
+            ),
+            EffectOrigin::Elsewhere
+        );
+    }
+
+    #[test]
+    fn an_effect_named_after_its_fighter_counts_even_from_elsewhere() {
+        assert_eq!(
+            origin_of("effect/fighter/eflame/ef_eflame.eff", "eflame_sword", Some("eflame")),
+            EffectOrigin::Fighter
+        );
+        assert_eq!(
+            origin_of("somewhere/odd.eff", "snake_smoke", Some("snake")),
+            EffectOrigin::Fighter
+        );
+    }
+
+    #[test]
+    fn system_effects_are_everyones_and_other_fighters_are_nobodys() {
+        assert_eq!(
+            origin_of("effect/system/common/ef_common.eff", "sys_hit_normal", Some("snake")),
+            EffectOrigin::System
+        );
+        assert_eq!(
+            origin_of("effect/fighter/mario/ef_mario.eff", "mario_fire", Some("snake")),
+            EffectOrigin::Elsewhere
+        );
+        // With no fighter selected, its own effects are simply somebody's.
+        assert_eq!(
+            origin_of("effect/fighter/mario/ef_mario.eff", "mario_fire", None),
+            EffectOrigin::Elsewhere
+        );
     }
 }

@@ -15461,15 +15461,27 @@ If you step every basis for a                          type and NONE of them mat
 
     /// Searchable effect picker: live in-game kinds first, then a scan of every eff in the
     /// pool. Returns the chosen effect name (to assign to the selected spawn) when clicked.
+    /// Effect picker for a spawn: a browsable list rather than a search box.
+    ///
+    /// Grouped by where an effect comes from, with this fighter's own first and open — a
+    /// moveset mostly spawns its own effects and the system ones, and a mod's transplanted
+    /// effects (Dabi's `dabi_*`, in a carrier under his fighter directory) are its own too.
+    /// Searching filters the list; it is not the only way to find anything.
+    ///
+    /// Returns the chosen effect name, to assign to the selected spawn.
     fn draw_effect_name_picker(&mut self, ui: &mut Ui) -> Option<String> {
-        // Ensure the donor pool is available for the full-eff search.
+        // Ensure the donor pool is available for the full-eff search, including the mod
+        // folders: a transplanted effect lives in the mod, not under the game's own root.
         if self.effect_pool.is_none() {
             if let Some(root) = self
                 .export_dir
                 .clone()
                 .or_else(|| self.state.data_root.clone())
             {
-                self.effect_pool = Some(crate::effect_pool::EffectPool::new(root));
+                self.effect_pool = Some(crate::effect_pool::EffectPool::with_mod_roots(
+                    root,
+                    self.extra_roots.clone(),
+                ));
             }
         }
         let scanning = self
@@ -15478,13 +15490,57 @@ If you step every basis for a                          type and NONE of them mat
             .map(|p| p.tick(6))
             .unwrap_or(false);
 
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|f| f.name.to_lowercase());
+        let query = self.effect_pick_search.to_lowercase();
+
+        // Live in-game kinds matching the query (deduped), so anything the running game has
+        // actually spawned stays at the top.
+        let mut live: Vec<String> = self
+            .game_link
+            .kinds()
+            .into_iter()
+            .map(|(_, k)| k.name)
+            .filter(|n| query.is_empty() || n.to_lowercase().contains(&query))
+            .collect();
+        live.sort();
+        live.dedup();
+
+        // (name, file) per bucket. The file is kept for the hover text: two effects can share
+        // a name across files, and knowing which one a spawn will reach matters.
+        let mut mine: Vec<(String, String)> = Vec::new();
+        let mut system: Vec<(String, String)> = Vec::new();
+        let mut elsewhere: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        if let Some(pool) = self.effect_pool.as_ref() {
+            for group in pool.search_grouped(&self.effect_pick_search) {
+                let mut rest: Vec<(String, String)> = Vec::new();
+                for (rel, name) in group.entries {
+                    match crate::effect_pool::origin_of(&rel, &name, fighter.as_deref()) {
+                        crate::effect_pool::EffectOrigin::Fighter => mine.push((name, rel)),
+                        crate::effect_pool::EffectOrigin::System => system.push((name, rel)),
+                        crate::effect_pool::EffectOrigin::Elsewhere => rest.push((name, rel)),
+                    }
+                }
+                if !rest.is_empty() {
+                    elsewhere.push((group.source_dir, rest));
+                }
+            }
+        }
+        for bucket in [&mut mine, &mut system] {
+            bucket.sort();
+            bucket.dedup();
+        }
+
         let mut picked: Option<String> = None;
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.horizontal(|ui| {
                 editor_subsection_heading(
                     ui,
                     "Choose visual effect",
-                    "Search effect names observed in the running game or discovered in available .eff resource files, then assign one to the selected spawn.",
+                    "Effects this fighter can spawn — its own, the system ones, and anything a mod adds for it — plus every other .eff in the pool. Type to filter.",
                 );
                 if ui.small_button("✕").on_hover_text("Close picker").clicked() {
                     self.effect_pick_open = false;
@@ -15492,73 +15548,102 @@ If you step every basis for a                          type and NONE of them mat
             });
             ui.add(
                 egui::TextEdit::singleline(&mut self.effect_pick_search)
-                    .hint_text("search effect names")
+                    .hint_text("filter by name")
                     .desired_width(220.0),
             );
-            let q = self.effect_pick_search.to_lowercase();
 
-            // Live in-game kinds matching the query (deduped), most-recently-updated first.
-            let mut live: Vec<String> = self
-                .game_link
-                .kinds()
-                .into_iter()
-                .map(|(_, k)| k.name)
-                .filter(|n| q.is_empty() || n.to_lowercase().contains(&q))
-                .collect();
-            live.sort();
-            live.dedup();
-
-            let pool_hits: Vec<String> = self
+            let (done, total) = self
                 .effect_pool
                 .as_ref()
-                .map(|p| {
-                    p.search(&self.effect_pick_search, 60)
-                        .into_iter()
-                        .map(|(_, name)| name)
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            egui::ScrollArea::vertical()
-                .max_height(180.0)
-                .show(ui, |ui| {
-                    if !live.is_empty() {
-                        ui.label(
-                            egui::RichText::new("Observed live")
-                                .small()
-                                .color(egui::Color32::from_rgb(120, 200, 120)),
-                        )
-                        .on_hover_text(
-                            "Effect names reported by the connected game during this session.",
-                        );
-                        for name in &live {
-                            if ui.selectable_label(false, name).clicked() {
-                                picked = Some(name.clone());
-                            }
-                        }
-                        ui.separator();
-                    }
-                    let (done, total) = self
-                        .effect_pool
-                        .as_ref()
-                        .map(|p| p.progress())
-                        .unwrap_or((0, 0));
-                    ui.label(
-                        egui::RichText::new(if scanning {
-                            format!("Effect files (scanning {done}/{total})")
-                        } else {
-                            "Effect files".into()
-                        })
+                .map(|p| p.progress())
+                .unwrap_or((0, 0));
+            if scanning {
+                ui.label(
+                    egui::RichText::new(format!("scanning effect files {done}/{total}"))
                         .small()
                         .color(egui::Color32::GRAY),
-                    )
-                    .on_hover_text(
-                        "Effect names discovered by scanning the available .eff resource files.",
-                    );
-                    for name in pool_hits.iter().filter(|n| !live.contains(n)) {
-                        if ui.selectable_label(false, name).clicked() {
-                            picked = Some(name.clone());
-                        }
+                );
+            }
+
+            let mut row = |ui: &mut Ui, name: &String, file: Option<&String>, picked: &mut Option<String>| {
+                let mut label = ui.selectable_label(false, name);
+                if let Some(file) = file {
+                    label = label.on_hover_text(file);
+                }
+                if label.clicked() {
+                    *picked = Some(name.clone());
+                }
+            };
+
+            egui::ScrollArea::vertical()
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    if !live.is_empty() {
+                        egui::CollapsingHeader::new(format!("Observed live ({})", live.len()))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for name in &live {
+                                    row(ui, name, None, &mut picked);
+                                }
+                            })
+                            .header_response
+                            .on_hover_text(
+                                "Effect names reported by the connected game during this session.",
+                            );
+                    }
+
+                    let title = fighter
+                        .as_deref()
+                        .map(|f| format!("{f} ({})", mine.len()))
+                        .unwrap_or_else(|| format!("This fighter ({})", mine.len()));
+                    if !mine.is_empty() {
+                        egui::CollapsingHeader::new(title)
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for (name, file) in &mine {
+                                    row(ui, name, Some(file), &mut picked);
+                                }
+                            })
+                            .header_response
+                            .on_hover_text(
+                                "This fighter's own effects, including any a mod transplants for it.",
+                            );
+                    }
+
+                    if !system.is_empty() {
+                        egui::CollapsingHeader::new(format!("System ({})", system.len()))
+                            .default_open(mine.is_empty())
+                            .show(ui, |ui| {
+                                for (name, file) in &system {
+                                    row(ui, name, Some(file), &mut picked);
+                                }
+                            })
+                            .header_response
+                            .on_hover_text("Shared effects every fighter can spawn.");
+                    }
+
+                    for (source, entries) in &elsewhere {
+                        egui::CollapsingHeader::new(format!("{source} ({})", entries.len()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for (name, file) in entries {
+                                    row(ui, name, Some(file), &mut picked);
+                                }
+                            });
+                    }
+
+                    if live.is_empty() && mine.is_empty() && system.is_empty() && elsewhere.is_empty() {
+                        ui.label(
+                            egui::RichText::new(if scanning {
+                                "scanning…"
+                            } else if query.is_empty() {
+                                "No effect files found. Set the data root, or extract effect/ from data.arc."
+                            } else {
+                                "Nothing matches that filter."
+                            })
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
                     }
                 });
         });

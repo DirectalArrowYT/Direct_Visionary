@@ -870,7 +870,7 @@ pub fn build_particle_batches(
                 // rather than with the emitter — so the grid is worked out here, where both
                 // are in hand, and the simulation only says which cell.
                 let (columns, rows) =
-                    crate::eff_sim::sheet_grid(info.width, info.height, sim.pattern_cells);
+                    crate::eff_sim::sheet_grid(info.width, info.height, sim.pattern_cells, sim.uv_div);
                 let mut sim = sim;
                 sim.sheet_cells = columns * rows;
                 let sim = sim;

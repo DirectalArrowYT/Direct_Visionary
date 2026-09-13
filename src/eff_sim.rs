@@ -66,6 +66,12 @@ pub struct EmitterSim {
     /// from `scale` above which is the emitter's — reading the emitter's as the particle's
     /// gives every particle in the game the same size, because emitters are nearly all 1.0.
     pub scale_keys: Vec<(f32, glam::Vec3)>,
+    /// How the emitter says its texture is cut into cells, if it says at all.
+    ///
+    /// This is the authority when it is set: an explosion's 4x4 sheet is declared here and
+    /// nowhere else, and inferring a grid from a square texture's proportions returns "one
+    /// cell", which draws the whole sheet on every particle.
+    pub uv_div: (u32, u32),
     /// The shape particles are born in: nw::eft's volume enum. 0 point, 1 circle,
     /// 2 circle-same-divide, 3 filled circle, 4 sphere, 5 sphere-same-divide, 7 filled sphere,
     /// 8 cylinder, 9 filled cylinder, 12 line, 13 line-same-divide.
@@ -210,6 +216,7 @@ pub struct Slots {
     diffusion: [Option<usize>; 3],
     velocity_random: Option<usize>,
     scale: [Option<usize>; 3],
+    uv_div: [Option<usize>; 2],
     volume_type: Option<usize>,
     volume_radius: [Option<usize>; 3],
     sweep_longitude: Option<usize>,
@@ -307,6 +314,10 @@ impl Slots {
                     ]
                 })
                 .collect(),
+            uv_div: [
+                at("emitter_static.tex_scroll_anim0.uv_div_x"),
+                at("emitter_static.tex_scroll_anim0.uv_div_y"),
+            ],
             volume_type: at("shape_info.volume_type"),
             volume_radius: [
                 at("shape_info.volume_radius_x"),
@@ -423,6 +434,10 @@ impl EmitterSim {
                 } else {
                     scale
                 }
+            },
+            uv_div: {
+                let axis = |slot| get(slot).unwrap_or(1.0).round().clamp(1.0, 64.0) as u32;
+                (axis(slots.uv_div[0]), axis(slots.uv_div[1]))
             },
             volume_type: get(slots.volume_type).unwrap_or(0.0) as i64,
             volume_radius: vec3(&slots.volume_radius),
@@ -622,9 +637,14 @@ fn sample_scale(keys: &[(f32, glam::Vec3)], age: f32, life: f32) -> glam::Vec3 {
 ///
 /// A grid can hold more cells than the animation uses (12 frames in a 4×4 sheet is common), so
 /// the fit is `columns * rows >= cells`, not equality.
-pub fn sheet_grid(width: u32, height: u32, cells: u32) -> (u32, u32) {
+pub fn sheet_grid(width: u32, height: u32, cells: u32, declared: (u32, u32)) -> (u32, u32) {
     if width == 0 || height == 0 {
         return (1, 1);
+    }
+    // What the emitter says, where it says anything. Only a grid of one in both axes means
+    // "not declared" -- every emitter carries this field, most of them at 1x1.
+    if declared.0 > 1 || declared.1 > 1 {
+        return (declared.0.max(1), declared.1.max(1));
     }
     if cells <= 1 {
         // No declared cell count. Most emitters that animate a sheet still leave `num` at 0 --
@@ -700,8 +720,10 @@ const MAX_PER_EMITTER: usize = 256;
 /// The engine's own spawn returns a direction beside the position -- which is why the outward
 /// velocity here follows the offset rather than pointing somewhere random.
 fn volume_offset(sim: &EmitterSim, id: u64, seed: u64) -> glam::Vec3 {
-    // 0..1 from the same hash the rest of the simulation uses.
-    let unit = |salt: u64| (hashed_signed(seed, id ^ salt) + 1.0) * 0.5;
+    // 0..1 from the same hash the rest of the simulation uses. The salts start past the cell
+    // picker's 0x71: sharing one would tie a particle's place in the shape to which frame of
+    // the sheet it shows.
+    let unit = |salt: u64| hashed(seed, id ^ salt);
     let radius = sim.volume_radius;
 
     // The "same divide" shapes space particles evenly around the sweep. The count is the
@@ -711,7 +733,7 @@ fn volume_offset(sim: &EmitterSim, id: u64, seed: u64) -> glam::Vec3 {
     let even = (id % divide as u64) as f32 / divide;
     let fraction = match sim.volume_type {
         2 | 5 | 13 => even,
-        _ => unit(0x71),
+        _ => unit(0x81),
     };
     let angle = sim.sweep_start + fraction * sim.sweep_longitude;
     // A filled shape reaches from its caliber to its edge. sqrt keeps a disc evenly covered
@@ -726,12 +748,12 @@ fn volume_offset(sim: &EmitterSim, id: u64, seed: u64) -> glam::Vec3 {
         0 => glam::Vec3::ZERO,
         1 | 2 => glam::Vec3::new(angle.cos() * radius.x, 0.0, angle.sin() * radius.z),
         3 => {
-            let reach = filled(0x72);
+            let reach = filled(0x82);
             glam::Vec3::new(angle.cos() * radius.x * reach, 0.0, angle.sin() * radius.z * reach)
         }
         4 | 5 | 6 | 7 => {
-            let polar = unit(0x73) * sim.sweep_latitude;
-            let reach = if sim.volume_type == 7 { filled(0x74) } else { 1.0 };
+            let polar = unit(0x83) * sim.sweep_latitude;
+            let reach = if sim.volume_type == 7 { filled(0x84) } else { 1.0 };
             glam::Vec3::new(
                 polar.sin() * angle.cos() * radius.x * reach,
                 polar.cos() * radius.y * reach,
@@ -739,10 +761,10 @@ fn volume_offset(sim: &EmitterSim, id: u64, seed: u64) -> glam::Vec3 {
             )
         }
         8 | 9 => {
-            let reach = if sim.volume_type == 9 { filled(0x75) } else { 1.0 };
+            let reach = if sim.volume_type == 9 { filled(0x85) } else { 1.0 };
             glam::Vec3::new(
                 angle.cos() * radius.x * reach,
-                hashed_signed(seed, id ^ 0x76) * radius.y,
+                hashed_signed(seed, id ^ 0x86) * radius.y,
                 angle.sin() * radius.z * reach,
             )
         }
@@ -923,6 +945,7 @@ mod tests {
 
     fn emitter() -> EmitterSim {
         EmitterSim {
+            uv_div: (1, 1),
             volume_type: 0,
             volume_radius: glam::Vec3::ZERO,
             sweep_longitude: std::f32::consts::TAU,
@@ -974,6 +997,19 @@ mod tests {
             color0: Vec::new(),
             alpha0: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_declared_sheet_grid_beats_the_inferred_one() {
+        // An explosion's sheet is square and its grid is declared, not implied: inferring from
+        // proportions returns one cell, which draws the whole sheet on every particle.
+        assert_eq!(sheet_grid(512, 512, 0, (4, 4)), (4, 4));
+        // A declaration wins even where inference would have produced something plausible.
+        assert_eq!(sheet_grid(256, 128, 0, (4, 4)), (4, 4));
+        assert_eq!(sheet_grid(640, 128, 5, (5, 1)), (5, 1));
+        // 1x1 is what nearly every emitter carries and means "nothing declared", so the
+        // strips still get their proportions read.
+        assert_eq!(sheet_grid(256, 128, 0, (1, 1)), (2, 1));
     }
 
     #[test]
@@ -1366,7 +1402,7 @@ mod tests {
             (128, 128, 5, (4, 4)),    // ef_cmn_wind00
             (256, 256, 6, (4, 4)),    // ef_cmn_impact05_ani
         ] {
-            let grid = sheet_grid(width, height, cells);
+            let grid = sheet_grid(width, height, cells, (1, 1));
             assert_eq!(
                 grid, expected,
                 "{width}x{height} with {cells} cells gave {grid:?}"
@@ -1394,23 +1430,23 @@ mod tests {
     #[test]
     fn an_undeclared_sheet_is_divided_by_the_textures_own_proportions() {
         // ef_cmn_smoke01 / smoke03: two square frames side by side.
-        assert_eq!(sheet_grid(256, 128, 0), (2, 1));
+        assert_eq!(sheet_grid(256, 128, 0, (1, 1)), (2, 1));
         // ef_cmn_smoke04.
-        assert_eq!(sheet_grid(384, 128, 0), (3, 1));
+        assert_eq!(sheet_grid(384, 128, 0, (1, 1)), (3, 1));
         // ef_cmn_fireimpact04: a vertical strip.
-        assert_eq!(sheet_grid(256, 768, 0), (1, 3));
+        assert_eq!(sheet_grid(256, 768, 0, (1, 1)), (1, 3));
 
         // A square texture with no declared count stays whole — nothing says it is subdivided,
         // and guessing would slice single images into quarters.
-        assert_eq!(sheet_grid(256, 256, 0), (1, 1));
-        assert_eq!(sheet_grid(133, 133, 0), (1, 1)); // ef_cmn_smoke02
+        assert_eq!(sheet_grid(256, 256, 0, (1, 1)), (1, 1));
+        assert_eq!(sheet_grid(133, 133, 0, (1, 1)), (1, 1)); // ef_cmn_smoke02
         // Proportions that do not divide evenly are not a sheet.
-        assert_eq!(sheet_grid(133, 100, 0), (1, 1));
+        assert_eq!(sheet_grid(133, 100, 0, (1, 1)), (1, 1));
         // An implausibly long strip is more likely a coincidence than a 32-frame sheet.
-        assert_eq!(sheet_grid(2048, 64, 0), (1, 1));
+        assert_eq!(sheet_grid(2048, 64, 0, (1, 1)), (1, 1));
 
         // A declared count still wins over the proportions.
-        assert_eq!(sheet_grid(256, 128, 5), (4, 2));
+        assert_eq!(sheet_grid(256, 128, 5, (1, 1)), (4, 2));
     }
 
     /// With no declared pattern, particles pick a cell each rather than all showing the same
