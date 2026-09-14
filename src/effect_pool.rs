@@ -80,6 +80,27 @@ impl EffectPool {
         }
     }
 
+    /// Scan these folders too, if they are not already part of the pool.
+    ///
+    /// A pool is made once and kept, often by whichever tool opened first -- the Transplant
+    /// studio makes it from the export folder alone -- so a folder learned about later (the
+    /// game dump holding `ef_common`, a mod root holding a transplant carrier) has to be
+    /// added to it rather than assumed to be there. Files already cached are not rescanned.
+    pub fn ensure_roots(&mut self, roots: &[PathBuf]) {
+        let mut added = false;
+        for root in roots {
+            if root == &self.root || self.extra_roots.contains(root) {
+                continue;
+            }
+            self.extra_roots.push(root.clone());
+            added = true;
+        }
+        if added {
+            // The next tick walks again; anything unchanged since it was cached is skipped.
+            self.queued = false;
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -113,7 +134,10 @@ impl EffectPool {
             walk_effs(&self.root, &mut files);
         }
         for extra in self.extra_roots.clone() {
-            walk_effs(&extra, &mut files);
+            // A game dump or a mod keeps its effects under `effect/`; walking the whole folder
+            // of a dump would visit every model and motion file in the game to find them.
+            let effects = extra.join("effect");
+            walk_effs(if effects.is_dir() { &effects } else { &extra }, &mut files);
         }
         self.total = files.len();
         for f in files {
@@ -457,6 +481,46 @@ mod picker_tests {
     /// This is the case the old picker could not express at all: Dabi's effects are named
     /// `dabi_*` and ride on snake, so neither the fighter's name nor the effect's mentions the
     /// other. The file path is what connects them.
+    /// The picker's regression: a pool made from the export folder never saw ef_common, which
+    /// lives in the game dump, so the System group came up empty. Roots learned about later
+    /// must be walked -- under their `effect/` folder -- without rescanning what is cached.
+    #[test]
+    fn roots_added_later_are_walked_for_their_effects() {
+        let base = std::env::temp_dir().join(format!("visionary-pool-roots-{}", std::process::id()));
+        let export = base.join("export");
+        let dump = base.join("dump");
+        let common = dump.join("effect/system/common");
+        std::fs::create_dir_all(&common).unwrap();
+        std::fs::create_dir_all(export.join("effect")).unwrap();
+        std::fs::write(common.join("ef_common.eff"), b"not really an eff").unwrap();
+        // Outside effect/: a dump's models and motions, which the walk must not wade through.
+        std::fs::create_dir_all(dump.join("fighter/mario/model")).unwrap();
+        std::fs::write(dump.join("fighter/mario/model/stray.eff"), b"").unwrap();
+
+        let mut pool = super::EffectPool {
+            root: export.clone(),
+            extra_roots: Vec::new(),
+            cache: Default::default(),
+            queue: Vec::new(),
+            queued: false,
+            total: 0,
+            dirty: false,
+        };
+        pool.ensure_queue();
+        assert_eq!(pool.total, 0, "the export folder alone has no effects");
+
+        pool.ensure_roots(&[export.clone(), dump.clone()]);
+        assert_eq!(pool.extra_roots, vec![dump.clone()], "the pool's own root is not added twice");
+        pool.ensure_queue();
+        assert_eq!(pool.total, 1, "ef_common is found, and only under effect/");
+        assert!(pool.queue.iter().any(|f| f.ends_with("ef_common.eff")));
+
+        // Naming the same roots again changes nothing.
+        pool.ensure_roots(&[dump.clone()]);
+        assert!(pool.queued, "an already-known root does not trigger another walk");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_transplanted_effect_belongs_to_the_fighter_that_carries_it() {
         assert_eq!(

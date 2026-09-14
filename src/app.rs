@@ -15470,19 +15470,22 @@ If you step every basis for a                          type and NONE of them mat
     ///
     /// Returns the chosen effect name, to assign to the selected spawn.
     fn draw_effect_name_picker(&mut self, ui: &mut Ui) -> Option<String> {
-        // Ensure the donor pool is available for the full-eff search, including the mod
-        // folders: a transplanted effect lives in the mod, not under the game's own root.
+        // Ensure the donor pool is available, and that it covers every root the effect
+        // preview searches: the game dump (where ef_common lives -- the export folder does
+        // not have it) and the mod folders (where transplanted effects live). The pool may
+        // already exist from the Transplant studio, made from the export folder alone.
         if self.effect_pool.is_none() {
             if let Some(root) = self
                 .export_dir
                 .clone()
                 .or_else(|| self.state.data_root.clone())
             {
-                self.effect_pool = Some(crate::effect_pool::EffectPool::with_mod_roots(
-                    root,
-                    self.extra_roots.clone(),
-                ));
+                self.effect_pool = Some(crate::effect_pool::EffectPool::new(root));
             }
+        }
+        let roots = self.all_roots();
+        if let Some(pool) = self.effect_pool.as_mut() {
+            pool.ensure_roots(&roots);
         }
         let scanning = self
             .effect_pool
