@@ -54,107 +54,24 @@ pub struct MeshKey {
     pub descriptor: usize,
 }
 
-/// Attribute formats seen on effect primitives, by the encoding in the low byte.
-///
-/// Only the ones the pool actually uses are handled. An unknown format yields no UV rather than
-/// a guessed one: a wrong guess puts the whole mesh on one texel of the sheet, which reads as a
-/// flat coloured shape and looks like a shader bug rather than a parsing one.
-fn read_uv(bytes: &[u8], format: u16) -> Option<[f32; 2]> {
-    match format {
-        // 16_16 float (half2).
-        0x1205 => {
-            let u = half_to_f32(u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]));
-            let v = half_to_f32(u16::from_le_bytes([*bytes.get(2)?, *bytes.get(3)?]));
-            Some([u, v])
-        }
-        // 16_16 unorm.
-        0x1201 => {
-            let u = u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as f32 / 65535.0;
-            let v = u16::from_le_bytes([*bytes.get(2)?, *bytes.get(3)?]) as f32 / 65535.0;
-            Some([u, v])
-        }
-        // 8_8 unorm.
-        0x0901 => Some([
-            *bytes.first()? as f32 / 255.0,
-            *bytes.get(1)? as f32 / 255.0,
-        ]),
-        _ => None,
-    }
-}
-
-/// IEEE half to f32. Written out rather than pulled in as a dependency for one conversion.
-fn half_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 1) as u32;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let mantissa = (bits & 0x3ff) as u32;
-    let value = match exponent {
-        0 if mantissa == 0 => sign << 31,
-        // Subnormal: renormalise into a float32 exponent.
-        0 => {
-            let mut e = -1i32;
-            let mut m = mantissa;
-            while m & 0x400 == 0 {
-                m <<= 1;
-                e -= 1;
-            }
-            let exp = (127 - 15 + e) as u32;
-            (sign << 31) | (exp << 23) | ((m & 0x3ff) << 13)
-        }
-        0x1f => (sign << 31) | (0xff << 23) | (mantissa << 13),
-        _ => (sign << 31) | ((exponent + 127 - 15) << 23) | (mantissa << 13),
-    };
-    f32::from_bits(value)
-}
-
 /// Pull one primitive out of an `.eff`'s BFRES pool.
+///
+/// Decoded through [`crate::eff_mesh_io::read_model`], which reads every vertex format the
+/// corpus uses. Reading positions as f32 and UVs from three formats, as this once did, drew the
+/// half-float primitives as scattered triangles and left the 16-bit snorm UVs -- 51 primitives
+/// across ef_common, ef_edge and the MHA carrier -- sampling one texel.
 pub fn extract(blob: &[u8], descriptor: usize) -> Option<EffectMesh> {
-    let single = effect_library::bfres::ResFile::export_single_model(blob, descriptor).ok()?;
-    let (name, model) = effect_library::bfres::ResFile::parse_model_export(single).ok()?;
-
-    let buffer = model.vertex_buffers.first()?;
-    let position = buffer.attributes.get("_p0")?;
-    let uv = buffer.attributes.get("_u0");
-    let stride = *buffer.buffer_strides.first()? as usize;
-    let data = buffer.buffers.first()?;
-    if stride == 0 {
-        return None;
-    }
-
-    let mut vertices = Vec::with_capacity(buffer.vertex_count as usize);
-    for index in 0..buffer.vertex_count as usize {
-        let base = index * stride;
-        let at = base + position.offset as usize;
-        let slice = data.get(at..at + 12)?;
-        let read = |n: usize| {
-            f32::from_le_bytes([slice[n], slice[n + 1], slice[n + 2], slice[n + 3]])
-        };
-        let uv_value = uv
-            .and_then(|attr| {
-                let at = base + attr.offset as usize;
-                data.get(at..(at + 4).min(data.len()))
-                    .and_then(|bytes| read_uv(bytes, attr.format))
-            })
-            .unwrap_or([0.0, 0.0]);
-        vertices.push(MeshVertex {
-            position: [read(0), read(4), read(8)],
-            uv: uv_value,
-        });
-    }
-
-    // Every measured primitive is one shape of triangles with u16 indices, but the fields are
-    // read rather than assumed: a mesh that is not triangles would otherwise be drawn as though
-    // it were, silently.
-    let mut indices = Vec::new();
-    for shape in model.shapes.values() {
-        for mesh in &shape.meshes {
-            if mesh.primitive_type != 3 || mesh.index_format != 1 {
-                continue;
-            }
-            for pair in mesh.index_data.chunks_exact(2) {
-                indices.push(u16::from_le_bytes([pair[0], pair[1]]));
-            }
-        }
-    }
+    let (name, mesh) = crate::eff_mesh_io::read_primitive(blob, descriptor).ok()?;
+    let vertices: Vec<MeshVertex> = mesh
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(i, position)| MeshVertex {
+            position: *position,
+            uv: mesh.uv0.get(i).copied().unwrap_or([0.0, 0.0]),
+        })
+        .collect();
+    let indices: Vec<u16> = mesh.indices.iter().map(|i| *i as u16).collect();
     if vertices.is_empty() || indices.is_empty() {
         return None;
     }
@@ -247,20 +164,14 @@ mod tests {
     }
 
     #[test]
-    fn half_floats_convert() {
-        assert_eq!(half_to_f32(0x0000), 0.0);
-        assert_eq!(half_to_f32(0x3c00), 1.0);
-        assert_eq!(half_to_f32(0xbc00), -1.0);
-        assert_eq!(half_to_f32(0x4000), 2.0);
-        assert!((half_to_f32(0x3555) - 0.333).abs() < 0.001);
-    }
-
-    #[test]
-    fn unknown_uv_formats_yield_nothing_rather_than_a_guess() {
+    fn unknown_formats_yield_nothing_rather_than_a_guess() {
         // A guessed UV puts the whole mesh on one texel, which reads as a shader bug.
-        assert!(read_uv(&[0, 0, 0, 0], 0xFFFF).is_none());
-        assert_eq!(read_uv(&[0xff, 0xff, 0x00, 0x00], 0x1201), Some([1.0, 0.0]));
-        assert_eq!(read_uv(&[0xff, 0x80, 0, 0], 0x0901), Some([1.0, 0.5019608]));
+        use crate::eff_mesh_io::decode;
+        assert!(decode(&[0, 0, 0, 0], 0xFFFF).is_none());
+        assert_eq!(decode(&[0xff, 0xff, 0x00, 0x00], 0x1201).map(|v| [v[0], v[1]]), Some([1.0, 0.0]));
+        assert_eq!(decode(&[0xff, 0x80], 0x0901).map(|v| [v[0], v[1]]), Some([1.0, 0.5019608]));
+        // 16-bit snorm, which the preview once could not read at all.
+        assert_eq!(decode(&[0xff, 0x7f, 0x01, 0x80], 0x1202).map(|v| [v[0], v[1]]), Some([1.0, -1.0]));
     }
 
     /// Real primitives out of a real pool. The layout is undocumented, so this is the check
@@ -372,5 +283,46 @@ mod tests {
             mesh.name,
             mesh.vertices.len()
         );
+    }
+
+    /// Survey of how effect primitives are laid out, so a writer matches what the game ships.
+    ///
+    /// `VISIONARY_MESH_SURVEY` = comma separated .eff paths.
+    #[test]
+    fn survey_primitive_layouts() {
+        let Ok(list) = std::env::var("VISIONARY_MESH_SURVEY") else {
+            return;
+        };
+        let mut layouts: std::collections::BTreeMap<String, usize> = Default::default();
+        for path in list.split(',') {
+            let bytes = std::fs::read(path).expect("eff reads");
+            let raw = effect_library::NamcoEffectFile::load(&bytes).expect("eff parses");
+            let Some(info) = raw.ptcl_file.and_then(|p| p.primitive_info) else { continue };
+            let Some(blob) = info.binary_data else { continue };
+            for index in 0..info.descriptors.len() {
+                let Ok(single) = effect_library::bfres::ResFile::export_single_model(&blob, index) else {
+                    *layouts.entry("unreadable".into()).or_default() += 1;
+                    continue;
+                };
+                let (_, model) = effect_library::bfres::ResFile::parse_model_export(single).unwrap();
+                let mut key = format!("vb{} shapes{} mats{} bones{}", model.vertex_buffers.len(), model.shapes.len(), model.materials.len(), model.skeleton.bones.len());
+                for vb in &model.vertex_buffers {
+                    key += &format!(" | bufs{} strides{:?} skin{}", vb.buffers.len(), vb.buffer_strides, vb.vertex_skin_count);
+                    for (name, a) in &vb.attributes {
+                        key += &format!(" {name}@{}:{}:{:#06x}", a.buffer_index, a.offset, a.format);
+                    }
+                }
+                for shape in model.shapes.values() {
+                    key += &format!(" | meshes{} lods", shape.meshes.len());
+                    for m in &shape.meshes {
+                        key += &format!(" prim{} idx{} subs{}", m.primitive_type, m.index_format, m.sub_meshes.len());
+                    }
+                }
+                *layouts.entry(key).or_default() += 1;
+            }
+        }
+        for (k, n) in layouts {
+            println!("{n:5}  {k}");
+        }
     }
 }

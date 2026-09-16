@@ -10,6 +10,7 @@ mod eff_attrs;
 mod eff_editor;
 mod eff_export;
 mod eff_mesh;
+mod eff_mesh_io;
 mod eff_render;
 mod eff_runtime;
 mod eff_sim;

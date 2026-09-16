@@ -63,6 +63,7 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate", "bzip2"] }
 # The other half of that: GameBanana serves .7z at least as often as .zip.
 sevenz-rust2 = "0.22.2"
+gltf = { version = "1", default-features = false, features = ["import", "utils"] }
 
 # These native window systems only exist on Linux. Keeping them out of the common eframe
 # declaration prevents Windows builds from inheriting host features they cannot use.
