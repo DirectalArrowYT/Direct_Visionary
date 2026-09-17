@@ -2139,10 +2139,39 @@ mod tests {
             return;
         };
         let mha = std::path::PathBuf::from(mha);
-        let manifest: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(mha.join("staged").join("manifest.json")).expect("manifest reads"),
+        let manifest_path = mha.join(
+            std::env::var("VISIONARY_MANIFEST").unwrap_or_else(|_| "staged/manifest.json".to_string()),
+        );
+        let mut manifest: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&manifest_path).expect("manifest reads"),
         )
         .expect("manifest parses");
+        println!("manifest {}", manifest_path.display());
+        // Generated builds (tools/mha_convert.py) keep their own files; their arrays join the
+        // manifest's, so a converted effect is staged exactly like a hand-written one.
+        let builds: Vec<String> = manifest["mha_builds"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        for build in &builds {
+            let part: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(mha.join(build)).unwrap_or_else(|e| panic!("build {build}: {e}")),
+            )
+            .unwrap_or_else(|e| panic!("build {build} parses: {e}"));
+            for (key, value) in part.as_object().expect("a build is an object") {
+                let Some(items) = value.as_array() else { continue };
+                let slot = manifest
+                    .as_object_mut()
+                    .unwrap()
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::json!([]));
+                slot.as_array_mut()
+                    .unwrap_or_else(|| panic!("manifest '{key}' is not a list"))
+                    .extend(items.iter().cloned());
+            }
+        }
+        println!("mha builds: {}", builds.len());
+        let manifest = manifest;
         let text = |v: &serde_json::Value, key: &str| -> String {
             v[key].as_str().unwrap_or_else(|| panic!("manifest: missing '{key}' in {v}")).to_string()
         };
@@ -2265,6 +2294,9 @@ mod tests {
         };
         let cloned = super::rebuild_eff_bytes_for_slot(&original, &phase1, Some(&root), None)
             .expect("phase 1: the effects come in");
+        if let Ok(dump) = std::env::var("VISIONARY_DUMP_PHASE1") {
+            std::fs::write(dump, &cloned).expect("phase 1 dump writes");
+        }
 
         /// A colour moved toward `hue`, keeping its brightness AND its saturation: a white
         /// highlight stays white and a grey stays grey, and only what was already coloured
@@ -2406,7 +2438,16 @@ mod tests {
             .as_ref()
             .map(|info| info.descriptors.iter().map(|d| (d.id, d.name.clone())).collect())
             .unwrap_or_default();
+        // Entries a roster rebuilds lose these emitters, and an edit addressed to one would land
+        // by index on whatever the roster put there instead.
+        let rostered: Vec<String> = list("rosters")
+            .iter()
+            .filter_map(|r| r["entry"].as_str().map(|e| e.to_ascii_uppercase()))
+            .collect();
         for (_, _, new) in &moves {
+            if rostered.contains(&new.to_ascii_uppercase()) {
+                continue;
+            }
             let (set_idx, set_name, names) = locate(&cloned, new);
             let mut flat = Vec::new();
             super::visit_emitters_ref(&cloned_ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
@@ -2443,8 +2484,101 @@ mod tests {
             }
         }
 
+        // Assembled effects: each slot clones an emitter of another entry. Resolved to set names
+        // here, where phase 1's sets exist; applied by the rebuild before any authored edit, so
+        // edits below address the emitters by the names their slots give them.
+        let mut rosters: Vec<crate::mod_project::EmitterRoster> = Vec::new();
+        let mut roster_names: std::collections::HashMap<String, Vec<String>> = Default::default();
+        for r in list("rosters") {
+            let entry = text(&r, "entry");
+            let (set_idx, set_name, _) = locate(&cloned, &entry);
+            let mut slots = Vec::new();
+            let mut names = Vec::new();
+            for s in r["slots"].as_array().expect("roster: slots") {
+                let from = text(s, "from").replace("{p}", manifest["prefix"].as_str().unwrap_or("SHIGA"));
+                let emitter = text(s, "emitter");
+                let (_, from_set, from_names) = locate(&cloned, &from);
+                let source_idx = from_names
+                    .iter()
+                    .position(|n| n == &emitter)
+                    .unwrap_or_else(|| panic!("roster {entry}: {from} has no emitter {emitter}: {from_names:?}"));
+                let name = s["name"].as_str().map(String::from).unwrap_or_else(|| emitter.clone());
+                names.push(name.clone());
+                slots.push(crate::mod_project::EmitterSlot {
+                    source_idx,
+                    source_name: emitter,
+                    name,
+                    depth: 0,
+                    source_set: from_set,
+                });
+            }
+            assert!(!slots.is_empty(), "roster {entry} has no slots");
+            let mut unique = names.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(unique.len(), names.len(), "roster {entry} repeats a name: {names:?}");
+            roster_names.insert(entry.to_ascii_uppercase(), names);
+            rosters.push(crate::mod_project::EmitterRoster {
+                set_name,
+                entry_name: entry,
+                set_idx,
+                slots,
+            });
+        }
+        let names_after = |entry: &str| -> Vec<String> {
+            roster_names
+                .get(&entry.to_ascii_uppercase())
+                .cloned()
+                .unwrap_or_else(|| locate(&cloned, entry).2)
+        };
+        let mut edit_list: Vec<AuthoredEdit> = Vec::new();
+        let mut edit_textures: Vec<(String, String, String)> = Vec::new();
+        for e in list("edits") {
+            let entry = text(&e, "entry");
+            let emitter = text(&e, "emitter");
+            let (set_idx, set_name, _) = locate(&cloned, &entry);
+            let names = names_after(&entry);
+            let emitter_idx = names
+                .iter()
+                .position(|n| n == &emitter)
+                .unwrap_or_else(|| panic!("edit {entry}: no emitter {emitter}: {names:?}"));
+            let texture = e["texture"].as_str().map(String::from);
+            if let Some(texture) = &texture {
+                if !edit_textures.iter().any(|(t, _, _)| t == texture) {
+                    edit_textures.push((texture.clone(), text(&e, "template"), text(&e, "png")));
+                }
+            }
+            edit_list.push(AuthoredEdit {
+                set_name,
+                entry_name: entry,
+                set_idx,
+                emitter_name: emitter,
+                emitter_idx,
+                fields: EmitterFieldEdits {
+                    texture_name: texture,
+                    attrs: e["attrs"]
+                        .as_object()
+                        .map(|o| o.iter().map(|(k, v)| (k.clone(), to_attr(v))).collect())
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+            });
+        }
+        println!("assembled: {} rosters, {} emitter edits, {} textures", rosters.len(), edit_list.len(), edit_textures.len());
+
         // Phase 2: the art, addressed to where phase 1 put things.
         let mut added: Vec<TextureAddition> = Vec::new();
+        for (texture, template, png) in &edit_textures {
+            let png = std::path::Path::new(png);
+            added.push(TextureAddition {
+                texture_name: texture.clone(),
+                template_name: template.clone(),
+                png_path: if png.is_absolute() { png.to_path_buf() } else { mha.join(png) }
+                    .to_string_lossy()
+                    .into_owned(),
+                raw: false,
+            });
+        }
         for r in &retextures {
             if !added.iter().any(|t| t.texture_name == r.texture) {
                 added.push(TextureAddition {
@@ -2480,6 +2614,7 @@ mod tests {
         let mut authored = recolor_edits.clone();
         authored.extend(retexture_edits);
         authored.extend(tune_edits);
+        authored.extend(edit_list);
         let phase2 = EffMod {
             source_rel: carrier_rel.clone(),
             textures: swaps
@@ -2492,10 +2627,57 @@ mod tests {
                 .collect(),
             textures_added: added,
             authored,
+            rosters,
             ..Default::default()
         };
-        let built = super::rebuild_eff_bytes_for_slot(&cloned, &phase2, None, None)
+        let mut built = super::rebuild_eff_bytes_for_slot(&cloned, &phase2, None, None)
             .expect("phase 2: the art applies");
+
+        // Meshes last: a new primitive per MHA mesh, pointed at by the emitters that draw it. Builds
+        // name a mesh by mesh and template, so the same MHA mesh from many effects is one
+        // primitive with all their emitters as targets.
+        let mut mesh_list: Vec<serde_json::Value> = Vec::new();
+        for m in list("meshes") {
+            match mesh_list.iter_mut().find(|seen| seen["name"] == m["name"]) {
+                Some(seen) => {
+                    let more = m["targets"].as_array().cloned().unwrap_or_default();
+                    seen["targets"].as_array_mut().expect("mesh: targets").extend(more);
+                }
+                None => mesh_list.push(m),
+            }
+        }
+        for m in mesh_list {
+            let template = text(&m, "template");
+            let name = text(&m, "name");
+            let glb_path = mha.join(text(&m, "glb"));
+            let glb = std::fs::read(&glb_path).unwrap_or_else(|e| panic!("mesh {}: {e}", glb_path.display()));
+            let mesh = crate::eff_mesh_io::from_gltf(&glb).unwrap_or_else(|e| panic!("mesh {name}: {e}"));
+            let targets: Vec<(String, String)> = m["targets"]
+                .as_array()
+                .expect("mesh: targets")
+                .iter()
+                .map(|t| (t[0].as_str().unwrap().to_string(), t[1].as_str().unwrap().to_string()))
+                .collect();
+            built = crate::eff_mesh_io::add_primitive_for_emitters(&built, &template, &name, &mesh, &targets)
+                .unwrap_or_else(|e| panic!("mesh {name}: {e:#}"));
+            println!("mesh {name}: {} verts for {} emitters", mesh.positions.len(), targets.len());
+        }
+
+        // One character per file: everything outside its prefixes is emptied and pruned.
+        let keep_prefixes: Vec<String> = strings(&manifest["keep_prefixes"]);
+        if !keep_prefixes.is_empty() {
+            let namco = effect_library::NamcoEffectFile::load(&built).expect("built eff parses");
+            let keep_names: Vec<String> = namco
+                .entry_names
+                .iter()
+                .filter(|n| keep_prefixes.iter().any(|p| n.to_ascii_uppercase().starts_with(&p.to_ascii_uppercase())))
+                .cloned()
+                .collect();
+            let refs: Vec<&str> = keep_names.iter().map(String::as_str).collect();
+            let before = built.len();
+            built = super::strip_donor_eff_bytes(&built, &refs).expect("stripping to this character's effects");
+            println!("kept {} entries under {keep_prefixes:?}: {before} -> {} bytes", keep_names.len(), built.len());
+        }
 
         let namco = effect_library::NamcoEffectFile::load(&built).expect("staged eff parses");
         let ptcl = namco.ptcl_file.as_ref().expect("ptcl");
@@ -2512,11 +2694,13 @@ mod tests {
         let mut donors: std::collections::HashMap<String, Vec<u8>> = Default::default();
 
         for (from, src, new) in &moves {
-            let donor = donors
-                .entry(from.clone())
-                .or_insert_with(|| std::fs::read(root.join(from)).expect("donor reads"));
             let (set_idx, _, names) = locate(&built, new);
-            assert_eq!(names, locate(donor, src).2, "{new} did not come across whole");
+            if !roster_names.contains_key(&new.to_ascii_uppercase()) {
+                let donor = donors
+                    .entry(from.clone())
+                    .or_insert_with(|| std::fs::read(root.join(from)).expect("donor reads"));
+                assert_eq!(names, locate(donor, src).2, "{new} did not come across whole");
+            }
             let mut missing = Vec::new();
             super::visit_emitters_ref(&ptcl.emitter_list.emitter_sets[set_idx].emitters, &mut |em| {
                 let id = em.data.particle_data.primitive_id;
@@ -2527,7 +2711,11 @@ mod tests {
             assert!(missing.is_empty(), "{new}: meshes missing from the carrier: {missing:?}");
         }
         for (name, _) in &swaps {
-            assert!(texture_ids.contains_key(name), "{name} is not in the staged pool");
+            // A replaced texture only this character's stripped effects used is pruned with them.
+            assert!(
+                texture_ids.contains_key(name) || !keep_prefixes.is_empty(),
+                "{name} is not in the staged pool"
+            );
         }
         let mut read_back = 0usize;
         for r in &retextures {
@@ -2607,7 +2795,7 @@ mod tests {
             }
             std::fs::write(out, &built).expect("staged file writes");
             let record = serde_json::json!({ "phase1_effects": &phase1, "phase2_art": &phase2 });
-            let record_path = mha.join("staged").join("batch.effmod.json");
+            let record_path = manifest_path.with_file_name("batch.effmod.json");
             std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap())
                 .expect("record writes");
             println!("wrote {}\nrecorded ops in {}", out.display(), record_path.display());
@@ -2885,6 +3073,7 @@ mod tests {
                 source_name: want.to_string(),
                 name: want.to_string(),
                 depth: 0,
+                source_set: String::new(),
             })
             .collect();
         let tuning: Vec<(&str, crate::eff_attrs::AttrValue)> = vec![
@@ -4790,6 +4979,7 @@ mod tests {
             source_name: names[idx].clone(),
             name: name.to_string(),
             depth: 0,
+            source_set: String::new(),
         };
         let eff = crate::mod_project::EffMod {
             source_rel: SRC.to_string(),
@@ -7444,6 +7634,11 @@ fn apply_roster(
     } else {
         sets.iter().position(set_named).unwrap_or(roster.set_idx)
     };
+    let sets_snapshot: Vec<effect_library::structs::EmitterSet> = if roster.slots.iter().any(|s| !s.source_set.is_empty()) {
+        sets.clone()
+    } else {
+        Vec::new()
+    };
     let set = sets.get_mut(set_idx).ok_or_else(|| {
         anyhow!(
             "emitter set '{}' (idx {}) not found — cannot apply its emitter list",
@@ -7467,11 +7662,32 @@ fn apply_roster(
         }
     }
     flatten(&set.emitters, &mut flat);
-
     let names: Vec<String> = flat.iter().map(|em| em.data.display_name()).collect();
+
+    // Other sets slots borrow from, flattened the same way.
+    let mut borrowed: std::collections::HashMap<String, (Vec<effect_library::structs::Emitter>, Vec<String>)> =
+        Default::default();
+    for slot in &roster.slots {
+        if slot.source_set.is_empty() || borrowed.contains_key(&slot.source_set) {
+            continue;
+        }
+        let other = sets_snapshot
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(&slot.source_set))
+            .ok_or_else(|| anyhow!("emitter list for '{}' borrows from set '{}', which the file does not have", roster.set_name, slot.source_set))?;
+        let mut other_flat = Vec::new();
+        flatten(&other.emitters, &mut other_flat);
+        let other_names = other_flat.iter().map(|em| em.data.display_name()).collect();
+        borrowed.insert(slot.source_set.clone(), (other_flat, other_names));
+    }
+
     let mut built: Vec<effect_library::structs::Emitter> = Vec::new();
     let mut depths: Vec<u8> = Vec::new();
     for slot in &roster.slots {
+        let (flat, names) = match borrowed.get(&slot.source_set) {
+            Some((other_flat, other_names)) => (other_flat, other_names),
+            None => (&flat, &names),
+        };
         // Same resolution rule as an authored edit: the stored name at the stored index wins
         // outright, then the name anywhere, then the bare index.
         let named =

@@ -584,6 +584,14 @@ pub struct EmitterSlot {
     /// Nesting depth in the result: 0 is a root emitter, 1 a child of the slot above it.
     #[serde(default)]
     pub depth: u8,
+    /// Another emitter set in the same file to clone this slot from, by name. Empty means the
+    /// set this roster rebuilds.
+    ///
+    /// How an effect is assembled from parts of others: an MHA hit rebuilt on Smash emitters
+    /// takes its glow from one effect, its spark lines from another and its shock sheet from a
+    /// third, each already carrying shaders the file holds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_set: String,
 }
 
 /// Changes to what one effect entry SPAWNS — the eff header's side of an effect, as opposed to

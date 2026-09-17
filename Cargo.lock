@@ -1188,8 +1188,6 @@ dependencies = [
 [[package]]
 name = "effect_library"
 version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af6a2687109822004c4812190f51cf5e3dba660ada157f6e28ec2d57ea0fcc56"
 dependencies = [
  "base64 0.21.7",
  "byteorder",

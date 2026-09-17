@@ -92,3 +92,8 @@ opt-level = 1
 # Compiles the WGSL in tests: wgpu only validates a shader when a pipeline is created, so a
 # broken particle shader would otherwise surface as a crash on opening the preview.
 naga = { version = "29.0.1", features = ["wgsl-in"] }
+
+# Local fix for the eff writer's header page count (vendor/effect_library/src/namco_file.rs):
+# files with a few hundred effect entries were written unreadable.
+[patch.crates-io]
+effect_library = { path = "vendor/effect_library" }

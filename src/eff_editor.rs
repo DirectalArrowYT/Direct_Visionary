@@ -1347,6 +1347,7 @@ impl EffEditor {
                             .unwrap_or_default(),
                         name: em.name.clone(),
                         depth: em.depth,
+                        source_set: String::new(),
                     })
                     .collect(),
             });

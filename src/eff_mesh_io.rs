@@ -1153,6 +1153,151 @@ mod tests {
         println!("replace and add both hold");
     }
 
+    /// Every entry of an eff with what it is made of: emitters, textures, meshes, blend, life.
+    /// Written as JSON, for planning which effects to rebuild.
+    ///
+    /// `VISIONARY_CATALOG_EFF` = the eff, `VISIONARY_CATALOG_OUT` = the JSON path.
+    #[test]
+    fn catalog_eff_entries() {
+        let (Ok(path), Ok(out)) = (
+            std::env::var("VISIONARY_CATALOG_EFF"),
+            std::env::var("VISIONARY_CATALOG_OUT"),
+        ) else {
+            return;
+        };
+        let eff = std::fs::read(path).unwrap();
+        let mut namco = load_eff(&eff).unwrap();
+        let ptcl = namco.ptcl_file.as_ref().unwrap();
+        let textures: std::collections::HashMap<u64, String> = ptcl
+            .texture_info
+            .as_ref()
+            .map(|i| i.descriptors.iter().map(|d| (d.id, d.name.clone())).collect())
+            .unwrap_or_default();
+        let meshes: std::collections::HashMap<u64, String> = list_primitives(&eff)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
+        let mut rows: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
+        for_each_emitter(&mut namco, |entry, em| {
+            let d = &em.data;
+            let row = rows.entry(entry.to_string()).or_insert_with(|| {
+                serde_json::json!({"emitters": [], "textures": [], "meshes": []})
+            });
+            let push = |row: &mut serde_json::Value, key: &str, value: String| {
+                let list = row[key].as_array_mut().unwrap();
+                if !list.iter().any(|v| v == &serde_json::Value::String(value.clone())) {
+                    list.push(value.into());
+                }
+            };
+            let mut desc = d.display_name();
+            let mut tex = Vec::new();
+            for sampler in [&d.sampler0, &d.sampler1, &d.sampler2].into_iter().flatten() {
+                if let Some(name) = textures.get(&sampler.texture_id) {
+                    tex.push(name.clone());
+                    push(row, "textures", name.clone());
+                }
+            }
+            if let Some(mesh) = meshes.get(&d.particle_data.primitive_id) {
+                push(row, "meshes", mesh.clone());
+                desc += &format!(" mesh={mesh}");
+            }
+            desc += &format!(" blend={} life={} tex={}", d.render_state.blend_type, d.particle_data.life, tex.join("+"));
+            row["emitters"].as_array_mut().unwrap().push(desc.into());
+        });
+        std::fs::write(&out, serde_json::to_string_pretty(&rows).unwrap()).unwrap();
+        println!("{} entries catalogued to {out}", rows.len());
+    }
+
+    /// Every attribute of every emitter, as { entry: { emitter: { attr: value } } }, plus the
+    /// textures each samples and the mesh it draws. For studying how the game's own effects are
+    /// authored before writing converters that author new ones.
+    ///
+    /// `VISIONARY_DUMP_EFF` = the eff, `VISIONARY_DUMP_OUT` = the JSON path.
+    #[test]
+    fn dump_every_emitter_attribute() {
+        let (Ok(path), Ok(out)) = (
+            std::env::var("VISIONARY_DUMP_EFF"),
+            std::env::var("VISIONARY_DUMP_OUT"),
+        ) else {
+            return;
+        };
+        let eff = std::fs::read(path).unwrap();
+        let mut namco = load_eff(&eff).unwrap();
+        let ptcl = namco.ptcl_file.as_ref().unwrap();
+        let textures: std::collections::HashMap<u64, String> = ptcl
+            .texture_info
+            .as_ref()
+            .map(|i| i.descriptors.iter().map(|d| (d.id, d.name.clone())).collect())
+            .unwrap_or_default();
+        let meshes: std::collections::HashMap<u64, String> = list_primitives(&eff)
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.name))
+            .collect();
+        let table = crate::eff_attrs::table();
+        let mut rows = serde_json::Map::new();
+        for_each_emitter(&mut namco, |entry, em| {
+            let d = &em.data;
+            let mut attrs = serde_json::Map::new();
+            for attr in table {
+                if let Some(value) = (attr.get)(d) {
+                    let v = match value {
+                        crate::eff_attrs::AttrValue::Int(i) => serde_json::json!(i),
+                        crate::eff_attrs::AttrValue::UInt(u) => serde_json::json!(u),
+                        crate::eff_attrs::AttrValue::Float(f) => serde_json::json!(f),
+                    };
+                    attrs.insert(attr.id.to_string(), v);
+                }
+            }
+            let tex: Vec<String> = [&d.sampler0, &d.sampler1, &d.sampler2]
+                .into_iter()
+                .map(|s| {
+                    s.as_ref()
+                        .and_then(|s| textures.get(&s.texture_id))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect();
+            attrs.insert("_textures".into(), serde_json::json!(tex));
+            attrs.insert(
+                "_mesh".into(),
+                serde_json::json!(meshes.get(&d.particle_data.primitive_id)),
+            );
+            attrs.insert("_children".into(), serde_json::json!(em.children.len()));
+            let row = rows
+                .entry(entry.to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let mut name = d.display_name();
+            while row.get(&name).is_some() {
+                name += "+";
+            }
+            row[&name] = serde_json::Value::Object(attrs);
+        });
+        std::fs::write(&out, serde_json::to_string(&rows).unwrap()).unwrap();
+        println!("{} entries dumped to {out}", rows.len());
+    }
+
+    /// Every pool texture: name, size, mips, format. For choosing templates to import art onto.
+    ///
+    /// `VISIONARY_TEXTURES_EFF` = the eff.
+    #[test]
+    fn list_pool_textures() {
+        let Ok(path) = std::env::var("VISIONARY_TEXTURES_EFF") else {
+            return;
+        };
+        let eff = std::fs::read(path).unwrap();
+        let namco = load_eff(&eff).unwrap();
+        let info = namco.ptcl_file.as_ref().unwrap().texture_info.as_ref().unwrap();
+        let pool = info.binary_data.as_ref().unwrap();
+        for (index, d) in info.descriptors.iter().enumerate() {
+            match crate::texture_import::describe(pool, index, &d.name) {
+                Ok(t) => println!("{:<36} {:>4}x{:<4} mips {:<2} {}", d.name, t.width, t.height, t.mipmaps, t.format),
+                Err(e) => println!("{:<36} ? {e}", d.name),
+            }
+        }
+    }
+
     /// Write every primitive of an eff to `<dir>/<name>.glb`, with an index of who draws each.
     ///
     /// `VISIONARY_MESH_EFF` = the eff, `VISIONARY_MESH_OUT` = the folder.
