@@ -2564,7 +2564,21 @@ mod tests {
                 },
             });
         }
-        println!("assembled: {} rosters, {} emitter edits, {} textures", rosters.len(), edit_list.len(), edit_textures.len());
+        // Aliases: effects MHA authored as copies of one another point at one emitter set rather
+        // than carrying their own, so the name still spawns and the file holds it once.
+        let entry_edits: Vec<crate::mod_project::EntryEdit> = list("entry_edits")
+            .iter()
+            .map(|e| crate::mod_project::EntryEdit {
+                entry_name: text(e, "entry"),
+                emitter_set: e["emitter_set"].as_str().map(String::from),
+                variants: None,
+                model: None,
+            })
+            .collect();
+        println!(
+            "assembled: {} rosters, {} emitter edits, {} textures, {} aliases",
+            rosters.len(), edit_list.len(), edit_textures.len(), entry_edits.len()
+        );
 
         // Phase 2: the art, addressed to where phase 1 put things.
         let mut added: Vec<TextureAddition> = Vec::new();
@@ -2628,6 +2642,7 @@ mod tests {
             textures_added: added,
             authored,
             rosters,
+            entry_edits,
             ..Default::default()
         };
         let mut built = super::rebuild_eff_bytes_for_slot(&cloned, &phase2, None, None)
@@ -2695,7 +2710,8 @@ mod tests {
 
         for (from, src, new) in &moves {
             let (set_idx, _, names) = locate(&built, new);
-            if !roster_names.contains_key(&new.to_ascii_uppercase()) {
+            // Same-file clones (assembled effects and aliases) have no donor file to compare to.
+            if !from.is_empty() && !roster_names.contains_key(&new.to_ascii_uppercase()) {
                 let donor = donors
                     .entry(from.clone())
                     .or_insert_with(|| std::fs::read(root.join(from)).expect("donor reads"));
