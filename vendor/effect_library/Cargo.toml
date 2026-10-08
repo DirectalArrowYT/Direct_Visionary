@@ -74,6 +74,10 @@ name = "bfres_user_data_audit"
 path = "examples/bfres_user_data_audit.rs"
 
 [[example]]
+name = "emitter_offsets"
+path = "examples/emitter_offsets.rs"
+
+[[example]]
 name = "bnsh_roundtrip"
 path = "examples/bnsh_roundtrip.rs"
 

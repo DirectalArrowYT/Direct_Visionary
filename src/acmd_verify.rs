@@ -193,16 +193,26 @@ pub fn verify_export_with_expression(
 
     for (fighter, move_name, script) in acmd_edits {
         let subject = format!("{fighter} / {move_name}");
-        let emitted = crate::acmd::preview_game_fn(script, move_name);
+        let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
+        let emitted = crate::acmd::preview_game_fn(script, &script_move);
         verify_move(&subject, script, &emitted, &mut report);
         // A costume-gated move ships the same body under `<name>_costume`, so the shipped
         // text is compared against both spellings. Dropping this check for gated moves would
         // stop verifying that the body reached disk at all.
-        let gated = crate::roster::scaffold::costume_arm_source(&emitted);
-        if !sources
+        //
+        // A gate also pins the function to the name its donor script declares, which can be
+        // the motion's other spelling (`game_attacks3s` where an ungated export would write
+        // `game_attacks3`). The gates are not passed in here, so either spelling counts.
+        let shipped = crate::acmd::move_script_aliases(move_name)
             .iter()
-            .any(|text| text.contains(&emitted) || text.contains(&gated))
-        {
+            .any(|alias| {
+                let emitted = crate::acmd::preview_game_fn(script, alias);
+                let gated = crate::roster::scaffold::costume_arm_source(&emitted);
+                sources
+                    .iter()
+                    .any(|text| text.contains(&emitted) || text.contains(&gated))
+            });
+        if !shipped {
             report.blocker(
                 &subject,
                 "the generated hitbox script is missing from the exported project",
@@ -215,7 +225,8 @@ pub fn verify_export_with_expression(
         // Not `subject`: that is prose for the report and has spaces around the slash. The
         // dropped map is keyed the way the editor keys every other per-move table.
         let key = format!("{fighter}/{move_name}");
-        let emitted = crate::acmd::preview_effect_fn(calls, move_name, tweaks, residue);
+        let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
+        let emitted = crate::acmd::preview_effect_fn(calls, &script_move, tweaks, residue);
         // C5 left this call passing `None`, because a saved project remembered the resolved
         // calls and nothing about the lines that became none of them. C6c gave the project
         // somewhere to keep that list, so both halves of the loss report now reach an export
@@ -239,7 +250,8 @@ pub fn verify_export_with_expression(
 
     for (fighter, move_name, script) in sound_edits {
         let subject = format!("{fighter} / {move_name}");
-        let emitted = crate::acmd::preview_sound_fn(script, move_name);
+        let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
+        let emitted = crate::acmd::preview_sound_fn(script, &script_move);
         verify_sound_move(&subject, script, &emitted, &mut report);
         if !sources.iter().any(|text| text.contains(&emitted)) {
             report.blocker(
@@ -251,7 +263,8 @@ pub fn verify_export_with_expression(
 
     for (fighter, move_name, script) in expression_edits {
         let subject = format!("{fighter} / {move_name}");
-        let emitted = crate::acmd::preview_expression_fn(script, move_name);
+        let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
+        let emitted = crate::acmd::preview_expression_fn(script, &script_move);
         verify_expression_move(&subject, script, &emitted, &mut report);
         if !sources.iter().any(|text| text.contains(&emitted)) {
             report.blocker(

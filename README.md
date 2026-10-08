@@ -744,15 +744,16 @@ installs looks exactly like one that does nothing.
 The **Project Hub** appears on launch — **Resume last / New / Open
 (`modproject.json`) / Import mod / Recent / Browse without project** — and
 reopens from **File → Project Hub** mid-session. One current project holds
-every edit: its path is remembered, **Save** (`Ctrl+S`) writes silently,
-**Save As** relocates, and Export/Load adopt the path they touched. Switching
-projects with unsaved edits warns first.
+every edit: its path is remembered, edits autosave to it about a second after
+they land, **Save As** relocates, and Export/Load adopt the path they touched.
+Switching projects only warns when there are edits autosave could not write
+yet (no project file, or a failed write).
 
 The **Mod** menu keeps hitbox, effect-spawn, authored effect, texture, and
 transplant edits together:
 
-- **Save / Save As** writes the current `modproject.json` silently (or asks once
-  when it has no file yet). If imported texture images are used, keep the
+- **Save As** relocates the current `modproject.json` (edits otherwise
+  autosave to its file). If imported texture images are used, keep the
   generated asset folder beside the JSON file.
 - **Export Project** writes a portable `modproject.json` and adopts its path.
   These editable files are exported separately from mod and developer files.
@@ -773,6 +774,50 @@ transplant edits together:
   same mod.
 - **Export Developer Files** writes rebuilt effect files to `effect_mod/` and
   the buildable Rust ACMD project to `acmd_source/`.
+
+### Model, animation, and swing preview
+
+Open **Project Files**, select a fighter costume, and import a model folder,
+`.nuanmb` animations, or `swing.prc`. Imports are copied into the project's
+`romfs/fighter/<fighter>/` folders. Edit those copies in your external tools;
+the original import locations are not watched.
+
+Start Visionary once before starting the game. It installs **Visionary Live
+Assets** in the configured emulator SD directory; enable that support package
+in ARCropolis and restart the game after its first installation. Subsequent
+asset reloads work within the match.
+
+Click **Reload asset preview** while connected to the game. A temporary hidden
+Alucard carrier loads the edited resources into memory and then retires. The main
+fighter uses the loaded model, textures, animations, and swing resources through
+its own native modules. Its gameplay scripts continue running on the same fighter.
+**Stop preview** restores the original resources; reloading restores them before
+loading the next edited snapshot.
+
+Import only the files you changed: model components, textures, animations, or
+swing parameters. Missing files come from the selected costume's vanilla dump.
+The dump must include its complete model and motion folders, including
+`motion_list.bin`. Animation filenames must match the entries they replace in
+that list, just as in an exported mod. When supplying a new skeleton, retain the
+fighter's vanilla bones so its motion set remains compatible.
+
+Preview copies use a reusable pool of 512 textures and 2,048 animation resources;
+materials, embedded texture names, and motion references are remapped together.
+The project's original names and files remain intact for mod export. Reloading
+restores the fighter before loading the next immutable snapshot.
+Keep the ordinary item slot empty when starting a preview; the slot is released
+after loading and remains usable during the preview. Do not
+spawn a normal Alucard assist while previewing, since it shares the carrier's
+resource graph.
+
+The status distinguishes queued files, owner retirement, loading, and a ready
+preview. A successful file copy alone does not mean the game has reloaded its
+resources. This preview requires the matching Visionary plugin and the configured
+emulator SD directory. Save your work before testing it in-game.
+
+Preview snapshots are immutable and old generations are reclaimed after the
+plugin acknowledges retirement. Staging stops if its SD cache reaches the safety
+limit; stop the game before manually clearing that cache.
 
 ## Additional tools
 

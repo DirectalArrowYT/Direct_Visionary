@@ -3,10 +3,16 @@
 //! The editor scrubs. A conventional particle system steps state forward a frame at a time and
 //! cannot answer "what does frame 30 look like" without having run frames 0..29 first, so
 //! dragging the playhead backwards either shows the wrong thing or forces a replay from the
-//! start of the move. Everything here is therefore a pure function of the particle's age:
-//! position is `p0 + v0·t + ½g·t²`, and every random quantity comes from hashing the particle's
-//! identity rather than from a running generator. Scrub anywhere, get the same answer, in the
-//! same time.
+//! start of the move. Everything here is therefore a pure function of the particle's age, and
+//! every random quantity comes from hashing the particle's identity rather than from a running
+//! generator. Scrub anywhere, get the same answer, in the same time.
+//!
+//! The rules themselves -- when an emitter fires, how many particles a firing makes, what each
+//! random percentage does, how drag and gravity step -- are the game's own, read out of the
+//! particle library in the 13.0.3 executable (NintendoWare Vfx, see
+//! `research/decomp/ssbu-re`). Where a comment gives an address, that is the function the rule
+//! was read from. The game steps a frame at a time; the forms here are the sums of those steps,
+//! so they agree with it on whole frames and interpolate between them.
 //!
 //! That constraint rules out anything path-dependent — collision, turbulence that integrates,
 //! drag applied per step — and those are the parts this deliberately does not model. What it
@@ -47,12 +53,29 @@ fn hashed_signed(seed: u64, salt: u64) -> f32 {
 /// field the next time a row is inserted.
 #[derive(Debug, Clone)]
 pub struct EmitterSim {
+    /// Particles per firing, not per frame: the emitter fires every `interval + 1` frames and
+    /// each firing makes this many at once (0x8d340). Fractions carry over to the next firing.
     pub rate: f32,
+    /// Percentage a firing's count may fall short by. One-sided, as every percentage here is.
     pub rate_random: f32,
+    /// Frames skipped between firings. Zero fires every frame.
     pub interval: f32,
+    /// Up to this many extra whole frames added to each gap (0x88750).
+    pub interval_random: f32,
     pub emission_start: f32,
     pub emission_duration: f32,
+    /// Whether the emitter stops after `emission_duration`. An emitter without this set keeps
+    /// firing for as long as the effect lives, whatever its duration says. `None` when the file
+    /// does not carry the flag, which falls back to "stops if it has a duration".
+    pub is_one_time: Option<bool>,
+    /// Radius of a random shell around the spawn point: a unit direction times this, not a
+    /// box.
     pub position_random: f32,
+    /// Per-frame multiplier on velocity. 1 is no drag.
+    pub air_res: f32,
+    /// Symmetric spread on how far a particle travels per frame for its velocity: each one
+    /// moves at `1 +- this` of the common pace for its whole life.
+    pub momentum_random: f32,
     pub gravity: glam::Vec3,
     pub life: f32,
     pub life_random: f32,
@@ -61,6 +84,12 @@ pub struct EmitterSim {
     pub designated_dir_scale: f32,
     pub diffusion: glam::Vec3,
     pub velocity_random: f32,
+    /// Half-angle, in degrees, of a cone around the designated direction that the directed
+    /// speed is spread over. Zero keeps every particle exactly on the direction.
+    pub diffusion_dir_angle: f32,
+    /// Speed outward from the emitter's Y axis, taken from where in the shape the particle
+    /// was born.
+    pub xz_diffusion: f32,
     pub scale: glam::Vec3,
     /// Particle size over its own life: (frame, xyz). This is the PARTICLE's scale, distinct
     /// from `scale` above which is the emitter's — reading the emitter's as the particle's
@@ -83,9 +112,11 @@ pub struct EmitterSim {
     pub uv_scroll_add: glam::Vec2,
     pub uv_scale: glam::Vec2,
     pub uv_scale_add: glam::Vec2,
-    /// The shape particles are born in: nw::eft's volume enum. 0 point, 1 circle,
-    /// 2 circle-same-divide, 3 filled circle, 4 sphere, 5 sphere-same-divide, 7 filled sphere,
-    /// 8 cylinder, 9 filled cylinder, 12 line, 13 line-same-divide.
+    /// The shape particles are born in, as the game's own table at 0x4f48c30 orders them:
+    /// 0 point, 1 circle, 2 circle-same-divide, 3 filled circle, 4 sphere,
+    /// 5 sphere-same-divide, 6 sphere-same-divide-64, 7 filled sphere, 8 cylinder,
+    /// 9 filled cylinder, 10 box, 11 filled box, 12 line, 13 line-same-divide, 14 rectangle,
+    /// 15 primitive.
     ///
     /// Half the corpus is a point and the rest is mostly circles and spheres. The "same
     /// divide" variants space their particles evenly around the sweep instead of scattering
@@ -99,12 +130,26 @@ pub struct EmitterSim {
     pub sweep_longitude: f32,
     pub sweep_latitude: f32,
     pub sweep_start: f32,
+    /// How a sphere is cut down: 0 by longitude (a wedge), 1 by latitude (a cap, around
+    /// `latitude_dir`).
+    pub arc_type: i64,
+    /// Which way a latitude cap points: +X, -X, +Y, -Y, +Z, -Z.
+    pub latitude_dir: i64,
     /// For the line shapes: how long, and where its centre sits.
     pub line_length: f32,
     pub line_center: f32,
-    /// Inner edge of a filled shape, as a fraction of the radius: 1.0 fills it to the middle,
-    /// 0.2 leaves a hole, which is how a ring of fire keeps its hole.
+    /// How much of a filled shape's radius is filled, from the rim inwards: 1.0 fills it to
+    /// the middle, 0.2 leaves a hole 0.8 of the radius wide, which is how a ring of fire keeps
+    /// its hole.
     pub caliber_ratio: f32,
+    /// Start the sweep at a random angle each firing instead of at `sweep_start`.
+    pub sweep_start_random: bool,
+    /// Angular jitter, radians either way, on the evenly divided circle's positions.
+    pub surface_pos_rand: f32,
+    /// How many positions the evenly divided circle and line have, and the percentage a firing
+    /// may fall short of that. A firing makes `rate` particles for each position.
+    pub num_divide_circle: (u32, f32),
+    pub num_divide_line: (u32, f32),
     /// The particle's size in world units, before its curve and the emitter's scale.
     ///
     /// This is the one that carries the data: across ef_common it runs 0.1 to 300, while the
@@ -214,9 +259,19 @@ pub struct Slots {
     rate: Option<usize>,
     rate_random: Option<usize>,
     interval: Option<usize>,
+    interval_random: Option<usize>,
     emission_start: Option<usize>,
     emission_duration: Option<usize>,
+    is_one_time: Option<usize>,
     position_random: Option<usize>,
+    air_res: Option<usize>,
+    momentum_random: Option<usize>,
+    diffusion_dir_angle: Option<usize>,
+    xz_diffusion: Option<usize>,
+    sweep_start_random: Option<usize>,
+    surface_pos_rand: Option<usize>,
+    num_divide_circle: [Option<usize>; 2],
+    num_divide_line: [Option<usize>; 2],
     gravity_scale: Option<usize>,
     gravity_dir: [Option<usize>; 3],
     life: Option<usize>,
@@ -234,9 +289,12 @@ pub struct Slots {
     uv_scale_add: [Option<usize>; 2],
     volume_type: Option<usize>,
     volume_radius: [Option<usize>; 3],
+    volume_form_scale: [Option<usize>; 3],
     sweep_longitude: Option<usize>,
     sweep_latitude: Option<usize>,
     sweep_start: Option<usize>,
+    arc_type: Option<usize>,
+    latitude_dir: Option<usize>,
     line_length: Option<usize>,
     line_center: Option<usize>,
     caliber_ratio: Option<usize>,
@@ -273,6 +331,24 @@ impl Slots {
             rate: at("emission.rate"),
             rate_random: at("emission.rate_random"),
             interval: at("emission.interval"),
+            interval_random: at("emission.interval_random"),
+            is_one_time: at("emission.is_one_time"),
+            air_res: at("emitter_static.air_res"),
+            momentum_random: at("particle_data.momentum_random"),
+            diffusion_dir_angle: at("particle_velocity.diffusion_dir_angle"),
+            xz_diffusion: at("particle_velocity.xz_diffusion"),
+            sweep_start_random: at("shape_info.sweep_start_random"),
+            arc_type: at("shape_info.arc_type"),
+            latitude_dir: at("shape_info.volume_latitude_dir"),
+            surface_pos_rand: at("shape_info.volume_surface_pos_rand"),
+            num_divide_circle: [
+                at("shape_info.num_divide_circle"),
+                at("shape_info.num_divide_circle_random"),
+            ],
+            num_divide_line: [
+                at("shape_info.num_divide_line"),
+                at("shape_info.num_divide_line_random"),
+            ],
             emission_start: at("emission.start"),
             emission_duration: at("emission.duration"),
             position_random: at("emission.position_random"),
@@ -354,6 +430,11 @@ impl Slots {
                 at("shape_info.volume_radius_x"),
                 at("shape_info.volume_radius_y"),
                 at("shape_info.volume_radius_z"),
+            ],
+            volume_form_scale: [
+                at("shape_info.volume_form_scale_x"),
+                at("shape_info.volume_form_scale_y"),
+                at("shape_info.volume_form_scale_z"),
             ],
             sweep_longitude: at("shape_info.sweep_longitude"),
             sweep_latitude: at("shape_info.sweep_latitude"),
@@ -440,9 +521,30 @@ impl EmitterSim {
             rate: get(slots.rate).unwrap_or(1.0).max(0.0),
             rate_random: get(slots.rate_random).unwrap_or(0.0),
             interval: get(slots.interval).unwrap_or(0.0).max(0.0),
+            interval_random: get(slots.interval_random).unwrap_or(0.0).max(0.0),
             emission_start: get(slots.emission_start).unwrap_or(0.0),
             emission_duration: get(slots.emission_duration).unwrap_or(0.0),
+            is_one_time: get(slots.is_one_time).map(|v| v != 0.0),
             position_random: get(slots.position_random).unwrap_or(0.0),
+            // Zero is a real setting -- a handful of emitters use it to throw a particle one
+            // step and leave it to gravity -- so only a missing field means "no drag".
+            air_res: get(slots.air_res).unwrap_or(1.0).max(0.0),
+            momentum_random: get(slots.momentum_random).unwrap_or(0.0),
+            diffusion_dir_angle: get(slots.diffusion_dir_angle).unwrap_or(0.0),
+            xz_diffusion: get(slots.xz_diffusion).unwrap_or(0.0),
+            sweep_start_random: get(slots.sweep_start_random).unwrap_or(0.0) != 0.0,
+            arc_type: get(slots.arc_type).unwrap_or(0.0) as i64,
+            // Unset is +Y, the pole the cap is built around.
+            latitude_dir: get(slots.latitude_dir).unwrap_or(2.0) as i64,
+            surface_pos_rand: get(slots.surface_pos_rand).unwrap_or(0.0),
+            num_divide_circle: (
+                get(slots.num_divide_circle[0]).unwrap_or(1.0).max(1.0) as u32,
+                get(slots.num_divide_circle[1]).unwrap_or(0.0),
+            ),
+            num_divide_line: (
+                get(slots.num_divide_line[0]).unwrap_or(1.0).max(1.0) as u32,
+                get(slots.num_divide_line[1]).unwrap_or(0.0),
+            ),
             gravity: vec3(&slots.gravity_dir) * gravity_scale,
             life: get(slots.life).unwrap_or(20.0).max(1.0),
             life_random: get(slots.life_random).unwrap_or(0.0),
@@ -494,7 +596,13 @@ impl EmitterSim {
                 (axis(slots.uv_div[0]), axis(slots.uv_div[1]))
             },
             volume_type: get(slots.volume_type).unwrap_or(0.0) as i64,
-            volume_radius: vec3(&slots.volume_radius),
+            // The shape's own per-axis stretch multiplies its radius (0x8dc80).
+            volume_radius: vec3(&slots.volume_radius)
+                * glam::Vec3::new(
+                    get(slots.volume_form_scale[0]).unwrap_or(1.0),
+                    get(slots.volume_form_scale[1]).unwrap_or(1.0),
+                    get(slots.volume_form_scale[2]).unwrap_or(1.0),
+                ),
             sweep_longitude: get(slots.sweep_longitude).unwrap_or(std::f32::consts::TAU),
             sweep_latitude: get(slots.sweep_latitude).unwrap_or(std::f32::consts::PI),
             sweep_start: get(slots.sweep_start).unwrap_or(0.0),
@@ -569,26 +677,113 @@ impl EmitterSim {
         }
     }
 
-    /// How many frames this emitter keeps producing for. Zero duration means "as long as the
-    /// effect runs", which is how a continuous emitter (a flame, a trail) is expressed.
+    /// How many frames this emitter keeps firing for.
+    ///
+    /// Only a one-time emitter stops (0x8dc80): it fires while its clock is short of
+    /// `start + duration`, so a duration of 1 is a single firing. Anything else runs until the
+    /// effect is removed. A one-time emitter that has made nothing yet keeps trying past its
+    /// end, so even a duration of 0 fires once -- see [`bursts`].
     fn emission_span(&self) -> f32 {
-        if self.emission_duration > 0.0 {
-            self.emission_duration
-        } else {
-            f32::INFINITY
+        match self.is_one_time {
+            Some(true) => self.emission_duration.max(0.0),
+            Some(false) => f32::INFINITY,
+            None if self.emission_duration > 0.0 => self.emission_duration,
+            None => f32::INFINITY,
         }
     }
 
-    /// Frames between births. `interval` wins when set; otherwise the rate is per frame.
-    fn birth_step(&self) -> f32 {
-        if self.interval > 0.0 {
-            self.interval
-        } else if self.rate > 0.0 {
-            1.0 / self.rate
-        } else {
-            1.0
-        }
+    /// How many positions an evenly divided shape has on this firing. `None` for every other
+    /// shape.
+    fn divisions(&self, unit: f32) -> Option<u32> {
+        let (count, random) = match self.volume_type {
+            2 => self.num_divide_circle,
+            13 => self.num_divide_line,
+            _ => return None,
+        };
+        let short = (unit * random * 0.01 * count as f32) as u32;
+        Some(count.saturating_sub(short).max(1))
     }
+}
+
+/// One firing of an emitter: when, and which particles it made.
+struct Burst {
+    /// Frames after the emitter's start.
+    time: f32,
+    /// Index of its first particle among all the emitter has made.
+    first: u64,
+    count: u32,
+    /// Positions of an evenly divided shape on this firing.
+    divisions: u32,
+    /// The firing's own random number, shared by its particles (a random sweep start).
+    unit: f32,
+}
+
+/// Every firing up to `until` frames after the emitter's start, oldest first.
+///
+/// The game's loop (0x8d340), run forward: when the gap has elapsed, add the rate -- less a
+/// random percentage -- to a running total, emit its whole part, keep the fraction, and draw
+/// the next gap. Walked from the start because both the fraction and a random gap depend on
+/// everything before them; it is a few additions per firing.
+fn bursts(sim: &EmitterSim, until: f32, seed: u64) -> Vec<Burst> {
+    let span = sim.emission_span();
+    let mut out = Vec::new();
+    let mut time = 0.0f32;
+    let mut saving = 0.0f32;
+    let mut first = 0u64;
+    let mut index = 0u64;
+    // Past its end a one-time emitter still fires if it has not managed a particle yet,
+    // which is what guarantees a rate below one, or a duration of zero, shows something.
+    while time <= until && (time < span || out.is_empty()) && out.len() < MAX_BURSTS {
+        let unit = hashed(seed, index ^ 0xb0_0000);
+        saving += sim.rate * (1.0 - sim.rate_random / 100.0 * hashed(seed, index ^ 0xb1_0000));
+        saving = saving.max(0.0);
+        let whole = saving as u32;
+        saving -= whole as f32;
+        let divisions = sim.divisions(unit);
+        let count = whole.saturating_mul(divisions.unwrap_or(1));
+        if count > 0 {
+            out.push(Burst {
+                time,
+                first,
+                count,
+                divisions: divisions.unwrap_or(1),
+                unit,
+            });
+            first += count as u64;
+        }
+        let extra = (hashed(seed, index ^ 0xb2_0000) * sim.interval_random).floor();
+        time += sim.interval + 1.0 + extra;
+        index += 1;
+    }
+    out
+}
+
+/// Where a particle is after `age` frames, relative to its spawn point, and its velocity then.
+///
+/// The game's step (0x95370) is, each frame: move by the velocity, scale the velocity by the
+/// drag, add gravity. Summed over `n` whole frames that is a geometric series, written out
+/// here; between frames the two neighbouring sums are blended, which keeps a scrubbed
+/// half-frame on the path the game's own frames lie on.
+fn travel(v0: glam::Vec3, gravity: glam::Vec3, drag: f32, age: f32) -> (glam::Vec3, glam::Vec3) {
+    let undamped = (drag - 1.0).abs() < 1e-6;
+    let at = |n: f32| {
+        if undamped {
+            v0 * n + gravity * (n * (n - 1.0) * 0.5)
+        } else {
+            let sum = (1.0 - drag.powf(n)) / (1.0 - drag);
+            v0 * sum + gravity * ((n - sum) / (1.0 - drag))
+        }
+    };
+    let whole = age.max(0.0).floor();
+    let part = age.max(0.0) - whole;
+    let offset = at(whole).lerp(at(whole + 1.0), part);
+    let velocity = if undamped {
+        v0 + gravity * age
+    } else {
+        let decay = drag.powf(age);
+        v0 * decay + gravity * ((1.0 - decay) / (1.0 - drag))
+    };
+    (offset, velocity)
 }
 
 /// One particle, evaluated.
@@ -766,237 +961,322 @@ pub fn cell_uv(cell: u32, columns: u32, rows: u32) -> [f32; 4] {
 /// number of particles; the viewport has to stay interactive while scrubbing, and beyond a few
 /// hundred quads per emitter nothing further is distinguishable on screen.
 const MAX_PER_EMITTER: usize = 256;
+/// Firings walked per evaluation. Past this an emitter has been running for hours.
+const MAX_BURSTS: usize = 100_000;
+
+/// A uniformly random unit vector.
+fn unit_vector(seed: u64, id: u64, salt: u64) -> glam::Vec3 {
+    let y = hashed_signed(seed, id ^ salt);
+    let turn = hashed(seed, id ^ (salt + 1)) * std::f32::consts::TAU;
+    let ring = (1.0 - y * y).max(0.0).sqrt();
+    glam::Vec3::new(ring * turn.cos(), y, ring * turn.sin())
+}
+
+/// Where in the emitter's shape a particle is born, and the direction the shape throws it.
+///
+/// The game's shape functions return both: a position, and a velocity that is this direction
+/// times the emitter's all-direction speed. `slot` is the particle's place within its firing,
+/// which is what the evenly divided shapes space themselves by.
+///
+/// These are the game's own formulas (0x90c00 to 0x92e00), with two exceptions: the evenly
+/// divided spheres place particles from a lookup table and are scattered here instead, and
+/// the box, rectangle and primitive shapes are not modelled and spawn at the emitter.
+fn volume_spawn(
+    sim: &EmitterSim,
+    burst: &Burst,
+    slot: u32,
+    id: u64,
+    seed: u64,
+) -> (glam::Vec3, glam::Vec3) {
+    let unit = |salt: u64| hashed(seed, id ^ salt);
+    let radius = sim.volume_radius;
+    let start = if sim.sweep_start_random {
+        burst.unit * std::f32::consts::TAU
+    } else {
+        sim.sweep_start
+    };
+    // The sweep is centred on its start, not begun there.
+    let scattered = start + sim.sweep_longitude * (unit(0x81) - 0.5);
+    // Angle 0 lies along +Z and the sweep turns toward +X.
+    let on_circle = |angle: f32, reach: f32| {
+        let dir = glam::Vec3::new(angle.sin(), 0.0, angle.cos());
+        (
+            glam::Vec3::new(dir.x * radius.x, 0.0, dir.z * radius.z) * reach,
+            dir,
+        )
+    };
+
+    match sim.volume_type {
+        1 => on_circle(scattered, 1.0),
+        2 => {
+            // An arc puts a particle on each end, so it has one gap fewer than positions; a
+            // full turn would stack its two ends, so it keeps every gap.
+            let open = (sim.sweep_longitude - std::f32::consts::TAU).abs() > 1e-4;
+            let gaps = if open && burst.divisions > 1 {
+                burst.divisions - 1
+            } else {
+                burst.divisions
+            };
+            let angle = start + sim.sweep_longitude / gaps as f32 * slot as f32
+                - sim.sweep_longitude * 0.5
+                + sim.surface_pos_rand * hashed_signed(seed, id ^ 0x87);
+            on_circle(angle, 1.0)
+        }
+        3 | 9 => {
+            // Evenly over the ring between the hole and the rim.
+            let inner = 1.0 - sim.caliber_ratio;
+            let pick = unit(0x82);
+            let reach = (pick + (1.0 - pick) * inner * inner).max(0.0).sqrt();
+            let (mut position, dir) = on_circle(scattered, reach);
+            // On an ellipse the throw leans toward the long axis.
+            let mut thrown = dir * reach;
+            if radius.x > radius.z {
+                thrown.z *= radius.z / radius.x;
+            } else if radius.z > 0.0 {
+                thrown.x *= radius.x / radius.z;
+            }
+            if sim.volume_type == 9 {
+                position.y = hashed_signed(seed, id ^ 0x86) * radius.y;
+            }
+            (position, thrown.normalize_or_zero())
+        }
+        8 => {
+            let (mut position, dir) = on_circle(scattered, 1.0);
+            position.y = hashed_signed(seed, id ^ 0x86) * radius.y;
+            (position, dir)
+        }
+        4 | 5 | 6 | 7 => {
+            // Height is drawn evenly, which is what covers a sphere evenly. A longitude cut
+            // keeps the full height and narrows the turn; a latitude cut keeps the full turn
+            // and stops the height at the cap's edge.
+            let (turn, height) = if sim.arc_type == 1 {
+                let edge = sim.sweep_latitude.cos();
+                (
+                    unit(0x81) * std::f32::consts::TAU,
+                    1.0 - unit(0x83) * (1.0 - edge),
+                )
+            } else {
+                (scattered, hashed_signed(seed, id ^ 0x83))
+            };
+            let ring = (1.0 - height * height).max(0.0).sqrt();
+            let mut dir = glam::Vec3::new(ring * turn.sin(), height, ring * turn.cos());
+            if sim.arc_type == 1 {
+                let pole = match sim.latitude_dir {
+                    0 => glam::Vec3::X,
+                    1 => glam::Vec3::NEG_X,
+                    3 => glam::Vec3::NEG_Y,
+                    4 => glam::Vec3::Z,
+                    5 => glam::Vec3::NEG_Z,
+                    _ => glam::Vec3::Y,
+                };
+                dir = glam::Quat::from_rotation_arc(glam::Vec3::Y, pole) * dir;
+            }
+            // A filled sphere reaches from its hole to its rim (0x922c0).
+            let reach = if sim.volume_type == 7 {
+                unit(0x84).sqrt() * sim.caliber_ratio + 1.0 - sim.caliber_ratio
+            } else {
+                1.0
+            };
+            (dir * radius * reach, dir)
+        }
+        12 | 13 => {
+            // Along Z. `line_center` slides the line: 0 centres it on the emitter.
+            let fraction = if sim.volume_type == 13 {
+                if burst.divisions > 1 {
+                    slot as f32 / (burst.divisions - 1) as f32
+                } else {
+                    0.5
+                }
+            } else {
+                unit(0x81)
+            };
+            let length = sim.line_length;
+            let z = length * fraction - 0.5 * (length + length * sim.line_center);
+            (glam::Vec3::new(0.0, 0.0, z), glam::Vec3::Z)
+        }
+        // A point, and the shapes not modelled: at the emitter, thrown in a random direction.
+        _ => (glam::Vec3::ZERO, unit_vector(seed, id, 0x21)),
+    }
+}
 
 /// Every particle this emitter has alive at `age_frames` since the effect started.
 ///
 /// `seed` distinguishes emitters so two emitters with identical settings do not produce
 /// identically jittered particles stacked on top of each other.
-/// Where in the emitter's shape a particle is born, relative to the emitter.
-///
-/// The engine's own spawn returns a direction beside the position -- which is why the outward
-/// velocity here follows the offset rather than pointing somewhere random.
-fn volume_offset(sim: &EmitterSim, id: u64, seed: u64) -> glam::Vec3 {
-    // 0..1 from the same hash the rest of the simulation uses. The salts start past the cell
-    // picker's 0x71: sharing one would tie a particle's place in the shape to which frame of
-    // the sheet it shows.
-    let unit = |salt: u64| hashed(seed, id ^ salt);
-    let radius = sim.volume_radius;
-
-    // The "same divide" shapes space particles evenly around the sweep. The count is the
-    // emitter's rate: a burst of 16 lands 16 points around the ring, and the next burst
-    // repeats it.
-    let divide = sim.rate.max(1.0);
-    let even = (id % divide as u64) as f32 / divide;
-    let fraction = match sim.volume_type {
-        2 | 5 | 13 => even,
-        _ => unit(0x81),
-    };
-    let angle = sim.sweep_start + fraction * sim.sweep_longitude;
-    // A filled shape reaches from its caliber to its edge. sqrt keeps a disc evenly covered
-    // rather than crowded at the middle.
-    let filled = |salt: u64| {
-        let outer = unit(salt).sqrt();
-        sim.caliber_ratio + (1.0 - sim.caliber_ratio) * outer
-    };
-
-    match sim.volume_type {
-        // Point, and anything this does not know: the emitter's own position.
-        0 => glam::Vec3::ZERO,
-        1 | 2 => glam::Vec3::new(angle.cos() * radius.x, 0.0, angle.sin() * radius.z),
-        3 => {
-            let reach = filled(0x82);
-            glam::Vec3::new(angle.cos() * radius.x * reach, 0.0, angle.sin() * radius.z * reach)
-        }
-        4 | 5 | 6 | 7 => {
-            let polar = unit(0x83) * sim.sweep_latitude;
-            let reach = if sim.volume_type == 7 { filled(0x84) } else { 1.0 };
-            glam::Vec3::new(
-                polar.sin() * angle.cos() * radius.x * reach,
-                polar.cos() * radius.y * reach,
-                polar.sin() * angle.sin() * radius.z * reach,
-            )
-        }
-        8 | 9 => {
-            let reach = if sim.volume_type == 9 { filled(0x85) } else { 1.0 };
-            glam::Vec3::new(
-                angle.cos() * radius.x * reach,
-                hashed_signed(seed, id ^ 0x86) * radius.y,
-                angle.sin() * radius.z * reach,
-            )
-        }
-        12 | 13 => glam::Vec3::new((fraction - 0.5) * sim.line_length + sim.line_center, 0.0, 0.0),
-        _ => glam::Vec3::ZERO,
-    }
-}
-
 pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle> {
     let mut particles = Vec::new();
     if age_frames < sim.emission_start {
         return particles;
     }
-
-    let step = sim.birth_step();
-    let span = sim.emission_span();
     let since_start = age_frames - sim.emission_start;
 
-    // Walk births backwards from the newest: the particles alive now are the most recent ones,
-    // so the cap drops the oldest rather than never reaching the newest.
-    let newest = (since_start / step).floor() as i64;
-    for index in (0..=newest).rev() {
-        if particles.len() >= MAX_PER_EMITTER {
+    // Walk firings backwards from the newest: the particles alive now are the most recent
+    // ones, so the cap drops the oldest rather than never reaching the newest.
+    'bursts: for burst in bursts(sim, since_start, seed).iter().rev() {
+        let age = since_start - burst.time;
+        // Nothing lives longer than the unshortened life, and firings are in order, so every
+        // older one is dead too.
+        if age >= sim.life.max(1.0) {
             break;
         }
-        let birth = index as f32 * step;
-        if birth > span {
-            continue;
-        }
-        let age = since_start - birth;
-        if age < 0.0 {
-            continue;
-        }
-        let id = index as u64;
-        // `life_random` is a PERCENTAGE of the particle's life, not a number of frames. Read
-        // as frames it produced lives from -6 to 34 on a 14-frame particle, which is where
-        // the corpus values (±20, ±30, ±50 against lives of 6 to 20) stop making sense.
-        let spread = 1.0 + (sim.life_random / 100.0) * hashed_signed(seed, id ^ 0x11);
-        let life = (sim.life * spread).max(1.0);
-        if age >= life {
-            // Births are ordered, so everything older than this is dead too.
-            break;
-        }
+        for slot in (0..burst.count).rev() {
+            if particles.len() >= MAX_PER_EMITTER {
+                break 'bursts;
+            }
+            let id = burst.first + slot as u64;
+            // A whole percentage of the life, taken off: 30 means anywhere from 70% to the
+            // full life, in steps of 1% (0x908d8). Never added.
+            let short = (hashed(seed, id ^ 0x11) * sim.life_random.max(0.0)).floor();
+            let life = (sim.life * (1.0 - short / 100.0)).max(1.0);
+            if age >= life {
+                continue;
+            }
 
-        // Initial velocity: an outward burst, a designated direction, and a per-axis spread.
-        // All three appear together in the data, so all three are summed rather than picked
-        // between.
-        // Where in the emitter's shape this particle starts.
-        let born = volume_offset(sim, id, seed);
-        // Outward means away from the emitter's centre, where the shape gives a direction to
-        // be away from: a ring's particles fly out along the ring's own radius rather than
-        // scattering. A point emitter has no such direction, so it keeps a random one.
-        let dir = born.normalize_or_zero();
-        let dir = if dir == glam::Vec3::ZERO {
-            glam::Vec3::new(
-                hashed_signed(seed, id ^ 0x21),
-                hashed_signed(seed, id ^ 0x22),
-                hashed_signed(seed, id ^ 0x23),
-            )
-            .normalize_or_zero()
-        } else {
-            dir
-        };
-        // A percentage, as `life_random` is: the corpus runs 5 to 90, commonly 50 and 30.
-        // Read as a fraction it multiplied a particle's speed by up to 91.
-        let jitter = 1.0 + (sim.velocity_random / 100.0) * hashed_signed(seed, id ^ 0x31);
-        let velocity = (dir * sim.all_direction
-            + sim.designated_dir * sim.designated_dir_scale
-            + sim.diffusion
+            let (born, thrown) = volume_spawn(sim, burst, slot, id, seed);
+            let mut velocity = thrown * sim.all_direction;
+            if sim.xz_diffusion != 0.0 {
+                // Away from the emitter's Y axis. A particle born on the axis has no "away",
+                // so it gets a random one.
+                let mut outward = glam::Vec3::new(born.x, 0.0, born.z);
+                if outward.length_squared() <= f32::EPSILON {
+                    outward = glam::Vec3::new(
+                        hashed_signed(seed, id ^ 0x24),
+                        0.0,
+                        hashed_signed(seed, id ^ 0x25),
+                    );
+                }
+                velocity += outward.normalize_or_zero() * sim.xz_diffusion;
+            }
+            // The directed part: straight along the designated direction, or spread over a
+            // cone about it. The cone is sampled about +Y and turned onto the direction.
+            let directed = if sim.diffusion_dir_angle == 0.0 {
+                sim.designated_dir
+            } else {
+                let floor = 1.0 - sim.diffusion_dir_angle / 90.0;
+                let turn = hashed(seed, id ^ 0x26) * std::f32::consts::TAU;
+                let y = floor + (1.0 - floor) * hashed(seed, id ^ 0x27);
+                let ring = (1.0 - y * y).max(0.0).sqrt();
+                let sample = glam::Vec3::new(ring * turn.cos(), y, ring * turn.sin());
+                let length = sim.designated_dir.length();
+                if length > f32::EPSILON {
+                    glam::Quat::from_rotation_arc(glam::Vec3::Y, sim.designated_dir / length)
+                        * sample
+                        * length
+                } else {
+                    glam::Vec3::ZERO
+                }
+            };
+            velocity += directed * sim.designated_dir_scale;
+            // A percentage taken off the speed, never added (0x8fd7c): 50 means anywhere from
+            // half speed to full. It scales the shape's throw and the directed part together.
+            velocity *= 1.0 - sim.velocity_random / 100.0 * hashed(seed, id ^ 0x31);
+            // The per-axis spread goes on afterwards, at full strength.
+            velocity += sim.diffusion
                 * glam::Vec3::new(
                     hashed_signed(seed, id ^ 0x41),
                     hashed_signed(seed, id ^ 0x42),
                     hashed_signed(seed, id ^ 0x43),
-                ))
-            * jitter;
+                );
 
-        let spawn = glam::Vec3::new(
-            hashed_signed(seed, id ^ 0x51),
-            hashed_signed(seed, id ^ 0x52),
-            hashed_signed(seed, id ^ 0x53),
-        ) * sim.position_random
-            + born;
+            let spawn = born + unit_vector(seed, id, 0x51) * sim.position_random;
+            let pace = 1.0 + sim.momentum_random * hashed_signed(seed, id ^ 0x54);
+            let (travelled, heading) = travel(velocity, sim.gravity, sim.air_res, age);
+            let offset = spawn + travelled * pace;
 
-        // Closed form, so any frame costs the same as any other.
-        let offset = spawn + velocity * age + sim.gravity * (0.5 * age * age);
+            let fraction = (age / life).clamp(0.0, 1.0);
+            let color = sample_keys(&sim.color0, age, life, [1.0, 1.0, 1.0, 1.0]);
+            let alpha = sample_keys(&sim.alpha0, age, life, [1.0, 1.0, 1.0, 1.0])[0];
 
-        let fraction = (age / life).clamp(0.0, 1.0);
-        let color = sample_keys(&sim.color0, age, life, [1.0, 1.0, 1.0, 1.0]);
-        let alpha = sample_keys(&sim.alpha0, age, life, [1.0, 1.0, 1.0, 1.0])[0];
-
-        // Fade the last quarter of life. The data expresses fades through flags and curves this
-        // does not read yet, and a particle that pops out of existence at full brightness is
-        // the single most obviously wrong thing on screen.
-        let fade = if fraction > 0.75 {
-            1.0 - (fraction - 0.75) / 0.25
-        } else {
-            1.0
-        };
-
-        // Which frame of the sheet this particle is on. The table is the sequence of cells;
-        // stepping it by age is what makes a smoke puff billow instead of showing every frame
-        // of its animation at once.
-        // Two ways a particle picks its cell. An emitter with a declared cell count animates
-        // through its table as it ages. One without -- the smoke family, which leaves `num` at
-        // 0 -- is picking a variant per particle instead, so every puff in a cloud is not the
-        // same drawing; that one is chosen by the particle's own hash so it stays put while
-        // the playhead moves.
-        let cell = if sim.pattern_cells > 1 && !sim.pattern_table.is_empty() {
-            let step = (age / sim.pattern_frequency.max(1.0)) as usize;
-            let entry = sim.pattern_table[step.min(sim.pattern_table.len() - 1)];
-            entry.max(0) as u32 % sim.pattern_cells
-        } else if sim.sheet_cells > 1 {
-            (hashed(seed, id ^ 0x71) * sim.sheet_cells as f32) as u32 % sim.sheet_cells
-        } else {
-            0
-        };
-
-        // The turn the emitter actually asks for, per axis, rather than a random one.
-        //
-        // A cloud still looks like a cloud through this, because a puff emitter carries a full
-        // turn in `rotate_init_rand_*` and gets its scatter from the data. An arc carries zeros
-        // for its initial angle and a velocity about Y, so it sweeps instead of sitting at a
-        // different random angle every time the frame is evaluated.
-        let mut spin = glam::Vec3::ZERO;
-        for axis in 0..3 {
-            if !sim.rotate_enabled[axis] {
-                continue;
-            }
-            let start = sim.rotate_init[axis]
-                + sim.rotate_init_rand[axis] * hashed_signed(seed, id ^ (0x61 + axis as u64));
-            let rate = sim.rotate_add[axis]
-                + sim.rotate_add_rand[axis] * hashed_signed(seed, id ^ (0x71 + axis as u64));
-            // `rotate_regist` damps the velocity each frame, so the total turn is a geometric
-            // series rather than rate*age. Outside (0, 1) it is either unset or not damping,
-            // and the undamped sum is the right reading of both.
-            let turned = if sim.rotate_regist > 0.0 && sim.rotate_regist < 1.0 {
-                let r = sim.rotate_regist;
-                rate * (1.0 - r.powf(age)) / (1.0 - r)
+            // Fade the last quarter of life. The data expresses fades through flags and curves
+            // this does not read yet, and a particle that pops out of existence at full
+            // brightness is the single most obviously wrong thing on screen.
+            let fade = if fraction > 0.75 {
+                1.0 - (fraction - 0.75) / 0.25
             } else {
-                rate * age
+                1.0
             };
-            spin[axis] = start + turned;
-        }
 
-        let curve = sample_scale(&sim.scale_keys, age, life);
-        particles.push(SimParticle {
-            offset,
-            // Emitter scale multiplies the particle's own curve, which is how the data is
-            // laid out: the curve is the shape of the size over life, the emitter scales it.
-            size: {
-                // Base size, the curve over life, and the emitter's own scale on top.
-                let base = sim.particle_scale.x.max(sim.particle_scale.y);
-                let spread = sim.scale_random.x.max(sim.scale_random.y) / 100.0;
-                let jitter = 1.0 + spread * hashed_signed(seed, id ^ 0x61);
-                (curve.x.max(curve.y) * base * jitter.max(0.0) * sim.scale.x.max(sim.scale.y))
-                    .max(0.01)
-            },
-            color: [
-                color[0] * sim.color_scale,
-                color[1] * sim.color_scale,
-                color[2] * sim.color_scale,
-                alpha * fade,
-            ],
-            rotation: spin.z,
-            spin,
-            cell,
-            // d/dt of `offset`. Taking the birth velocity instead would point every particle
-            // of a falling burst upwards for its whole life.
-            velocity: velocity + sim.gravity * age,
-            // Rates are per frame, so the animation at this age is its start plus rate x age.
-            uv_anim: {
-                let scroll = sim.uv_scroll + sim.uv_scroll_add * age;
-                let scale = sim.uv_scale + sim.uv_scale_add * age;
-                [scroll.x, scroll.y, scale.x, scale.y]
-            },
-        });
+            // Two ways a particle picks its cell. An emitter with a declared cell count
+            // animates through its table as it ages, which is what makes a smoke puff billow
+            // instead of showing every frame of its animation at once. One without -- the
+            // smoke family, which leaves `num` at 0 -- is picking a variant per particle
+            // instead, so every puff in a cloud is not the same drawing; that one is chosen by
+            // the particle's own hash so it stays put while the playhead moves.
+            let cell = if sim.pattern_cells > 1 && !sim.pattern_table.is_empty() {
+                let step = (age / sim.pattern_frequency.max(1.0)) as usize;
+                let entry = sim.pattern_table[step.min(sim.pattern_table.len() - 1)];
+                entry.max(0) as u32 % sim.pattern_cells
+            } else if sim.sheet_cells > 1 {
+                (hashed(seed, id ^ 0x71) * sim.sheet_cells as f32) as u32 % sim.sheet_cells
+            } else {
+                0
+            };
+
+            // The turn the emitter actually asks for, per axis, rather than a random one.
+            //
+            // A cloud still looks like a cloud through this, because a puff emitter carries a
+            // full turn in `rotate_init_rand_*` and gets its scatter from the data. An arc
+            // carries zeros for its initial angle and a velocity about Y, so it sweeps instead
+            // of sitting at a different random angle every time the frame is evaluated.
+            let mut spin = glam::Vec3::ZERO;
+            for axis in 0..3 {
+                if !sim.rotate_enabled[axis] {
+                    continue;
+                }
+                let start = sim.rotate_init[axis]
+                    + sim.rotate_init_rand[axis] * hashed_signed(seed, id ^ (0x61 + axis as u64));
+                let rate = sim.rotate_add[axis]
+                    + sim.rotate_add_rand[axis] * hashed_signed(seed, id ^ (0x71 + axis as u64));
+                // `rotate_regist` damps the velocity each frame, so the total turn is a
+                // geometric series rather than rate*age. Outside (0, 1) it is either unset or
+                // not damping, and the undamped sum is the right reading of both.
+                let turned = if sim.rotate_regist > 0.0 && sim.rotate_regist < 1.0 {
+                    let r = sim.rotate_regist;
+                    rate * (1.0 - r.powf(age)) / (1.0 - r)
+                } else {
+                    rate * age
+                };
+                spin[axis] = start + turned;
+            }
+
+            let curve = sample_scale(&sim.scale_keys, age, life);
+            // A percentage taken off the size, never added (0x90750). One draw sizes both
+            // axes when their percentages match, so a square stays square; when they differ
+            // each axis draws its own.
+            let shrink_x = 1.0 - sim.scale_random.x / 100.0 * hashed(seed, id ^ 0x91);
+            let shrink_y = if sim.scale_random.x == sim.scale_random.y {
+                shrink_x
+            } else {
+                1.0 - sim.scale_random.y / 100.0 * hashed(seed, id ^ 0x92)
+            };
+            // Base size, the curve over life, and the emitter's own scale on top, per axis.
+            let width = curve.x * sim.particle_scale.x * shrink_x.max(0.0) * sim.scale.x;
+            let height = curve.y * sim.particle_scale.y * shrink_y.max(0.0) * sim.scale.y;
+            particles.push(SimParticle {
+                offset,
+                size: width.max(height).max(0.01),
+                color: [
+                    color[0] * sim.color_scale,
+                    color[1] * sim.color_scale,
+                    color[2] * sim.color_scale,
+                    alpha * fade,
+                ],
+                rotation: spin.z,
+                spin,
+                cell,
+                // Where it is heading now rather than where it was thrown: taking the birth
+                // velocity would point every particle of a falling burst upwards for its
+                // whole life.
+                velocity: heading,
+                // Rates are per frame, so the animation at this age is its start plus rate x
+                // age.
+                uv_anim: {
+                    let scroll = sim.uv_scroll + sim.uv_scroll_add * age;
+                    let scale = sim.uv_scale + sim.uv_scale_add * age;
+                    [scroll.x, scroll.y, scale.x, scale.y]
+                },
+            });
+        }
     }
     particles
 }
@@ -1020,6 +1300,18 @@ mod tests {
             line_length: 0.0,
             line_center: 0.0,
             caliber_ratio: 1.0,
+            sweep_start_random: false,
+            arc_type: 0,
+            latitude_dir: 2,
+            surface_pos_rand: 0.0,
+            num_divide_circle: (1, 0.0),
+            num_divide_line: (1, 0.0),
+            is_one_time: None,
+            interval_random: 0.0,
+            air_res: 1.0,
+            momentum_random: 0.0,
+            diffusion_dir_angle: 0.0,
+            xz_diffusion: 0.0,
             particle_scale: glam::Vec3::ONE,
             scale_random: glam::Vec3::ZERO,
             color_scale: 1.0,
@@ -1146,19 +1438,20 @@ mod tests {
 
     #[test]
     fn the_same_divide_shapes_space_their_particles_evenly() {
-        // Type 2 is the circle that divides its sweep instead of scattering: a burst of `rate`
-        // particles lands `rate` evenly spaced points, which is what a ring reads as.
+        // Type 2 is the circle that divides its sweep instead of scattering: each firing puts
+        // `rate` particles on every one of its divisions, which is what a ring reads as.
         let mut sim = emitter();
         sim.volume_type = 2;
         sim.volume_radius = glam::Vec3::new(5.0, 0.0, 5.0);
-        sim.rate = 8.0;
+        sim.num_divide_circle = (8, 0.0);
+        sim.rate = 1.0;
+        sim.interval = 100.0;
         sim.position_random = 0.0;
         sim.all_direction = 0.0;
         sim.diffusion = glam::Vec3::ZERO;
         sim.gravity = glam::Vec3::ZERO;
-        // A frame in, so a whole burst of eight has been born.
         let particles = evaluate(&sim, 1.0, 7);
-        assert!(particles.len() >= 4, "need a burst to see the spacing, got {}", particles.len());
+        assert_eq!(particles.len(), 8, "one firing should fill all eight divisions");
         let mut angles: Vec<f32> = particles
             .iter()
             .map(|p| p.offset.z.atan2(p.offset.x).rem_euclid(std::f32::consts::TAU))
@@ -1198,7 +1491,7 @@ mod tests {
 
     #[test]
     fn scale_random_spreads_sizes_by_a_percentage() {
-        // 30 means 0.7x to 1.3x, not 30 units and not 30x.
+        // 30 means 0.7x to 1x -- taken off, never added -- not 30 units and not 30x.
         let mut sim = emitter();
         sim.particle_scale = glam::Vec3::splat(10.0);
         sim.scale_random = glam::Vec3::splat(30.0);
@@ -1209,7 +1502,7 @@ mod tests {
         assert!(high > low, "every particle came out the same size");
         for size in &sizes {
             assert!(
-                (7.0..=13.0).contains(size),
+                (7.0..=10.0).contains(size),
                 "{size} is outside the 30% the data asked for"
             );
         }
@@ -1291,14 +1584,14 @@ mod tests {
     #[test]
     fn particles_are_born_over_time_and_die_at_their_life() {
         let sim = emitter();
-        // Rate 2/frame, life 10 -> at most 20 alive once the stream is saturated.
-        assert!(evaluate(&sim, 0.0, 1).len() <= 1);
+        // Two a frame, life 10 -> exactly 20 alive once the stream is saturated.
+        assert_eq!(evaluate(&sim, 0.0, 1).len(), 2, "the first firing is on the first frame");
         let early = evaluate(&sim, 3.0, 1).len();
         let saturated = evaluate(&sim, 30.0, 1).len();
         assert!(early > 0, "nothing emitted after 3 frames");
         assert!(saturated > early, "the stream never grew: {early} -> {saturated}");
         assert!(
-            saturated <= 21,
+            saturated <= 20,
             "particles outliving their life: {saturated} alive at rate 2 life 10"
         );
     }
@@ -1309,7 +1602,8 @@ mod tests {
     #[test]
     fn the_particle_cap_keeps_the_newest_rather_than_the_oldest() {
         let mut sim = emitter();
-        sim.rate = 500.0;
+        // A hundred a frame, so the cap spans three firings rather than part of one.
+        sim.rate = 100.0;
         sim.life = 1000.0;
         let particles = evaluate(&sim, 100.0, 1);
         assert_eq!(particles.len(), MAX_PER_EMITTER);
@@ -1441,13 +1735,169 @@ mod tests {
         sim.rate = 1.0;
         sim.designated_dir_scale = 0.0;
         sim.gravity = glam::Vec3::new(0.0, -2.0, 0.0);
-        // The particle born at t=0 is the oldest; at age 5 it should have fallen ½·2·25 = 25.
+        // The game moves by the velocity and then adds gravity to it, so a particle at rest
+        // does not move on its first frame: after 5 frames it has fallen 0+2+4+6+8 = 20, not
+        // the 25 that half g t squared gives.
         let particles = evaluate(&sim, 5.0, 3);
         let oldest = particles
             .iter()
             .map(|particle| particle.offset.y)
             .fold(f32::INFINITY, f32::min);
-        assert!((oldest + 25.0).abs() < 0.001, "fell to {oldest}, expected -25");
+        assert!((oldest + 20.0).abs() < 0.001, "fell to {oldest}, expected -20");
+    }
+
+    #[test]
+    fn drag_shortens_how_far_a_particle_carries() {
+        let mut sim = emitter();
+        sim.rate = 1.0;
+        sim.interval = 100.0;
+        sim.gravity = glam::Vec3::ZERO;
+        sim.designated_dir = glam::Vec3::X;
+        sim.designated_dir_scale = 8.0;
+        sim.air_res = 0.5;
+        // 8 + 4 + 2 = 14 after three frames, and never past 16 however long it lives.
+        let three = evaluate(&sim, 3.0, 3)[0].offset.x;
+        assert!((three - 14.0).abs() < 1e-3, "travelled {three}, expected 14");
+        sim.life = 100.0;
+        let late = evaluate(&sim, 60.0, 3)[0].offset.x;
+        assert!((late - 16.0).abs() < 1e-3, "travelled {late}, expected to settle at 16");
+    }
+
+    #[test]
+    fn an_emitter_fires_its_whole_rate_every_interval_plus_one_frames() {
+        let mut sim = emitter();
+        sim.rate = 3.0;
+        sim.interval = 4.0;
+        sim.life = 1000.0;
+        // Firings at 0, 5 and 10, three particles each.
+        assert_eq!(evaluate(&sim, 0.0, 1).len(), 3);
+        assert_eq!(evaluate(&sim, 4.0, 1).len(), 3);
+        assert_eq!(evaluate(&sim, 5.0, 1).len(), 6);
+        assert_eq!(evaluate(&sim, 10.0, 1).len(), 9);
+    }
+
+    #[test]
+    fn a_fractional_rate_carries_over_between_firings() {
+        let mut sim = emitter();
+        sim.rate = 0.5;
+        sim.life = 1000.0;
+        // Half a particle a frame is one every second frame, not none.
+        assert_eq!(evaluate(&sim, 0.0, 1).len(), 0);
+        assert_eq!(evaluate(&sim, 1.0, 1).len(), 1);
+        assert_eq!(evaluate(&sim, 9.0, 1).len(), 5);
+    }
+
+    #[test]
+    fn only_a_one_time_emitter_stops_at_its_duration() {
+        let mut sim = emitter();
+        sim.rate = 1.0;
+        sim.life = 1000.0;
+        sim.emission_duration = 3.0;
+        sim.is_one_time = Some(true);
+        assert_eq!(evaluate(&sim, 50.0, 1).len(), 3, "frames 0, 1 and 2 fire; frame 3 does not");
+        sim.is_one_time = Some(false);
+        assert_eq!(evaluate(&sim, 50.0, 1).len(), 51, "a looping emitter ignores its duration");
+        // The commonest emitter in the game: one-time, and too short to fire on its own.
+        sim.is_one_time = Some(true);
+        sim.emission_duration = 0.0;
+        sim.rate = 4.0;
+        assert_eq!(evaluate(&sim, 50.0, 1).len(), 4, "it still fires exactly once");
+    }
+
+    #[test]
+    fn the_random_percentages_only_ever_take_away() {
+        let mut sim = emitter();
+        sim.rate = 40.0;
+        sim.interval = 1000.0;
+        sim.gravity = glam::Vec3::ZERO;
+        sim.designated_dir = glam::Vec3::X;
+        sim.designated_dir_scale = 10.0;
+        sim.velocity_random = 50.0;
+        sim.life = 100.0;
+        sim.life_random = 50.0;
+        // One frame in: each particle has moved exactly its own speed.
+        let speeds: Vec<f32> = evaluate(&sim, 1.0, 9).iter().map(|p| p.offset.x).collect();
+        assert_eq!(speeds.len(), 40);
+        let (low, high) = speeds
+            .iter()
+            .fold((f32::MAX, 0.0f32), |(l, h), &s| (l.min(s), h.max(s)));
+        assert!(low >= 5.0 - 1e-3 && high <= 10.0 + 1e-3, "speeds ran {low} to {high}");
+        assert!(high - low > 2.0, "the spread is missing: {low} to {high}");
+        // Lives run from half to full, so some are gone by 60 and all are by 100.
+        let at_60 = evaluate(&sim, 60.0, 9).len();
+        assert!(at_60 > 0 && at_60 < 40, "{at_60} of 40 alive at frame 60");
+        assert_eq!(evaluate(&sim, 49.0, 9).len(), 40, "none may die before half life");
+        assert!(evaluate(&sim, 100.0, 9).is_empty(), "none may outlive the full life");
+    }
+
+    #[test]
+    fn a_fully_filled_circle_reaches_its_centre_and_a_thin_one_keeps_its_hole() {
+        let mut sim = emitter();
+        sim.volume_type = 3;
+        sim.volume_radius = glam::Vec3::new(10.0, 0.0, 10.0);
+        sim.rate = 200.0;
+        sim.interval = 1000.0;
+        sim.gravity = glam::Vec3::ZERO;
+        sim.designated_dir_scale = 0.0;
+        let reach = |sim: &EmitterSim| {
+            evaluate(sim, 0.0, 4)
+                .iter()
+                .map(|p| p.offset.length())
+                .fold((f32::MAX, 0.0f32), |(l, h), r| (l.min(r), h.max(r)))
+        };
+        sim.caliber_ratio = 1.0;
+        let (inner, outer) = reach(&sim);
+        assert!(inner < 3.0 && outer <= 10.0 + 1e-3, "a full disc ran {inner} to {outer}");
+        sim.caliber_ratio = 0.2;
+        let (inner, outer) = reach(&sim);
+        assert!(inner >= 8.0 - 1e-3 && outer <= 10.0 + 1e-3, "a thin ring ran {inner} to {outer}");
+    }
+
+    #[test]
+    fn a_sphere_is_covered_evenly_and_a_latitude_cut_leaves_a_cap() {
+        let mut sim = emitter();
+        sim.volume_type = 4;
+        sim.volume_radius = glam::Vec3::splat(1.0);
+        sim.rate = 250.0;
+        sim.interval = 1000.0;
+        sim.gravity = glam::Vec3::ZERO;
+        sim.designated_dir_scale = 0.0;
+        // Evenly covered means height is evenly spread: its mean size is a half. Scattering
+        // the polar angle instead crowds the poles and gives about 0.64.
+        let heights: Vec<f32> = evaluate(&sim, 0.0, 6).iter().map(|p| p.offset.y).collect();
+        let mean = heights.iter().map(|y| y.abs()).sum::<f32>() / heights.len() as f32;
+        assert!((mean - 0.5).abs() < 0.06, "mean height {mean}");
+        // A 60 degree cap about -X: every particle at least half a radius out along -X.
+        sim.arc_type = 1;
+        sim.latitude_dir = 1;
+        sim.sweep_latitude = std::f32::consts::FRAC_PI_3;
+        for particle in evaluate(&sim, 0.0, 6) {
+            assert!(particle.offset.x <= -0.5 + 1e-3, "{:?} is outside the cap", particle.offset);
+        }
+    }
+
+    #[test]
+    fn a_line_lies_along_z_with_a_particle_on_each_end() {
+        let mut sim = emitter();
+        sim.volume_type = 13;
+        sim.line_length = 6.0;
+        sim.num_divide_line = (4, 0.0);
+        sim.rate = 1.0;
+        sim.interval = 1000.0;
+        sim.gravity = glam::Vec3::ZERO;
+        sim.designated_dir_scale = 0.0;
+        let mut along: Vec<f32> = evaluate(&sim, 0.0, 2)
+            .iter()
+            .map(|p| {
+                assert!(p.offset.x.abs() < 1e-4 && p.offset.y.abs() < 1e-4);
+                p.offset.z
+            })
+            .collect();
+        along.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(along.len(), 4);
+        for (got, want) in along.iter().zip([-3.0, -1.0, 1.0, 3.0]) {
+            assert!((got - want).abs() < 1e-4, "{along:?}");
+        }
     }
 
     #[test]
