@@ -199,11 +199,20 @@ pub fn verify_export_with_expression(
         // A costume-gated move ships the same body under `<name>_costume`, so the shipped
         // text is compared against both spellings. Dropping this check for gated moves would
         // stop verifying that the body reached disk at all.
-        let gated = crate::roster::scaffold::costume_arm_source(&emitted);
-        if !sources
+        //
+        // A gate also pins the function to the name its donor script declares, which can be
+        // the motion's other spelling (`game_attacks3s` where an ungated export would write
+        // `game_attacks3`). The gates are not passed in here, so either spelling counts.
+        let shipped = crate::acmd::move_script_aliases(move_name)
             .iter()
-            .any(|text| text.contains(&emitted) || text.contains(&gated))
-        {
+            .any(|alias| {
+                let emitted = crate::acmd::preview_game_fn(script, alias);
+                let gated = crate::roster::scaffold::costume_arm_source(&emitted);
+                sources
+                    .iter()
+                    .any(|text| text.contains(&emitted) || text.contains(&gated))
+            });
+        if !shipped {
             report.blocker(
                 &subject,
                 "the generated hitbox script is missing from the exported project",
