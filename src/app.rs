@@ -43,6 +43,371 @@ fn rebuild_linked_acmd_source_index(
     Ok(has_scripts)
 }
 
+/// Format the result of one explicit source-sync request.
+///
+/// A source category can be present while none of its edits are safe to write. Reporting that
+/// case as `Synced 0 ...` made a refused effect or hitbox change look successful, especially when
+/// a later source rescan replaced this message. Keep the wording tied to an actual file write so
+/// the status strip tells the user whether anything reached disk.
+fn source_sync_status(
+    fighter: &str,
+    move_name: &str,
+    ran: bool,
+    changed: usize,
+    files: usize,
+    notes: &[String],
+) -> String {
+    let mut status = if !ran {
+        format!("{fighter}/{move_name} is not in the linked project — nothing to sync")
+    } else if files == 0 {
+        if notes.is_empty() {
+            format!("No source changes to sync for {fighter}/{move_name}")
+        } else {
+            format!("No source changes written for {fighter}/{move_name}")
+        }
+    } else {
+        format!(
+            "Synced {changed} source change{} into {files} file{}",
+            if changed == 1 { "" } else { "s" },
+            if files == 1 { "" } else { "s" },
+        )
+    };
+    if !notes.is_empty() {
+        status.push_str(" — ");
+        status.push_str(&notes.join("; "));
+    }
+    status
+}
+
+/// Match one effect call from the source snapshot to the editor's call that owns it.
+///
+/// The editor keeps its vector in the order in which the move was first loaded. A source timing
+/// write can move one frame block across another call, so that order is no longer a safe source
+/// identity on the next sync. These fields are the structural parts of an effect call; transform,
+/// modifier, and timing values are deliberately left out so a pending edit still maps to the
+/// source call it came from.
+fn effect_source_identity_matches(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    let same_kind = match (&source.color, &candidate.color) {
+        (Some(left), Some(right)) => {
+            source.spawn_func == candidate.spawn_func
+                && left.transition.is_some() == right.transition.is_some()
+                && left.rgba.is_some() == right.rgba.is_some()
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    let same_control = match (&source.control, &candidate.control) {
+        (Some(left), Some(right)) => left.command_name() == right.command_name(),
+        (None, None) => true,
+        _ => false,
+    };
+    same_kind
+        && same_control
+        && source
+            .effect_name
+            .eq_ignore_ascii_case(&candidate.effect_name)
+        && source.effect_name_alt == candidate.effect_name_alt
+        && source.spawn_func == candidate.spawn_func
+        && source.bone_name.eq_ignore_ascii_case(&candidate.bone_name)
+        && source.follows_bone == candidate.follows_bone
+        && source.trail_command == candidate.trail_command
+        && source.trail_bone2 == candidate.trail_bone2
+        && source.raw_line.is_some() == candidate.raw_line.is_some()
+}
+
+fn effect_source_values_match(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    let mut source = source.clone();
+    let mut candidate = candidate.clone();
+    // Removing a call is represented in the editor by a disabled entry. The authored source
+    // call remains present, so the disabled bit cannot be part of source identity.
+    source.disabled = false;
+    candidate.disabled = false;
+    source == candidate
+}
+
+fn effect_source_timing_matches(
+    source: &crate::data::EffectCall,
+    candidate: &crate::data::EffectCall,
+) -> bool {
+    source.active_start == candidate.active_start
+        && (!source.follows_bone || source.active_end == candidate.active_end)
+}
+
+/// Reorder the editor's effect list into the order of the source currently on disk.
+///
+/// `pristine` remains the editor's native/live baseline. `source` is only the per-write source
+/// snapshot; it is never installed as a live baseline. A source call must have one best owner.
+/// Ambiguous or missing owners are refused so a repeated sync cannot retune a neighbouring
+/// repeated call by position.
+fn effect_calls_in_source_order(
+    source: &[crate::data::EffectCall],
+    pristine: &[crate::data::EffectCall],
+    edited: &[crate::data::EffectCall],
+) -> Result<Vec<crate::data::EffectCall>, String> {
+    let source: Vec<_> = source
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let pristine: Vec<_> = pristine
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let edited: Vec<_> = edited
+        .iter()
+        .cloned()
+        .map(crate::data::EffectCall::normalized_timing)
+        .collect();
+    let mut used = vec![false; edited.len()];
+    let mut ordered = Vec::with_capacity(edited.len());
+
+    // The unchanged source order is authoritative on the first sync. This also handles repeated
+    // byte-identical calls: their ordinal is known because the source and pristine snapshots are
+    // still the same list.
+    if source.len() == pristine.len()
+        && source
+            .iter()
+            .zip(&pristine)
+            .all(|(source_call, before)| effect_source_values_match(source_call, before))
+    {
+        let mut ordered = edited.clone();
+        for call in &mut ordered {
+            call.normalize_timing();
+        }
+        return Ok(ordered);
+    }
+
+    for source_call in &source {
+        let mut exact = Vec::new();
+        let mut timing = Vec::new();
+        let mut structural = Vec::new();
+        for (index, candidate) in edited.iter().enumerate() {
+            if !effect_source_identity_matches(source_call, candidate) {
+                continue;
+            }
+            structural.push(index);
+            let source_matches_pristine = pristine
+                .get(index)
+                .is_some_and(|before| effect_source_values_match(source_call, before));
+            let source_matches_edited = effect_source_values_match(source_call, candidate);
+            let source_matches_pristine_timing = pristine
+                .get(index)
+                .is_some_and(|before| effect_source_timing_matches(source_call, before));
+            let source_matches_edited_timing = effect_source_timing_matches(source_call, candidate);
+            if source_matches_pristine || source_matches_edited {
+                exact.push(index);
+            } else if source_matches_pristine_timing || source_matches_edited_timing {
+                timing.push(index);
+            }
+        }
+        let mut verified = exact;
+        verified.extend(timing);
+        verified.sort_unstable();
+        verified.dedup();
+        let candidates = if verified.len() == 1 {
+            verified
+        } else if verified.is_empty() && structural.len() == 1 {
+            structural
+        } else {
+            Vec::new()
+        };
+        let Some(index) = candidates.first().copied() else {
+            return Err(format!(
+                "could not identify one source owner for effect at frame {}",
+                source_call.active_start
+            ));
+        };
+        if used[index] {
+            return Err(format!(
+                "multiple source calls claim editor effect #{}",
+                index + 1
+            ));
+        }
+        used[index] = true;
+        ordered.push(edited[index].clone());
+    }
+
+    // Calls beyond the pristine list are editor-authored additions. The source writer expects
+    // them after the existing source calls so it can use its conservative insertion path.
+    for (index, call) in edited.iter().enumerate() {
+        if !used[index] {
+            if index < pristine.len() {
+                return Err(format!(
+                    "editor effect #{} has no matching source call",
+                    index + 1
+                ));
+            }
+            ordered.push(call.clone());
+        }
+    }
+    Ok(ordered)
+}
+
+#[cfg(test)]
+mod source_sync_status_tests {
+    use super::{effect_calls_in_source_order, source_sync_status};
+
+    #[test]
+    fn source_sync_status_distinguishes_written_and_refused_edits() {
+        assert_eq!(
+            source_sync_status("mario", "attack_air_n", true, 0, 0, &[]),
+            "No source changes to sync for mario/attack_air_n"
+        );
+        assert_eq!(
+            source_sync_status(
+                "mario",
+                "attack_air_n",
+                true,
+                0,
+                0,
+                &["effect name is structural".into()]
+            ),
+            "No source changes written for mario/attack_air_n — effect name is structural"
+        );
+        assert_eq!(
+            source_sync_status("mario", "attack_air_n", true, 2, 1, &[]),
+            "Synced 2 source changes into 1 file"
+        );
+    }
+
+    #[test]
+    fn repeated_effect_sync_follows_a_crossing_retime_without_replacing_pristine() {
+        let source = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+    frame(agent.lua_state_agent, 15.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("second"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let pristine = crate::acmd::parse_effect_script(source).to_effect_calls();
+        assert_eq!(pristine.len(), 2);
+        let pristine_snapshot = pristine.clone();
+        let mut first_sync = pristine.clone();
+        first_sync[0].active_start = 25;
+        first_sync[1].active_start = 10;
+        let (after_first, report) = crate::acmd_src::rewrite_effect_calls(
+            source,
+            "test/effect_test",
+            &pristine,
+            &first_sync,
+        )
+        .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+
+        let source_after_first = crate::acmd::parse_effect_script(&after_first).to_effect_calls();
+        assert_eq!(source_after_first[0].effect_name, "second");
+        assert_eq!(source_after_first[1].effect_name, "first");
+        let ordered =
+            effect_calls_in_source_order(&source_after_first, &pristine, &first_sync).unwrap();
+        assert_eq!(ordered[0].effect_name, "second");
+        assert_eq!(ordered[1].effect_name, "first");
+
+        // A second panel edit targets the original first call after the source has reordered it.
+        // Passing the editor vector positionally would write this scale into `second`.
+        let mut second_sync = first_sync.clone();
+        second_sync[0].scale = 2.5;
+        let ordered_again =
+            effect_calls_in_source_order(&source_after_first, &pristine, &second_sync).unwrap();
+        let (after_second, report) = crate::acmd_src::rewrite_effect_calls(
+            &after_first,
+            "test/effect_test",
+            &source_after_first,
+            &ordered_again,
+        )
+        .unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let final_calls = crate::acmd::parse_effect_script(&after_second).to_effect_calls();
+        assert_eq!(final_calls[0].effect_name, "second");
+        assert_eq!(final_calls[0].scale, 1.0);
+        assert_eq!(final_calls[1].effect_name, "first");
+        assert_eq!(final_calls[1].scale, 2.5);
+        assert_eq!(
+            pristine, pristine_snapshot,
+            "native/live pristine was changed"
+        );
+    }
+
+    #[test]
+    fn syncing_an_added_effect_twice_keeps_one_source_call_and_the_native_baseline() {
+        let source = r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("first"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#;
+        let native = crate::acmd::parse_effect_script(source).to_effect_calls();
+        let mut edited = native.clone();
+        let mut added = native[0].clone();
+        added.effect_name = "sys_hit_elec".into();
+        added.active_start = 9;
+        edited.push(added);
+        let (written, report) =
+            crate::acmd_src::rewrite_effect_calls(source, "test", &native, &edited).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let disk = crate::acmd::parse_effect_script(&written).to_effect_calls();
+        assert_eq!(disk.len(), 2);
+        edited[1].scale = 2.5;
+        let ordered = effect_calls_in_source_order(&disk, &native, &edited).unwrap();
+        let (rewritten, report) =
+            crate::acmd_src::rewrite_effect_calls(&written, "test", &disk, &ordered).unwrap();
+        assert!(report.skipped.is_empty(), "{report:?}");
+        let final_calls = crate::acmd::parse_effect_script(&rewritten).to_effect_calls();
+        assert_eq!(
+            final_calls.len(),
+            2,
+            "a second sync must not duplicate the addition"
+        );
+        assert_eq!(final_calls[1].scale, 2.5);
+        assert_eq!(
+            native.len(),
+            1,
+            "the added call is still absent from the running game's baseline"
+        );
+        assert!(
+            super::VisionaryApp::build_effect_inject_from_captures(&edited[1], &[], None, 0)
+                .is_some(),
+            "the added call still has a donor-free live injection"
+        );
+    }
+
+    #[test]
+    fn repeated_effect_identity_refuses_ambiguous_duplicate_owners() {
+        let source = crate::acmd::parse_effect_script(
+            r#"unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 5.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT_FOLLOW(agent, Hash40::new("same"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+        macros::EFFECT_FOLLOW(agent, Hash40::new("same"), Hash40::new("top"), 0, 0, 0, 0, 0, 0, 1, true);
+    }
+}
+"#,
+        )
+        .to_effect_calls();
+        assert_eq!(source.len(), 2);
+        let mut edited = source.clone();
+        edited[0].scale = 3.0;
+        edited[1].scale = 4.0;
+        let mut previously_synced = source.clone();
+        for call in &mut previously_synced {
+            call.scale = 2.0;
+        }
+        let error = effect_calls_in_source_order(&previously_synced, &source, &edited).unwrap_err();
+        assert!(error.contains("one source owner"), "{error}");
+    }
+}
+
 #[cfg(test)]
 mod linked_acmd_index_tests {
     use super::rebuild_linked_acmd_source_index;
@@ -117,10 +482,6 @@ const WORK_FLAGS_DESCRIPTION: &str =
 
 /// Main-editor section names always carry a plain-language explanation on the name itself.
 /// Keeping that convention in helpers makes a bare, unexplained heading easy to spot in review.
-fn editor_section_heading(ui: &mut Ui, title: &str, description: &str) {
-    ui.heading(title).on_hover_text(description);
-}
-
 fn editor_subsection_heading(ui: &mut Ui, title: &str, description: &str) {
     ui.label(RichText::new(title).strong())
         .on_hover_text(description);
@@ -129,7 +490,7 @@ fn editor_subsection_heading(ui: &mut Ui, title: &str, description: &str) {
 /// A heading for the resizable left sidebar. Unlike the main editor headings, this one must not
 /// report its full text width as an intrinsic minimum when the sidebar is intentionally clipped.
 fn sidebar_section_heading(ui: &mut Ui, title: &str, description: &str) {
-    ui.add(egui::Label::new(RichText::new(title).heading()).truncate())
+    ui.add(egui::Label::new(RichText::new(title).strong()).truncate())
         .on_hover_text(description);
 }
 
@@ -140,11 +501,14 @@ fn editor_section_heading_with_badge(
     badge_color: Color32,
     badge: &str,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        editor_section_heading(ui, title, description);
-        ui.colored_label(badge_color, badge)
-            .on_hover_text(description);
-    });
+    let text = RichText::new(title).strong();
+    let text = if badge == "source-only" {
+        text.color(badge_color)
+    } else {
+        text
+    };
+    ui.label(text)
+        .on_hover_text(format!("{description}\n\n{badge}"));
 }
 
 fn editor_command_subsection_heading(
@@ -154,11 +518,7 @@ fn editor_command_subsection_heading(
     badge_color: Color32,
     badge: &str,
 ) {
-    ui.horizontal_wrapped(|ui| {
-        editor_subsection_heading(ui, title, description);
-        ui.colored_label(badge_color, badge)
-            .on_hover_text(description);
-    });
+    editor_section_heading_with_badge(ui, title, description, badge_color, badge);
 }
 
 fn editor_collapsing(
@@ -2345,6 +2705,9 @@ struct SyncReportWindow {
 #[derive(Default)]
 struct LiveApplyReport {
     restored_moves: usize,
+    /// The first fully materialized project move, used to give Resume one real editor target
+    /// after the live-rule replay has finished.
+    resume_target: Option<(String, String)>,
     missing_source: BTreeSet<String>,
     missing_fighter: BTreeSet<String>,
     missing_capture_donor: BTreeSet<String>,
@@ -2603,6 +2966,9 @@ pub struct VisionaryApp {
     last_frame_time: std::time::Instant,
     // Background move list loading
     move_list_receiver: Option<std::sync::mpsc::Receiver<Vec<MoveEntry>>>,
+    /// A project resume first loads its fighter, then waits for that fighter's asynchronous
+    /// motion list before selecting the saved move through the normal interactive path.
+    pending_project_move_selection: Option<(String, String)>,
     /// In-flight "Fetch ACMD" result: `(fighter, move, body or error)`. The fetch used to run
     /// inline and blocked the UI thread for a whole GitHub round trip on every click.
     acmd_receiver: Option<std::sync::mpsc::Receiver<AcmdFetchResult>>,
@@ -2649,6 +3015,16 @@ pub struct VisionaryApp {
     credits: crate::credits::CreditsWindow,
     show_edit_log: bool,
     show_workspace: bool,
+    /// Costume slot targeted by Project Files model/motion imports. Session-only: the imported
+    /// files themselves live canonically in the project workspace and are rediscovered on open.
+    workspace_asset_slot: u8,
+    workspace_copy_rx: Option<std::sync::mpsc::Receiver<Result<(usize, usize), String>>>,
+    workspace_asset_sent_slot: Option<u8>,
+    workspace_asset_cache_root: Option<PathBuf>,
+    workspace_asset_reclaimed: u64,
+    /// Fresh generation for disk-staged model/motion carrier snapshots. Timestamp-seeded on send
+    /// so reconnecting or restarting the editor cannot move the plugin backwards.
+    workspace_asset_generation: u64,
     export_dir: Option<PathBuf>,
     /// Extra roots holding modded content — added-character mods and slot-add packs. Each
     /// has the same `fighter/<name>/…` + `effect/fighter/<name>/…` layout as the data root.
@@ -2794,12 +3170,20 @@ pub struct VisionaryApp {
     /// The open project's `modproject.json` path. `None` means in-memory only
     /// ("Browse without project"). Persisted so the hub can Resume last.
     project_path: Option<PathBuf>,
-    /// Last saved editable snapshot (move sources cleared), for the unsaved-edits
-    /// guard. `None` means "never saved this session" — dirty iff non-empty.
+    /// Last saved editable snapshot (move sources cleared), for the autosave
+    /// pass. `None` means "never saved this session" — dirty iff non-empty.
     last_saved_snapshot: Option<serde_json::Value>,
+    /// Autosave debounce: when the project first read as dirty. `None` means clean
+    /// (or unsavable with no path). Set on the throttled dirty check, cleared on save.
+    project_autosave_pending_since: Option<std::time::Instant>,
+    /// Throttle for the dirty check itself — `build_project` + snapshot serializes
+    /// the whole edit model and must not run every frame.
+    project_autosave_last_check: std::time::Instant,
+    /// Last autosave failure, shown in the status strip until the next success.
+    project_autosave_error: Option<String>,
     /// Project Hub cold-start / mid-session window state.
     project_hub: crate::project_hub::HubState,
-    /// Hub action awaiting the unsaved-edits confirmation.
+    /// Hub action awaiting the not-yet-autosaved confirmation.
     hub_pending: Option<crate::project_hub::HubAction>,
     /// Last mod-import report, shown until dismissed.
     import_report: Option<crate::mod_import::ImportReport>,
@@ -3024,6 +3408,7 @@ impl VisionaryApp {
             pending_model_load: None,
             last_frame_time: std::time::Instant::now(),
             move_list_receiver: None,
+            pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
             source_mismatch_prompt: None,
@@ -3038,6 +3423,12 @@ impl VisionaryApp {
             credits: crate::credits::CreditsWindow::default(),
             show_edit_log: false,
             show_workspace: false,
+            workspace_asset_slot: 0,
+            workspace_copy_rx: None,
+            workspace_asset_sent_slot: None,
+            workspace_asset_cache_root: None,
+            workspace_asset_reclaimed: 0,
+            workspace_asset_generation: 0,
             export_dir: saved_export_dir,
             extra_roots: resolved_mod_roots,
             roster,
@@ -3103,6 +3494,9 @@ impl VisionaryApp {
             project_name: "unnamed_mod".into(),
             project_path: None,
             last_saved_snapshot: None,
+            project_autosave_pending_since: None,
+            project_autosave_last_check: std::time::Instant::now(),
+            project_autosave_error: None,
             project_hub: crate::project_hub::HubState::cold_start(
                 &app_config_dir().unwrap_or_else(|| std::path::PathBuf::from(".")),
             ),
@@ -3282,8 +3676,13 @@ impl VisionaryApp {
     fn reindex_fighters(&mut self) {
         // Sub-fighters, bosses and enemies the roster list has never shown. This filters by
         // exact vanilla name only, so a mod that happens to be called e.g. "nanaex" is kept.
+        // `element` is the Pyra/Mythra swap manager, not a playable moveset — the same role
+        // `ptrainer` plays for the Pokémon trio. Its select-screen presence is the shared
+        // Aegis cell the roster already collapses; listing it here produced a third,
+        // unloadable entry next to the real Pyra (`eflame`) and Mythra (`elight`).
         let skip = [
             "common",
+            "element",
             "ptrainer",
             "ptrainer_low",
             "pfushigisou",
@@ -3698,6 +4097,9 @@ impl VisionaryApp {
     /// and [`select_costume_slot`] (an explicitly chosen slot).
     fn select_fighter_slot(&mut self, idx: usize, slot: u8) {
         self.selected_costume_slot = slot;
+        // A click is an explicit navigation decision, so it supersedes a project-resume move
+        // that may still be waiting for this fighter's background motion scan.
+        self.pending_project_move_selection = None;
         self.commit_current_edits();
         self.source_mismatch_prompt = None;
         self.state.selected_fighter = Some(idx);
@@ -3727,6 +4129,7 @@ impl VisionaryApp {
         self.current_anim_path = None;
 
         let fighter = &self.state.fighters[idx];
+        self.workspace_asset_slot = slot;
         let requested = format!("c{slot:02}");
         let roots = self.all_roots();
         let name = fighter.name.clone();
@@ -3974,6 +4377,32 @@ impl VisionaryApp {
             moves.sort_by(|a, b| a.name.cmp(&b.name));
             let _ = tx.send(moves);
         });
+    }
+
+    /// Restore a usable editor target after the project replay. Replaying every saved move
+    /// temporarily uses selection-dependent rule builders; it must never leave one of those
+    /// temporary selections highlighted in the sidebar without loading its model or scripts.
+    fn restore_project_editor_selection(&mut self, target: Option<(String, String)>) {
+        let Some((fighter_name, move_name)) = target else {
+            self.state.selected_fighter = None;
+            self.state.selected_move = None;
+            clear_move_state(&mut self.state);
+            return;
+        };
+        let Some(fighter_index) = self
+            .state
+            .fighters
+            .iter()
+            .position(|fighter| fighter.name.eq_ignore_ascii_case(&fighter_name))
+        else {
+            self.state.selected_fighter = None;
+            self.state.selected_move = None;
+            clear_move_state(&mut self.state);
+            return;
+        };
+
+        self.select_fighter(fighter_index);
+        self.pending_project_move_selection = Some((fighter_name, move_name));
     }
 
     fn select_move(&mut self, move_entry: MoveEntry) {
@@ -4398,13 +4827,59 @@ impl VisionaryApp {
             return;
         };
         let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
-        let script = crate::acmd::acmd_script_name(script_prefix, &move_name);
-        let Some(site) = index.script(&fighter, &script) else {
-            self.state.status = index.conflict(&fighter, &script).map_or_else(
-                || format!("{script} is not in the linked project"),
-                crate::acmd_src::ScriptConflict::description,
-            );
-            return;
+        // Resolve the motion to the spelling the project carries (`game_attacks3`
+        // for `attack_s3_s`) so the opened buffer names the function it shows.
+        let mut script: Option<String> = None;
+        let mut site: Option<crate::acmd_src::ScriptSite> = None;
+        for candidate in crate::acmd::acmd_script_candidates(script_prefix, &move_name) {
+            if let Some(found) = index.script(&fighter, &candidate) {
+                // `script()` is alias-aware and may have matched the other spelling;
+                // only accept the candidate that is really present so the buffer's
+                // name matches the file's `fn`.
+                let present = index
+                    .fighters
+                    .get(&fighter.to_ascii_lowercase())
+                    .is_some_and(|table| table.scripts.contains_key(&candidate));
+                if present {
+                    script = Some(candidate);
+                    site = Some(found.clone());
+                    break;
+                }
+            }
+        }
+        // Fall back to the alias-aware lookup (covers the single unlabelled-set
+        // project, whose fighter key is empty and needs the sentinel path).
+        let (script, site) = match (script, site) {
+            (Some(script), Some(site)) => (script, site),
+            _ => {
+                let requested = crate::acmd::acmd_script_name(script_prefix, &move_name);
+                let resolved = crate::acmd::resolve_script_move_name(&fighter, &move_name);
+                let resolved_name = crate::acmd::acmd_script_name(script_prefix, &resolved);
+                // Prefer the resolved spelling; fall back to the requested one so
+                // the error still names what was asked for.
+                if let Some(found) = index.script(&fighter, &resolved_name) {
+                    (resolved_name, found.clone())
+                } else if let Some(found) = index.script(&fighter, &requested) {
+                    // Find which spelling actually matched for the buffer name.
+                    let actual = crate::acmd::script_name_aliases(&requested)
+                        .into_iter()
+                        .find(|candidate| {
+                            index
+                                .fighters
+                                .get(&fighter.to_ascii_lowercase())
+                                .is_some_and(|table| table.scripts.contains_key(candidate))
+                        })
+                        .unwrap_or(requested.clone());
+                    (actual, found.clone())
+                } else {
+                    let script = requested;
+                    self.state.status = index.conflict(&fighter, &script).map_or_else(
+                        || format!("{script} is not in the linked project"),
+                        crate::acmd_src::ScriptConflict::description,
+                    );
+                    return;
+                }
+            }
         };
         let (file, span) = (site.file.clone(), site.span.clone());
         let text = match std::fs::read_to_string(&file) {
@@ -4530,6 +5005,15 @@ impl VisionaryApp {
         let Some(move_name) = self.state.selected_move.as_ref().map(|m| m.name.clone()) else {
             return (Vec::new(), Default::default());
         };
+        let fighter_name = self
+            .state
+            .selected_fighter
+            .and_then(|i| self.state.fighters.get(i))
+            .map(|fighter| fighter.name.clone())
+            .unwrap_or_default();
+        // `attack_s3_s` is installed as `game_attacks3` upstream: preview the
+        // spelling the export will write so the two cannot drift apart.
+        let script_move = crate::acmd::resolve_script_move_name(&fighter_name, &move_name);
         let show_category = |category: &str| only.is_none_or(|selected| selected == category);
 
         let mut functions: Vec<(&'static str, String)> = Vec::new();
@@ -4543,7 +5027,7 @@ impl VisionaryApp {
             } else {
                 rebuild_script_from_hitboxes(&self.state.script, &self.state.hitboxes)
             };
-            let emitted = crate::acmd::preview_game_fn(&script, &move_name);
+            let emitted = crate::acmd::preview_game_fn(&script, &script_move);
             crate::acmd_verify::verify_move(&move_name, &script, &emitted, &mut report);
             functions.push(("game", emitted));
         }
@@ -4559,8 +5043,12 @@ impl VisionaryApp {
             // to show what an export would write *right now*, and the two agree because
             // `record_dropped_effect_lines` fills the map from this same parse.
             let (_, residue) = self.state.effect_script.to_effect_calls_and_residue();
-            let emitted =
-                crate::acmd::preview_effect_fn(&self.state.effects, &move_name, &tweaks, &residue);
+            let emitted = crate::acmd::preview_effect_fn(
+                &self.state.effects,
+                &script_move,
+                &tweaks,
+                &residue,
+            );
             crate::acmd_verify::verify_effect_move(
                 &move_name,
                 &self.state.effects,
@@ -4588,7 +5076,7 @@ impl VisionaryApp {
             .current_move_key()
             .is_some_and(|key| self.state.sound_script_edits.contains_key(&key));
         if show_category("sound") && sound_edited {
-            let emitted = crate::acmd::preview_sound_fn(&self.state.sound_script, &move_name);
+            let emitted = crate::acmd::preview_sound_fn(&self.state.sound_script, &script_move);
             crate::acmd_verify::verify_sound_move(
                 &move_name,
                 &self.state.sound_script,
@@ -4602,7 +5090,7 @@ impl VisionaryApp {
             .is_some_and(|key| self.state.expression_script_edits.contains_key(&key));
         if show_category("expression") && expression_edited {
             let emitted =
-                crate::acmd::preview_expression_fn(&self.state.expression_script, &move_name);
+                crate::acmd::preview_expression_fn(&self.state.expression_script, &script_move);
             crate::acmd_verify::verify_expression_move(
                 &move_name,
                 &self.state.expression_script,
@@ -5443,19 +5931,81 @@ impl VisionaryApp {
         };
         let (fighter, move_name) = (fighter.name.clone(), move_entry.name.clone());
 
+        // Rebuild spans before reading the source snapshot. A source edit made outside Visionary
+        // can leave an old span in bounds while pointing at a different function.
+        if !self.refresh_linked_acmd_source_index() {
+            self.state.status =
+                format!("Could not refresh the linked source before syncing {fighter}/{move_name}");
+            return;
+        }
+
         let mut changed = 0usize;
         let mut files: Vec<PathBuf> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut ran = false;
+
+        // `move_source_cache` is the source snapshot established when this move was loaded or
+        // after the last successful write. A different disk body may be a perfectly valid edit,
+        // but it is no longer the baseline this editor state was authored against. Refuse it so
+        // source-only changes are never silently overwritten by a panel sync.
+        let source_snapshot_changed = self
+            .move_source_cache
+            .get(&Self::move_key(&fighter, &move_name))
+            .and_then(|saved| {
+                self.source_body_for_sync(&fighter, &move_name)
+                    .map(|(body, _)| (saved, body))
+            })
+            .is_some_and(|(saved, body)| saved.body != body);
+        if source_snapshot_changed {
+            notes.push(
+                "the linked source changed since this move was loaded or last synced — reload the move before syncing"
+                    .into(),
+            );
+            self.state.status = source_sync_status(&fighter, &move_name, true, 0, 0, &notes);
+            return;
+        }
 
         // A category the user has edited but the project does not define is created first, from
         // the mirror's own text, so the value passes below have somewhere of the user's own to
         // write into. Before D1b that could not happen; since D1d it is the ordinary case, because
         // a hitbox-only project still shows — and now edits — vanilla's sounds.
         ran |= self.create_missing_scripts(&fighter, &move_name, &mut files, &mut notes);
+        if ran && !self.note_synced_source_body(&fighter, &move_name) {
+            notes.push(
+                "a new source category was created, but the updated move could not be re-read"
+                    .into(),
+            );
+        }
 
         let Some(mut index) = self.acmd_src.as_ref().cloned() else {
             return;
+        };
+
+        // A previous sync may already have added an effect call or rewritten a hitbox in the
+        // user's file. Re-read those two source lists for matching, but keep the editor's pristine
+        // arrays as the original native identity for live rules. Re-indexing alone is not enough:
+        // on the next click the old pristine effect list would still have one fewer call than the
+        // source and the writer would refuse the whole move as out of date.
+        let (source_hitboxes_pristine, source_effects_pristine) =
+            match self.linked_source_sync_baselines(&fighter, &move_name) {
+                Ok(baselines) => baselines,
+                Err(error) => {
+                    notes.push(error);
+                    self.state.status =
+                        source_sync_status(&fighter, &move_name, ran, changed, 0, &notes);
+                    return;
+                }
+            };
+        let source_effects = match effect_calls_in_source_order(
+            &source_effects_pristine,
+            &self.state.effects_pristine,
+            &self.state.effects,
+        ) {
+            Ok(ordered) => Some(ordered),
+            Err(error) => {
+                notes.push(error);
+                None
+            }
         };
 
         if index
@@ -5466,20 +6016,28 @@ impl VisionaryApp {
             .is_some()
         {
             ran = true;
-            match crate::acmd_src::sync_effect_calls(
-                &index,
-                &fighter,
-                &move_name,
-                &self.state.effects_pristine,
-                &self.state.effects,
-            ) {
-                Ok(report) => {
-                    changed += report.changed;
-                    files.extend(report.files);
-                    notes.extend(report.skipped);
+            if let Some(edited_effects) = source_effects.as_deref() {
+                match crate::acmd_src::sync_effect_calls(
+                    &index,
+                    &fighter,
+                    &move_name,
+                    &source_effects_pristine,
+                    edited_effects,
+                ) {
+                    Ok(report) => {
+                        changed += report.changed;
+                        files.extend(report.files);
+                        notes.extend(report.skipped);
+                    }
+                    Err(e) => notes.push(e.to_string()),
                 }
-                Err(e) => notes.push(e.to_string()),
             }
+            // An effect value can change the byte length of its function. Re-index before
+            // the game passes, or a stale span truncates the game body when both live in
+            // the same file with the effect first (alphabetical order) and the hitbox
+            // write lands on the wrong bytes — the shape issue 37 reports as "only
+            // syncs the effect script edits".
+            refresh_acmd_index(&mut index, &mut notes);
         }
         if index
             .script(&fighter, &crate::acmd::acmd_script_name("game", &move_name))
@@ -5490,7 +6048,7 @@ impl VisionaryApp {
                 &index,
                 &fighter,
                 &move_name,
-                &self.state.hitboxes_pristine,
+                &source_hitboxes_pristine,
                 &self.state.hitboxes,
             ) {
                 Ok(report) => {
@@ -5909,6 +6467,12 @@ impl VisionaryApp {
                 }
                 Err(e) => notes.push(e.to_string()),
             }
+            // The last game pass above has no later game family to protect, but sound
+            // and expression live in their own functions that can share the file. Without
+            // this, a game write that changes the byte length leaves their spans stale
+            // and their syncs read the wrong body — the same staleness the effect/game
+            // boundary above had for issue 37.
+            refresh_acmd_index(&mut index, &mut notes);
         }
         // Sounds get a pass of their own, and unlike the three above it writes a *different
         // function*: `sound_`, not `game_`. It sat inside the `game_` guard until D1e, which is
@@ -6031,23 +6595,21 @@ impl VisionaryApp {
         }
         files.sort();
         files.dedup();
-        let mut status = format!(
-            "Synced {changed} source change{} into {} file{}",
-            if changed == 1 { "" } else { "s" },
-            files.len(),
-            if files.len() == 1 { "" } else { "s" },
-        );
-        // The refusals used to be joined onto the end of this line. The strip holds one line and
-        // the next action overwrites it, so an edit that never reached the file was reported
-        // where it could not be read. The line now says only how many there were; the window
-        // below says what they are and what to do about them.
-        if !notes.is_empty() {
-            status.push_str(&format!(
-                " — {} edit(s) not written; see Sync report",
-                notes.len()
-            ));
+        let wrote_source = !files.is_empty();
+        if wrote_source {
+            // Every pass above refreshed its local index after a write. Publish that final index
+            // without reloading the move: the editor's pristine arrays still identify the
+            // original calls that the running game needs suppressed/replayed, and replacing them
+            // here would make a successful source sync turn off its live preview.
+            self.acmd_src = Some(index);
+            if !self.note_synced_source_body(&fighter, &move_name) {
+                notes.push(
+                    "source changed, but the updated move could not be re-read; rescan the project"
+                        .into(),
+                );
+            }
+            self.refresh_source_buffer_after_sync(&fighter, &move_name, &mut notes);
         }
-        self.state.status = status;
         if !notes.is_empty() {
             self.sync_report = Some(SyncReportWindow {
                 fighter: fighter.clone(),
@@ -6057,11 +6619,8 @@ impl VisionaryApp {
                 notes: notes.clone(),
             });
         }
-        if changed > 0 {
-            // The written values are now the pristine ones; re-reading also refreshes the
-            // spans the next sync will target.
-            self.rescan_acmd_source();
-        }
+        self.state.status =
+            source_sync_status(&fighter, &move_name, ran, changed, files.len(), &notes);
     }
 
     /// Which categories this move has been edited in, in the order a script file writes them.
@@ -6247,8 +6806,11 @@ impl VisionaryApp {
         let wanted = Self::edited_prefixes(&self.state);
         let mut created = false;
         for prefix in wanted {
+            // Create under the spelling the game runs (`game_attacks3` for
+            // `attack_s3_s`), not the motion's own spelling.
+            let script_move = crate::acmd::resolve_script_move_name(fighter, move_name);
             let script_name =
-                crate::acmd::acmd_script_name(prefix.trim_end_matches('_'), move_name);
+                crate::acmd::acmd_script_name(prefix.trim_end_matches('_'), &script_move);
             let Some(index) = self.acmd_src.as_ref() else {
                 return created;
             };
@@ -6959,17 +7521,6 @@ impl VisionaryApp {
         let generated = (view != SourceView::Source).then(|| self.generated_source_for_move());
 
         let response = window.show(ctx, |ui| {
-            ui.label(
-                egui::RichText::new(
-                    "Read ACMD scripts from your own smashline project instead of the online \
-                     archive of vanilla scripts, so the editor shows the code your game \
-                     actually runs.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-            ui.separator();
-
             // The linked project is a HEADER, not a gate. It used to return early when
             // nothing was linked, when the fighter was not in the project, or when no script
             // was open — which meant a live-captured move, the one case with no source file
@@ -7071,6 +7622,8 @@ impl VisionaryApp {
 
             // Everything that needs `&self` is resolved before the buffer is borrowed
             // mutably below — closures capturing both would not borrow-check.
+            // Show the spelling the game runs (`game_attacks3` for `attack_s3_s`).
+            let script_move = crate::acmd::resolve_script_move_name(&fighter, &move_name);
             let scripts: Vec<(&str, String, bool, bool, bool)> = [
                 ("game", "Hitboxes"),
                 ("effect", "Effects"),
@@ -7079,7 +7632,7 @@ impl VisionaryApp {
             ]
             .into_iter()
             .map(|(prefix, label)| {
-                let name = crate::acmd::acmd_script_name(prefix, &move_name);
+                let name = crate::acmd::acmd_script_name(prefix, &script_move);
                 let present = self
                     .acmd_src
                     .as_ref()
@@ -7380,18 +7933,7 @@ impl VisionaryApp {
                 return;
             }
 
-            ui.label(
-                RichText::new(
-                    "All edits across the toolkit — hitboxes, effect spawns, sounds, \
-                     expression, live tweaks, authored eff values, fighter-wide values, \
-                     and every roster edit (positions, names, portraits, new characters). \
-                     Saved automatically; use ↶ to restore the source (also un-sends the live \
-                     state).",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
-            );
-            ui.separator();
+            ui.weak("Use ↶ to restore an original value in the project and game.");
 
             // ── Roster — every roster edit kind, each revertible ──
             {
@@ -8271,19 +8813,15 @@ impl VisionaryApp {
 
     fn draw_left_panel(&mut self, ui: &mut Ui) {
         if self.state.data_root.is_none() {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("Click 'Open Data Root' above")
-                        .color(egui::Color32::YELLOW),
-                )
-                .wrap(),
-            );
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new("to load fighter files.").color(egui::Color32::YELLOW),
-                )
-                .wrap(),
-            );
+            if ui
+                .button("Open Data Root…")
+                .on_hover_text("Choose the folder containing extracted fighter files")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                    self.set_data_root(path);
+                }
+            }
             return;
         }
 
@@ -8309,12 +8847,13 @@ impl VisionaryApp {
                 restore_forgotten = true;
             }
         });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.fighter_search)
-                .hint_text("Search fighters…")
-                .desired_width(f32::INFINITY),
+        crate::ui::search_field(
+            ui,
+            "fighter_search",
+            &mut self.fighter_search,
+            "Search fighters…",
         );
-        let fighter_query = self.fighter_search.to_lowercase();
+        let fighter_query = self.fighter_search.trim().to_lowercase();
         ScrollArea::both()
             .id_salt("fighters")
             .max_height(half)
@@ -8344,6 +8883,9 @@ impl VisionaryApp {
                         )
                     })
                     .collect();
+                if fighters.is_empty() {
+                    ui.weak("No matching fighters");
+                }
                 for (i, fighter_name, name, modded, slot_count, base) in fighters {
                     let selected = self.state.selected_fighter == Some(i);
                     let mut label = name.clone();
@@ -8428,11 +8970,7 @@ impl VisionaryApp {
             "Moves",
             "Choose one animation or action for the selected fighter. Categories group the game's internal motion names by their usual purpose.",
         );
-        ui.add(
-            egui::TextEdit::singleline(&mut self.move_search)
-                .hint_text("Search moves…")
-                .desired_width(f32::INFINITY),
-        );
+        crate::ui::search_field(ui, "move_search", &mut self.move_search, "Search moves…");
         let move_query = self.move_search.trim().to_lowercase();
         let move_searching = !move_query.trim().is_empty();
         ScrollArea::both()
@@ -8497,6 +9035,13 @@ impl VisionaryApp {
                     self.move_search_touched.clear();
                 }
 
+                if groups.iter().all(Vec::is_empty) {
+                    ui.weak(if self.state.selected_fighter.is_none() {
+                        "Select a fighter"
+                    } else {
+                        "No matching moves"
+                    });
+                }
                 let mut to_select: Option<MoveEntry> = None;
                 for (ci, group) in groups.iter().enumerate() {
                     if group.is_empty() {
@@ -8562,112 +9107,6 @@ impl VisionaryApp {
     }
 
     fn draw_right_panel(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            editor_section_heading(
-                ui,
-                self.primary_tab.title(),
-                self.primary_tab.description(),
-            );
-            if self.state.selected_move.is_none() {
-                ui.weak("Select a move");
-            }
-            if self.state.selected_move.is_some() {
-                let btn_text = if self.fetching_acmd {
-                    "Loading…"
-                } else if self.state.acmd_source.is_empty() {
-                    "Retry source"
-                } else {
-                    "Reload source"
-                };
-                if ui
-                    .add_enabled(!self.fetching_acmd, egui::Button::new(btn_text))
-                    .on_hover_text(
-                        "Reload this move's ACMD scripts from the linked project or local \
-                         GitHub cache — hitboxes, hurtboxes, effects, sounds, and expression. \
-                         Moves load automatically when selected; use this after changing the \
-                         source on disk or retrying a failed fetch.",
-                    )
-                    .clicked()
-                {
-                    self.fetch_acmd();
-                }
-                let has_capture = self
-                    .current_motion_hash()
-                    .map(|m| !self.captures_for_selected_fighter(m).is_empty())
-                    .unwrap_or(false);
-                if ui
-                    .add_enabled(has_capture, egui::Button::new("⟳ Live"))
-                    .on_hover_text(
-                        "Load this move's hitboxes + effects from the live game capture \
-                         (exact values; perform the move in game to capture it)",
-                    )
-                    .clicked()
-                {
-                    self.load_from_capture();
-                }
-                if ui
-                    .add_enabled(has_capture, egui::Button::new("Forget capture"))
-                    .on_hover_text(
-                        "Forget the locked live-ACMD snapshots. Each move is captured from its \
-                         first playback only; clear when you intentionally want to \
-                         record a fresh set.",
-                    )
-                    .clicked()
-                {
-                    self.game_link.clear_captures();
-                    self.forget_current_move_capture();
-                    self.state.status = "Cleared the live capture — perform the move again \
-                                         to record a clean run."
-                        .into();
-                }
-                if !self.state.acmd_source.is_empty() {
-                    let (txt, color) = if self.state.acmd_source == "Live capture" {
-                        ("● Live", egui::Color32::from_rgb(90, 220, 90))
-                    } else {
-                        ("● GitHub", egui::Color32::from_rgb(160, 160, 220))
-                    };
-                    ui.colored_label(color, txt)
-                        .on_hover_text(format!("Data source: {}", self.state.acmd_source));
-                }
-                if ui
-                    .add_enabled(
-                        self.current_move_has_edits(),
-                        egui::Button::new("Restore move"),
-                    )
-                    .on_hover_text(
-                        "Discard this move's collision, motion, effect, sound, and expression edits and restore the loaded source or capture baseline",
-                    )
-                    .clicked()
-                {
-                    self.restore_current_move_edits();
-                }
-            }
-            if ui
-                .add_enabled(
-                    self.state.selected_move.is_some()
-                        && matches!(self.primary_tab, PrimaryEditorTab::Collisions),
-                    egui::Button::new("Add collision"),
-                )
-                .clicked()
-            {
-                self.show_add_hitbox = !self.show_add_hitbox;
-            }
-            if ui
-                .add_enabled(self.has_undo(), egui::Button::new("Undo"))
-                .on_hover_text("Undo the last edit in this move (Ctrl+Z)")
-                .clicked()
-            {
-                self.queue_history_action(HistoryAction::Undo);
-            }
-            if ui
-                .add_enabled(self.has_redo(), egui::Button::new("Redo"))
-                .on_hover_text("Redo the last undone edit in this move (Ctrl+Shift+Z)")
-                .clicked()
-            {
-                self.queue_history_action(HistoryAction::Redo);
-            }
-        });
-
         ui.horizontal_wrapped(|ui| {
             for tab in [
                 PrimaryEditorTab::Collisions,
@@ -8687,8 +9126,104 @@ impl VisionaryApp {
             }
         });
 
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(self.state.selected_move.is_some(), |ui| {
+                ui.menu_button("Move…", |ui| {
+                    let btn_text = if self.fetching_acmd {
+                        "Loading…"
+                    } else if self.state.acmd_source.is_empty() {
+                        "Retry source"
+                    } else {
+                        "Reload source"
+                    };
+                    if ui
+                        .add_enabled(!self.fetching_acmd, egui::Button::new(btn_text))
+                        .on_hover_text(
+                            "Reload this move's ACMD scripts from the linked project or local \
+                             GitHub cache — hitboxes, hurtboxes, effects, sounds, and expression. \
+                             Moves load automatically when selected; use this after changing the \
+                             source on disk or retrying a failed fetch.",
+                        )
+                        .clicked()
+                    {
+                        self.fetch_acmd();
+                        ui.close();
+                    }
+                    let has_capture = self
+                        .current_motion_hash()
+                        .map(|m| !self.captures_for_selected_fighter(m).is_empty())
+                        .unwrap_or(false);
+                    if ui
+                        .add_enabled(has_capture, egui::Button::new("Load live capture"))
+                        .on_hover_text(
+                            "Load this move's hitboxes + effects from the live game capture \
+                             (exact values; perform the move in game to capture it)",
+                        )
+                        .clicked()
+                    {
+                        self.load_from_capture();
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(has_capture, egui::Button::new("Forget capture"))
+                        .on_hover_text(
+                            "Forget the locked live-ACMD snapshots. Each move is captured from its \
+                             first playback only; clear when you intentionally want to \
+                             record a fresh set.",
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                        self.game_link.clear_captures();
+                        self.forget_current_move_capture();
+                        self.state.status = "Cleared the live capture — perform the move again \
+                                             to record a clean run."
+                            .into();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.current_move_has_edits(),
+                            egui::Button::new("Reset move edits"),
+                        )
+                        .on_hover_text(
+                            "Discard this move's collision, motion, effect, sound, and expression edits and restore the loaded source or capture baseline",
+                        )
+                        .clicked()
+                    {
+                        self.restore_current_move_edits();
+                        ui.close();
+                    }
+                });
+            });
+            if matches!(self.primary_tab, PrimaryEditorTab::Collisions)
+                && ui.add_enabled(self.state.selected_move.is_some(), egui::Button::new("Add collision")).clicked()
+            {
+                self.show_add_hitbox = !self.show_add_hitbox;
+            }
+            if ui
+                .add_enabled(self.has_undo(), egui::Button::new("Undo"))
+                .on_hover_text("Undo the last edit in this move (Ctrl+Z)")
+                .clicked()
+            {
+                self.queue_history_action(HistoryAction::Undo);
+            }
+            if ui
+                .add_enabled(self.has_redo(), egui::Button::new("Redo"))
+                .on_hover_text("Redo the last undone edit in this move (Ctrl+Shift+Z)")
+                .clicked()
+            {
+                self.queue_history_action(HistoryAction::Redo);
+            }
+        });
+
         if let Some(err) = &self.acmd_error.clone() {
             ui.colored_label(Color32::RED, err);
+        }
+
+        if self.state.selected_move.is_none() && self.primary_tab != PrimaryEditorTab::Hurtboxes {
+            ui.weak("Select a move to edit");
+            return;
         }
 
         if matches!(self.primary_tab, PrimaryEditorTab::Hurtboxes) {
@@ -8837,11 +9372,6 @@ impl VisionaryApp {
 
         if matches!(self.primary_tab, PrimaryEditorTab::Collisions) {
             ui.vertical(|ui| {
-                editor_section_heading(
-                    ui,
-                    "Collision entries",
-                    "Every attack, grab, detection area, wind area, and throw-damage event loaded for this move. Select one to edit its settings below.",
-                );
                 let master_height =
                     hitbox_selector_height(self.state.hitboxes.len(), ui.available_height());
                 egui::ScrollArea::vertical()
@@ -8986,11 +9516,6 @@ impl VisionaryApp {
                     });
 
                 ui.separator();
-                editor_section_heading(
-                    ui,
-                    "Selected collision settings",
-                    "Settings for the collision selected above. The available fields change with its collision family so unsupported values are not invented.",
-                );
                 let detail_height = ui.available_height().max(1.0);
                 egui::ScrollArea::vertical()
                     .id_salt("collision_detail_scroll")
@@ -9084,11 +9609,6 @@ impl VisionaryApp {
                                     ),
                                 };
                                 ui.horizontal(|ui| {
-                                    editor_section_heading(
-                                        ui,
-                                        "Collision properties",
-                                        "Identity, combat behavior, target filters, shape, feedback, and active frames for the selected collision.",
-                                    );
                                     ui.colored_label(cat_color, cat_label)
                                         .on_hover_text(cat_description);
                                 });
@@ -9819,26 +10339,8 @@ impl VisionaryApp {
             egui::Color32::from_rgb(150, 210, 150),
             "sound_ script",
         );
-        // Names the vocabulary and where it comes from. The banks are worth spelling out: a
-        // modder looking for a voice clip will not guess that `vc_` is the prefix, and a
-        // fighter's own bank being separate from the shared one is not obvious either.
         if candidates.is_empty() {
-            ui.weak("No hash labels loaded yet, so there is nothing to browse — typing works.");
-        } else {
-            let own = candidates
-                .iter()
-                .filter(|c| c.starts_with(&format!("se_{fighter}_")))
-                .count();
-            let voice = candidates
-                .iter()
-                .filter(|c| c.starts_with(&format!("vc_{fighter}_")))
-                .count();
-            let common = candidates.len() - own - voice;
-            ui.weak(format!(
-                "{} names: {own} se_{fighter}_ · {common} se_common_ · {voice} vc_{fighter}_ — \
-                 press Browse to search them.",
-                candidates.len()
-            ));
+            ui.weak("No sound labels loaded. Enter a sound name to add one.");
         }
 
         enum StructuralAction {
@@ -13861,8 +14363,8 @@ If you step every basis for a                          type and NONE of them mat
                 }
             }
         });
-        ui.checkbox(&mut self.state.show_all_effect_calls, "show all frames");
-        ui.checkbox(&mut self.show_effect_advanced, "show advanced overrides")
+        ui.checkbox(&mut self.state.show_all_effect_calls, "All frames");
+        ui.checkbox(&mut self.show_effect_advanced, "Advanced overrides")
             .on_hover_text(
                 "Reveal optional rate, camera, WorkModule, tint, alpha, and scale overrides",
             );
@@ -13888,7 +14390,7 @@ If you step every basis for a                          type and NONE of them mat
         if !has_effect_data && !move_loaded {
             ui.colored_label(egui::Color32::GRAY, "Effect data unavailable");
             ui.label(
-                egui::RichText::new("Fetch ACMD to load effect data.")
+                egui::RichText::new("Use Move → Retry source to load scripts.")
                     .small()
                     .color(egui::Color32::DARK_GRAY),
             );
@@ -14058,6 +14560,7 @@ If you step every basis for a                          type and NONE of them mat
                         .insert(mv, self.state.effects.clone());
                 }
                 self.state.selected_effect_call = Some(idx);
+                self.push_effect_rules();
             }
 
             if ui.small_button("＋ Add effect call").clicked() {
@@ -14120,6 +14623,7 @@ If you step every basis for a                          type and NONE of them mat
                         .insert(mv, self.state.effects.clone());
                 }
                 self.state.selected_effect_call = Some(idx);
+                self.push_effect_rules();
             }
 
             // Backspace / Delete removes the selected spawn (unless typing in a field).
@@ -15749,6 +16253,119 @@ If you step every basis for a                          type and NONE of them mat
             .map(|body| (body, "GitHub"))
     }
 
+    /// Resolve a local linked body even when the mirror cache is cold. A project that owns only
+    /// one category still has a usable source function; `loaded_body` supplies the last merged
+    /// snapshot for categories the project does not cover.
+    fn source_body_for_sync(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Option<(String, &'static str)> {
+        self.warm_source_body(fighter, move_name).or_else(|| {
+            let project = self
+                .acmd_src
+                .as_ref()
+                .and_then(|index| index.script_source(fighter, move_name))?;
+            let body = if self.state.loaded_body.is_empty() {
+                project.body.clone()
+            } else {
+                crate::acmd::merge_project_over_mirror_blocked(
+                    &project.body,
+                    &project.covers,
+                    &project.blocked,
+                    &self.state.loaded_body,
+                )
+            };
+            Some((body, "Project source"))
+        })
+    }
+
+    /// Parse the source snapshot established by the last load or successful write.
+    ///
+    /// The source snapshot is a per-write baseline: it follows a prior source sync, while the
+    /// editor's pristine arrays continue to describe the original native calls used by live
+    /// suppression/replay. If the file changed outside this session, refuse the write until the
+    /// user explicitly reloads it instead of silently adopting those external values as a new
+    /// baseline.
+    fn linked_source_sync_baselines(
+        &self,
+        fighter: &str,
+        move_name: &str,
+    ) -> Result<(Vec<crate::data::Hitbox>, Vec<crate::data::EffectCall>), String> {
+        let Some((body, _)) = self.source_body_for_sync(fighter, move_name) else {
+            return Err(format!(
+                "could not read the linked source for {fighter}/{move_name}"
+            ));
+        };
+        let key = Self::move_key(fighter, move_name);
+        if self
+            .move_source_cache
+            .get(&key)
+            .is_some_and(|snapshot| snapshot.body != body)
+        {
+            return Err(format!(
+                "{fighter}/{move_name} changed on disk since it was loaded or last synced — reload the move before syncing"
+            ));
+        }
+        let mut hitboxes = crate::acmd::parse_acmd_script(&body).to_hitboxes();
+        self.normalize_hitbox_bones(&mut hitboxes);
+        let effects = crate::acmd::parse_effect_script(&body)
+            .to_effect_calls()
+            .into_iter()
+            .map(crate::data::EffectCall::normalized_timing)
+            .collect();
+        Ok((hitboxes, effects))
+    }
+
+    /// Keep source provenance in step with a successful write while leaving the live editor state
+    /// and its native pristine identities alone. The next move switch therefore sees the file as
+    /// the current source instead of opening a needless mismatch prompt, while current live rules
+    /// still suppress/replay the original calls until the game is rebuilt.
+    fn note_synced_source_body(&mut self, fighter: &str, move_name: &str) -> bool {
+        let Some((body, _)) = self.source_body_for_sync(fighter, move_name) else {
+            return false;
+        };
+        self.state.loaded_body = body.clone();
+        self.remember_move_source_body(fighter, move_name, body);
+        true
+    }
+
+    /// Reopen a clean source-editor checkout after a disk sync so its span and text follow the
+    /// newly indexed file. A buffer with unsaved typing is left in place and called out in the
+    /// sync report rather than silently discarding that text.
+    fn refresh_source_buffer_after_sync(
+        &mut self,
+        fighter: &str,
+        move_name: &str,
+        notes: &mut Vec<String>,
+    ) {
+        let Some(buffer) = self.acmd_src_buffer.as_ref() else {
+            return;
+        };
+        if buffer.fighter != fighter || buffer.move_name != move_name {
+            return;
+        }
+        if buffer.text != buffer.synced {
+            notes.push(
+                "the source editor has unsaved text; save or revert it before reopening that script"
+                    .into(),
+            );
+            return;
+        }
+        let Some(prefix) = ["game", "effect", "sound", "expression"]
+            .into_iter()
+            .find(|prefix| buffer.script.starts_with(&format!("{prefix}_")))
+        else {
+            self.acmd_src_buffer = None;
+            return;
+        };
+        self.acmd_src_buffer = None;
+        self.open_source_buffer(prefix);
+        if self.acmd_src_buffer.is_none() {
+            notes.push("the source editor could not reopen the synced script".into());
+        }
+    }
+
     fn capture_snapshot_body(
         move_name: &str,
         script: &crate::data::AcmdScript,
@@ -16212,6 +16829,9 @@ If you step every basis for a                          type and NONE of them mat
                 report.missing_source.insert(key);
                 continue;
             };
+            report
+                .resume_target
+                .get_or_insert_with(|| (fighter.to_string(), move_name.to_string()));
             self.state.selected_fighter = Some(fighter_index);
             self.state.selected_move = Some(MoveEntry {
                 name: move_name.to_string(),
@@ -16250,35 +16870,12 @@ If you step every basis for a                          type and NONE of them mat
                 .insert(format!("{key} collision"));
         }
 
-        if let (Some(fighter_index), Some(move_entry)) = selected {
-            if self.state.fighters.get(fighter_index).is_some() {
-                self.state.selected_fighter = Some(fighter_index);
-                let key = self
-                    .state
-                    .fighters
-                    .get(fighter_index)
-                    .map(|fighter| Self::move_key(&fighter.name, &move_entry.name));
-                self.state.selected_move = Some(move_entry);
-                clear_move_state(&mut self.state);
-                if let Some(key) = key {
-                    if let Some(snapshot) = self.move_source_cache.get(&key).cloned() {
-                        let fighter = key.split('/').next().unwrap_or_default();
-                        let move_name = key.split('/').nth(1).unwrap_or_default();
-                        if let Some(context) =
-                            self.materialize_move_replay_context(fighter, move_name, &snapshot)
-                        {
-                            if !context.source.body.is_empty() || !context.captures.is_empty() {
-                                self.apply_move_replay_context(context);
-                                self.refresh_current_live_rules();
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            self.state.selected_move = None;
-            clear_move_state(&mut self.state);
-        }
+        // The loop above uses direct selection assignments only because the live-rule builders
+        // are selection-based. Those assignments are implementation detail, not UI navigation:
+        // retaining one would highlight a fighter or move whose assets were never loaded.
+        self.state.selected_fighter = None;
+        self.state.selected_move = None;
+        clear_move_state(&mut self.state);
 
         self.rebuilding_project_live = false;
         self.replay_live_fallback_key = None;
@@ -16978,8 +17575,21 @@ If you step every basis for a                          type and NONE of them mat
     }
 
     fn export_project(&mut self) {
+        if self.workspace_copy_rx.is_some() {
+            self.state.status =
+                "Wait for the base game files to finish copying before exporting.".into();
+            return;
+        }
         let project = self.build_project();
-        if project.is_empty() {
+        // A project may intentionally contain only the binary `romfs/` overlay (for example a
+        // model/animation iteration with no ACMD or EFF edits). Keep that useful project
+        // exportable instead of treating the serialized edit model as the whole project.
+        let has_workspace_overlay = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(crate::project_hub::workspace_romfs_has_files);
+        if project.is_empty() && !has_workspace_overlay {
             self.state.status = "No edits to export yet.".into();
             return;
         }
@@ -17007,11 +17617,37 @@ If you step every basis for a                          type and NONE of them mat
             .map(crate::mod_export::slugify)
             .unwrap_or_else(|| "project".into());
         let asset_dir = format!("{stem}_assets");
+        let previous_project = self.project_path.clone();
         match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
             Ok(()) => {
-                // Export adopts the path: the next Save writes here silently.
+                let overlay_report = previous_project
+                    .as_deref()
+                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
+                // Export adopts the path: later edits autosave here.
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Project exported to {}", path.display());
+                match overlay_report {
+                    Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
+                        self.state.status.push_str(&format!(
+                            " — copied {copied} workspace overlay file{}{}",
+                            if copied == 1 { "" } else { "s" },
+                            if skipped.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "; skipped {} generated conflict{}",
+                                    skipped.len(),
+                                    if skipped.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ));
+                    }
+                    Some(Err(error)) => self
+                        .state
+                        .status
+                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
+                    _ => {}
+                }
             }
             Err(e) => self.state.status = format!("Project export failed: {e}"),
         }
@@ -17030,11 +17666,11 @@ If you step every basis for a                          type and NONE of them mat
     // ── Project Hub: one current project ────────────────────────────────
     //
     // One current project holds every edit. Its path is persisted so the hub can
-    // Resume last; Save writes silently when it is known; Save As relocates;
-    // Export/Load adopt the path they touched. Hub switches with unsaved edits
-    // warn first.
+    // Resume last; edits autosave to it a beat after they land; Save As relocates;
+    // Export/Load adopt the path they touched. Hub switches only warn when there
+    // is no path to autosave to (or the last autosave failed).
 
-    /// Canonical snapshot for the unsaved-edits guard: the editable project
+    /// Canonical snapshot for the dirty check: the editable project
     /// with move-source provenance cleared. Browsing moves records provenance
     /// without editing anything, and must not read as dirty.
     fn snapshot_for_dirty(project: &crate::mod_project::ModProjectFile) -> serde_json::Value {
@@ -17045,7 +17681,7 @@ If you step every basis for a                          type and NONE of them mat
         serde_json::to_value(&without_sources).unwrap_or(serde_json::Value::Null)
     }
 
-    /// True when in-memory edits differ from the last save/load.
+    /// True when in-memory edits differ from the last autosave/load.
     fn is_project_dirty(&mut self) -> bool {
         let project = self.build_project();
         if self.last_saved_snapshot.is_none() {
@@ -17064,6 +17700,8 @@ If you step every basis for a                          type and NONE of them mat
     ) {
         self.project_path = Some(path.to_path_buf());
         self.last_saved_snapshot = Some(Self::snapshot_for_dirty(project));
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
         if let Some(config_dir) = app_config_dir() {
             crate::project_hub::push_recent(&config_dir, path);
             self.project_hub.last = Some(path.to_path_buf());
@@ -17076,19 +17714,15 @@ If you step every basis for a                          type and NONE of them mat
     /// Save silently to the current path, or fall back to Save As.
     /// Returns whether the project ended up saved — the roster Deploy flow
     /// needs the answer without parsing the status line back out.
+    /// Manual saves are now rare (autosave covers every edit); this remains
+    /// for explicit flush points such as Deploy and the hub guard.
     fn save_project_silent(&mut self) -> bool {
         let Some(path) = self.project_path.clone() else {
             self.save_project_as();
             return self.project_path.is_some();
         };
         let project = self.build_project();
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(crate::mod_export::slugify)
-            .unwrap_or_else(|| "project".into());
-        let asset_dir = format!("{stem}_assets");
-        match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
+        match Self::persist_project_file(&project, &path) {
             Ok(()) => {
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Saved {}", path.display());
@@ -17103,6 +17737,11 @@ If you step every basis for a                          type and NONE of them mat
 
     /// Save As always asks, then relocates the current project there.
     fn save_project_as(&mut self) {
+        if self.workspace_copy_rx.is_some() {
+            self.state.status =
+                "Wait for the base game files to finish copying before Save As.".into();
+            return;
+        }
         let project = self.build_project();
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save project as…")
@@ -17126,12 +17765,148 @@ If you step every basis for a                          type and NONE of them mat
             .map(crate::mod_export::slugify)
             .unwrap_or_else(|| "project".into());
         let asset_dir = format!("{stem}_assets");
+        let previous_project = self.project_path.clone();
         match crate::mod_export::write_portable_project(&project, &path, &asset_dir) {
             Ok(()) => {
+                let overlay_report = previous_project
+                    .as_deref()
+                    .map(|current| crate::project_hub::preserve_workspace_romfs(current, &path));
                 self.adopt_project_path(&path, &project);
                 self.state.status = format!("Saved {}", path.display());
+                match overlay_report {
+                    Some(Ok((copied, skipped))) if copied > 0 || !skipped.is_empty() => {
+                        self.state.status.push_str(&format!(
+                            " — copied {copied} workspace overlay file{}{}",
+                            if copied == 1 { "" } else { "s" },
+                            if skipped.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    "; kept {} destination conflict{}",
+                                    skipped.len(),
+                                    if skipped.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ));
+                    }
+                    Some(Err(error)) => self
+                        .state
+                        .status
+                        .push_str(&format!(" — workspace overlay copy failed: {error:#}")),
+                    _ => {}
+                }
             }
             Err(e) => self.state.status = format!("Save failed: {e}"),
+        }
+    }
+
+    /// Record a successful write to the already-adopted path without touching
+    /// recent/last or the status line. Autosave runs often; rewriting config
+    /// files and clobbering transient status on every pass would be noise.
+    fn note_autosaved(&mut self, project: &crate::mod_project::ModProjectFile) {
+        self.last_saved_snapshot = Some(Self::snapshot_for_dirty(project));
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
+    }
+
+    /// Write an already-built project to its file. Shared by the manual
+    /// save path and the autosave pass so both persist identical bytes.
+    fn persist_project_file(
+        project: &crate::mod_project::ModProjectFile,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .map(crate::mod_export::slugify)
+            .unwrap_or_else(|| "project".into());
+        let asset_dir = format!("{stem}_assets");
+        crate::mod_export::write_portable_project(project, path, &asset_dir)
+    }
+
+    /// Debounced autosave: persist dirty edits to the current path a beat after
+    /// they land. Throttled so `build_project` + snapshot serialization does not
+    /// run every frame; debounced so a slider drag writes once, not per tick.
+    fn poll_project_autosave(&mut self, ctx: &egui::Context) {
+        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(800);
+
+        let Some(path) = self.project_path.clone() else {
+            // Nowhere to write yet — Save As gives the project a home, after
+            // which every later edit autosaves.
+            self.project_autosave_pending_since = None;
+            return;
+        };
+        if self.workspace_copy_rx.is_some() {
+            return;
+        }
+        if self.project_autosave_last_check.elapsed() < CHECK_INTERVAL {
+            // Still inside the debounce window: keep frames coming so the save
+            // lands without another edit.
+            if self.project_autosave_pending_since.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            return;
+        }
+        self.project_autosave_last_check = std::time::Instant::now();
+
+        let project = self.build_project();
+        let dirty = match &self.last_saved_snapshot {
+            None => !project.is_empty(),
+            Some(saved) => Some(&Self::snapshot_for_dirty(&project)) != Some(saved),
+        };
+        if !dirty {
+            self.project_autosave_pending_since = None;
+            self.project_autosave_error = None;
+            return;
+        }
+        let since = *self
+            .project_autosave_pending_since
+            .get_or_insert_with(std::time::Instant::now);
+        if since.elapsed() < DEBOUNCE {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            return;
+        }
+        match Self::persist_project_file(&project, &path) {
+            Ok(()) => self.note_autosaved(&project),
+            Err(e) => {
+                self.project_autosave_error = Some(format!("Autosave failed: {e:#}"));
+                // Retry on the next pass; keep the pending instant so failures
+                // do not spin the disk every check.
+                self.project_autosave_last_check = std::time::Instant::now();
+                ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            }
+        }
+    }
+
+    /// Save now when dirty, bypassing the debounce. Used before hub switches
+    /// and deploys so they observe the file the autosave pass would write.
+    fn flush_project_autosave(&mut self) -> bool {
+        let Some(path) = self.project_path.clone() else {
+            return false;
+        };
+        if self.workspace_copy_rx.is_some() {
+            return false;
+        }
+        let project = self.build_project();
+        let dirty = match &self.last_saved_snapshot {
+            None => !project.is_empty(),
+            Some(saved) => Some(&Self::snapshot_for_dirty(&project)) != Some(saved),
+        };
+        if !dirty {
+            self.project_autosave_pending_since = None;
+            self.project_autosave_error = None;
+            return true;
+        }
+        match Self::persist_project_file(&project, &path) {
+            Ok(()) => {
+                self.note_autosaved(&project);
+                true
+            }
+            Err(e) => {
+                self.project_autosave_error = Some(format!("Autosave failed: {e:#}"));
+                false
+            }
         }
     }
 
@@ -17172,7 +17947,7 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.send_reset_pins();
         self.publish_live_rule_union();
         self.project_name = crate::mod_export::slugify(name);
-        // Adopt the scaffolded file immediately: Save writes silently from here.
+        // Adopt the scaffolded file immediately: edits autosave here from now on.
         let project = self.build_project();
         self.adopt_project_path(&file, &project);
         self.import_report = None;
@@ -17180,9 +17955,10 @@ If you step every basis for a                          type and NONE of them mat
         self.state.status = format!("New project at {}.", workspace.display());
     }
 
-    /// A hub choice was clicked: guard discarding actions with the unsaved-edits
-    /// modal, otherwise run immediately.
+    /// A hub choice was clicked: flush any pending autosave first, then guard
+    /// only what autosave could not persist (no path yet, or a failed write).
     fn request_hub_action(&mut self, action: crate::project_hub::HubAction) {
+        self.flush_project_autosave();
         if crate::project_hub::needs_hub_warning(self.is_project_dirty(), &action) {
             self.hub_pending = Some(action);
             return;
@@ -17207,7 +17983,7 @@ If you step every basis for a                          type and NONE of them mat
             crate::project_hub::HubAction::BrowseWithoutProject => {
                 self.project_hub.show = false;
                 self.state.status =
-                    "Browsing without a project — edits stay in memory until saved.".into();
+                    "Browsing without a project — edits stay in memory until File → Save As… gives them a home.".into();
             }
         }
     }
@@ -17260,7 +18036,7 @@ If you step every basis for a                          type and NONE of them mat
                 }
             };
         project.name = stem.clone();
-        // Write the adopted project beside its assets so Save round-trips silently.
+        // Write the adopted project beside its assets so later edits autosave onto it.
         match crate::mod_export::write_portable_project(&project, &project_file, &asset_dir) {
             Ok(()) => {}
             Err(e) => {
@@ -17306,20 +18082,16 @@ If you step every basis for a                          type and NONE of them mat
             .resizable(true)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("One workspace folder holds every edit. Pick where to start.");
-                ui.label(
-                    egui::RichText::new(
-                        "New scaffolds modproject.json + assets/ + romfs/ overlay. \
-                         Models/animations go in romfs/fighter/… — see Windows → Project Files.",
-                    )
-                    .small()
-                    .color(egui::Color32::GRAY),
-                );
-                ui.add_space(6.0);
                 if let Some(last) = &last {
                     if ui
-                        .button(format!("Resume last — {}", last.display()))
-                        .on_hover_text("Reopen the project that was open last session")
+                        .button(format!(
+                            "Resume {}",
+                            last.parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("last project")
+                        ))
+                        .on_hover_text(last.display().to_string())
                         .clicked()
                     {
                         chosen = Some(crate::project_hub::HubAction::ResumeLast(last.clone()));
@@ -17328,7 +18100,7 @@ If you step every basis for a                          type and NONE of them mat
                 if ui
                     .button("New project…")
                     .on_hover_text(
-                        "Pick a workspace folder — every edit lives there from the first save",
+                        "Pick a workspace folder — every edit lives there and autosaves",
                     )
                     .clicked()
                 {
@@ -17337,7 +18109,7 @@ If you step every basis for a                          type and NONE of them mat
                     }
                 }
                 if ui
-                    .button("Open… (modproject.json)")
+                    .button("Open project…")
                     .on_hover_text("Open an editable project for further editing")
                     .clicked()
                 {
@@ -17360,7 +18132,7 @@ If you step every basis for a                          type and NONE of them mat
                         chosen = Some(crate::project_hub::HubAction::ImportMod(folder));
                     }
                 }
-                if !recent.is_empty() {
+                if recent.iter().any(|path| Some(path) != last.as_ref()) {
                     ui.separator();
                     ui.label("Recent");
                     for path in &recent {
@@ -17372,7 +18144,11 @@ If you step every basis for a                          type and NONE of them mat
                             .and_then(|p| p.file_name())
                             .and_then(|n| n.to_str())
                             .unwrap_or_else(|| path.to_str().unwrap_or("project"));
-                        if ui.button(format!("{label} — {}", path.display())).clicked() {
+                        if ui
+                            .button(label)
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
                             chosen = Some(crate::project_hub::HubAction::OpenRecent(path.clone()));
                         }
                     }
@@ -17387,10 +18163,17 @@ If you step every basis for a                          type and NONE of them mat
                 }
                 if dirty {
                     ui.add_space(4.0);
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "Unsaved edits — switching projects will warn first.",
-                    );
+                    if current_path.is_none() {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Edits are in memory — File → Save As… gives them a home before switching.",
+                        );
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::YELLOW,
+                            "Edits are still saving — switching now keeps what autosave already wrote.",
+                        );
+                    }
                 }
                 if let Some(path) = &current_path {
                     ui.add_space(2.0);
@@ -17417,15 +18200,18 @@ If you step every basis for a                          type and NONE of them mat
             return;
         };
         let mut decision: Option<&'static str> = None;
-        egui::Window::new("Unsaved edits")
+        egui::Window::new("Edits not yet autosaved")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label("The current project has unsaved edits. Save them first?");
+                ui.label(
+                    "The current project has edits autosave could not write yet \
+                     (no project file, or the last write failed). Save them first?",
+                );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if ui.button("Save…").clicked() {
                         decision = Some("save");
                     }
                     if ui.button("Discard").clicked() {
@@ -17439,8 +18225,8 @@ If you step every basis for a                          type and NONE of them mat
         match decision {
             Some("save") => {
                 self.save_project_silent();
-                // A Save As cancel leaves the edits unsaved — stay put.
-                if self.is_project_dirty() && self.project_path.is_none() {
+                // A Save As cancel — or a failed write — leaves edits unsaved. Stay put.
+                if self.is_project_dirty() {
                     return;
                 }
                 self.hub_pending = None;
@@ -17531,85 +18317,422 @@ If you step every basis for a                          type and NONE of them mat
         }
     }
 
+    fn next_workspace_asset_generation(&mut self) -> u64 {
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(1);
+        let generation = clock
+            .max(self.workspace_asset_generation.saturating_add(1))
+            .max(
+                self.game_link
+                    .asset_bundle_status()
+                    .generation
+                    .saturating_add(1),
+            )
+            .max(1);
+        self.workspace_asset_generation = generation;
+        generation
+    }
+
+    /// Stage the selected workspace model/motion files on the emulator SD and publish one full
+    /// carrier snapshot. The plugin reports callback reads separately; queuing this snapshot is
+    /// not presented as proof that a parsed game resource has already changed.
+    fn send_workspace_asset_bundle(
+        &mut self,
+        workspace: &std::path::Path,
+        fighter: &str,
+        slot: u8,
+    ) {
+        self.game_link.ensure_started();
+        if self.game_link.status() != crate::game_link::LinkStatus::Connected {
+            self.state.status = "Connect to the game before reloading the asset preview.".into();
+            return;
+        }
+        let Some(sd) = crate::scratch_dirs::emulator_sd_root() else {
+            self.state.status = "Emulator SD card not found. Set it in Visionary before sending model or animation files."
+                .into();
+            return;
+        };
+        if let Err(error) = crate::carrier_support::install(&sd) {
+            self.state.status = format!("Could not install live asset support: {error:#}");
+            return;
+        }
+        let generation = self.next_workspace_asset_generation();
+        let cache_root = sd.join("effect_viewer").join("live_assets").join("files");
+        let live_root = match crate::asset_snapshots::reserve(&cache_root, generation) {
+            Ok(path) => path,
+            Err(error) => {
+                self.state.status = format!("Could not stage preview snapshot: {error:#}");
+                return;
+            }
+        };
+        let fighter_entry = self
+            .state
+            .fighters
+            .iter()
+            .find(|entry| entry.name == fighter);
+        let slot_component = format!("c{slot:02}");
+        let vanilla_motion = fighter_entry.map(|entry| {
+            entry
+                .fighter_dir
+                .join("motion")
+                .join("body")
+                .join(&slot_component)
+        });
+        let vanilla_model = fighter_entry.map(|entry| {
+            entry
+                .fighter_dir
+                .join("model")
+                .join("body")
+                .join(&slot_component)
+        });
+        let files = match crate::project_hub::prepare_carrier_assets(
+            workspace,
+            fighter,
+            slot,
+            None,
+            vanilla_motion.as_deref(),
+            vanilla_model.as_deref(),
+            &live_root,
+        ) {
+            Ok(bundle) if !bundle.files.is_empty() => bundle,
+            Ok(_) => {
+                let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                self.state.status = format!("No preview assets are staged for c{slot:02}.");
+                return;
+            }
+            Err(error) => {
+                let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                self.state.status = format!("Could not prepare carrier preview: {error:#}");
+                return;
+            }
+        };
+        let crate::project_hub::CarrierBundle {
+            files: staged,
+            vanilla_motion_used,
+            omitted_swing,
+            stripped_lod_meshes,
+        } = files;
+        let file_count = staged.len();
+        let mut wire_files = Vec::with_capacity(file_count);
+        for asset in staged {
+            let size = match std::fs::metadata(&asset.workspace_path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) => {
+                    let _ = crate::asset_snapshots::discard_unpublished(&cache_root, generation);
+                    self.state.status = format!(
+                        "Could not stage {}: {error:#}",
+                        asset.workspace_path.display()
+                    );
+                    return;
+                }
+            };
+            wire_files.push(crate::game_link::AssetBundleFileWire {
+                path: asset.game_path.clone(),
+                file: format!(
+                    "effect_viewer/live_assets/files/{generation}/{}",
+                    asset.game_path
+                ),
+                size,
+            });
+        }
+        self.workspace_asset_sent_slot = Some(slot);
+        self.workspace_asset_cache_root = Some(cache_root);
+        self.game_link
+            .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                generation,
+                target: fighter.to_ascii_lowercase(),
+                files: wire_files,
+            });
+        self.state.status = format!(
+            "Queued {} preview file(s) for {fighter} c{slot:02}{}; waiting for the asset carrier to reload.",
+            file_count,
+            {
+                let mut notes = Vec::new();
+                if !vanilla_motion_used.is_empty() {
+                    notes.push(format!("vanilla {}", vanilla_motion_used.join(", ")));
+                }
+                if omitted_swing {
+                    notes.push("no swing.prc on this fighter".to_owned());
+                }
+                if stripped_lod_meshes > 0 {
+                    notes.push(format!(
+                        "{} far-range mesh{} omitted from the preview only",
+                        stripped_lod_meshes,
+                        if stripped_lod_meshes == 1 { "" } else { "es" }
+                    ));
+                }
+                if notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", notes.join("; "))
+                }
+            }
+        );
+    }
+
     /// Project Files: one folder holds every edit. Supported edits live in
-    /// `modproject.json` / `assets/`; anything the tool does not model
-    /// (models, animations, …) lives in the manual `romfs/` overlay and ships
-    /// verbatim on export.
+    /// `modproject.json` / `assets/`; binary assets live in the `romfs/` overlay, can be sent to
+    /// the carrier for iteration, and ship verbatim on export.
     fn draw_workspace_panel(&mut self, ctx: &egui::Context) {
+        if let Some(receiver) = &self.workspace_copy_rx {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.state.status = match result {
+                        Ok((copied, skipped)) => format!(
+                            "Copied {copied} files into romfs/. Kept {skipped} existing files. Open slot folder to edit them."
+                        ),
+                        Err(error) => format!("Could not copy base files: {error}"),
+                    };
+                    self.workspace_copy_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.state.status = "Base file copy stopped unexpectedly.".into();
+                    self.workspace_copy_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+        let status = self.game_link.asset_bundle_status();
+        if status.generation > self.workspace_asset_reclaimed
+            && status.generation == status.serving_generation
+            && (status.ready || (status.phase == "idle" && status.staged == 0))
+        {
+            if let Some(root) = &self.workspace_asset_cache_root {
+                match crate::asset_snapshots::retire_before(root, status.generation) {
+                    Ok(()) => self.workspace_asset_reclaimed = status.generation,
+                    Err(error) => {
+                        eprintln!("Could not reclaim retired asset snapshots: {error:#}");
+                        // Avoid retrying a failing filesystem operation on every UI frame.
+                        self.workspace_asset_reclaimed = status.generation;
+                    }
+                }
+            }
+        }
         if !self.show_workspace {
             return;
         }
+        if let Some(error) = self.game_link.take_asset_bundle_error() {
+            let mut message = format!("Asset carrier: {error}");
+            if error.contains("reserved slot") {
+                message.push_str(
+                    " — the carrier was dropped (death, Training reset, or touching items clears it). Press Reload asset preview again and keep the host idle.",
+                );
+            }
+            self.state.status = message;
+        }
+        enum WorkspaceAction {
+            CopyBaseFiles,
+            CopyBaseModel,
+            CopyBaseCharacter,
+            ImportModelFolder,
+            ImportModelFiles,
+            ImportAnimations,
+            ImportSwing,
+            Send,
+            Stop,
+            Reveal,
+        }
+
         let mut open = self.show_workspace;
         let workspace = self
             .project_path
             .as_ref()
             .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        let fighter = self
+            .state
+            .selected_fighter
+            .and_then(|index| self.state.fighters.get(index))
+            .map(|entry| {
+                (
+                    entry.name.clone(),
+                    entry.display_name.clone(),
+                    entry.slots.clone(),
+                    entry.base_slot(),
+                )
+            });
+        if let Some((_, _, slots, base_slot)) = &fighter {
+            if !slots.contains(&self.workspace_asset_slot) {
+                self.workspace_asset_slot = *base_slot;
+            }
+        }
+        let mut action = None;
         egui::Window::new("Project Files")
             .open(&mut open)
             .resizable(true)
             .show(ctx, |ui| {
-                match &workspace {
-                    Some(dir) => {
-                        ui.label(format!("Workspace: {}", dir.display()));
+                if let Some(dir) = &workspace {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Open project folder").clicked() {
+                            if let Err(error) = crate::roster::reveal::reveal(dir) {
+                                self.state.status = error.to_string();
+                            }
+                        }
+                        if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base game files…")).on_disabled_hover_text("Choose a base game folder from File, or wait for the current copy to finish.").clicked() {
+                            action = Some(WorkspaceAction::CopyBaseFiles);
+                        }
+                    });
+                    ui.weak("Copy files into romfs/, edit them, then export your mod.");
+                } else {
+                    if ui.button("Open or create a project…").clicked() {
+                        self.project_hub.show = true;
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if let Some((_, display, slots, _)) = &fighter {
+                        ui.label(display);
+                        egui::ComboBox::from_id_salt("workspace_asset_slot")
+                            .selected_text(format!("c{:02}", self.workspace_asset_slot))
+                            .width(58.0)
+                            .show_ui(ui, |ui| {
+                                for slot in slots {
+                                    ui.selectable_value(
+                                        &mut self.workspace_asset_slot,
+                                        *slot,
+                                        format!("c{slot:02}"),
+                                    );
+                                }
+                            });
+                    }
+                });
+                match (&workspace, &fighter) {
+                    (Some(workspace), Some((fighter, _, _, _))) => {
+                        let inventory = crate::project_hub::workspace_asset_inventory(
+                            workspace,
+                            fighter,
+                            self.workspace_asset_slot,
+                        )
+                        .unwrap_or_default();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} model file{} · {} animation{} · swing.prc {}",
+                                inventory.model_files.len(),
+                                if inventory.model_files.len() == 1 { "" } else { "s" },
+                                inventory.animations.len(),
+                                if inventory.animations.len() == 1 { "" } else { "s" },
+                                if inventory.swing_prc { "ready" } else { "not added" },
+                            ))
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                        let asset_status = self.game_link.asset_bundle_status();
+                        if asset_status.target == fighter.to_ascii_lowercase()
+                            && asset_status.generation == self.workspace_asset_generation
+                            && self.workspace_asset_sent_slot == Some(self.workspace_asset_slot)
+                        {
+                            let message = format!("Asset carrier: {} · {}/{} files loaded",
+                                if asset_status.ready { "preview ready" }
+                                else if asset_status.phase == "ready" { "awaiting carrier confirmation" }
+                                else { &asset_status.phase },
+                                asset_status.served, asset_status.staged);
+                            ui.label(
+                                egui::RichText::new(message)
+                                    .small()
+                                    .color(egui::Color32::from_rgb(125, 190, 235)),
+                            );
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base character")).on_hover_text("Copy this costume's base model AND animations (all model/motion parts, motion_list.bin, swing.prc) into romfs/ for editing; keep existing edits").clicked() {
+                                action = Some(WorkspaceAction::CopyBaseCharacter);
+                            }
+                            if ui.add_enabled(self.state.data_root.is_some() && self.workspace_copy_rx.is_none(), egui::Button::new("Copy base model")).on_hover_text("Copy the complete base game model and textures for this costume; keep existing edits").clicked() {
+                                action = Some(WorkspaceAction::CopyBaseModel);
+                            }
+                            if ui.button("Model folder…").on_hover_text(
+                                "Copy a complete model folder into this project's selected fighter/costume",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportModelFolder);
+                            }
+                            if ui.button("Model files…").on_hover_text(
+                                "Copy selected model, material, skeleton, helper, or texture files",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportModelFiles);
+                            }
+                            if ui.button("Animations…").on_hover_text(
+                                "Copy one or more .nuanmb files into the selected motion folder",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportAnimations);
+                            }
+                            if ui.button("swing.prc…").on_hover_text(
+                                "Copy a .prc file into the selected motion folder as swing.prc",
+                            ).clicked() {
+                                action = Some(WorkspaceAction::ImportSwing);
+                            }
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(
+                                    inventory.total_files() > 0,
+                                    egui::Button::new("Reload asset preview"),
+                                )
+                                .on_hover_text(
+                                    "Load model, animation, and swing resources onto the main fighter through a temporary hidden carrier. Keep the ordinary item slot empty while loading.",
+                                )
+                                .clicked()
+                            {
+                                action = Some(WorkspaceAction::Send);
+                            }
+                            if ui.button("Open slot folder").on_hover_text("Open this costume's project copies (romfs/fighter/… — the files you edit) in your file manager").clicked() {
+                                action = Some(WorkspaceAction::Reveal);
+                            }
+                            if ui.button("Stop preview").clicked() {
+                                action = Some(WorkspaceAction::Stop);
+                            }
+                        });
                         ui.label(
                             egui::RichText::new(
-                                "Manual files go under romfs/ in arc layout and ship on export.",
+                                "Edit the project copies, then reload to preview. Stop restores the original model.",
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                        egui::CollapsingHeader::new("How to preview a model edit")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for step in [
+                                    "1. Start Visionary before the game. Enable Visionary Live Assets in ARCropolis and restart the game after the first installation; later edits reload within the match.",
+                                    "2. Import the model, texture, animation, or swing files you changed. Missing files use the selected costume's vanilla model and motion folders, including motion_list.bin.",
+                                    "3. Connect in Training Mode and press Reload asset preview with the fighter's ordinary item slot empty. The preview follows the fighter's current animation and frame; the item slot is released after construction.",
+                                    "4. Edit the imported copies, then reload again. Stop preview restores the original model. Do not spawn a normal Alucard assist during a preview.",
+                                    "The preview changes appearance and swing physics; the fighter's gameplay collision and attacks remain unchanged. Export Mod Folder retains the original asset filenames.",
+                                ] {
+                                    ui.label(egui::RichText::new(step).small());
+                                }
+                            });
+                    }
+                    (None, _) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "Open or create a project before importing iteration files.",
                             )
                             .small()
                             .color(egui::Color32::GRAY),
                         );
                     }
-                    None => {
-                        ui.label("No project open — pick one in the Project Hub first.");
+                    (_, None) => {
                         ui.label(
                             egui::RichText::new(
-                                "New picks a workspace folder so every edit has a home.",
+                                "Select a fighter to choose its model and motion paths.",
                             )
                             .small()
                             .color(egui::Color32::GRAY),
                         );
                     }
                 }
+
                 ui.add_space(6.0);
+                ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(380.0)
                     .show(ui, |ui| {
-                        for entry in crate::project_hub::workspace_map() {
-                            let (icon, color) = match entry.support {
-                                crate::project_hub::WorkspaceSupport::Supported => {
-                                    ("✓", egui::Color32::from_rgb(120, 220, 120))
-                                }
-                                crate::project_hub::WorkspaceSupport::Reference => {
-                                    ("◈", egui::Color32::from_rgb(150, 180, 230))
-                                }
-                                crate::project_hub::WorkspaceSupport::Manual => {
-                                    ("▣", egui::Color32::from_rgb(220, 200, 120))
-                                }
-                            };
-                            let support = match entry.support {
-                                crate::project_hub::WorkspaceSupport::Supported => "supported",
-                                crate::project_hub::WorkspaceSupport::Reference => "reference",
-                                crate::project_hub::WorkspaceSupport::Manual => "manual",
-                            };
-                            ui.horizontal(|ui| {
-                                ui.colored_label(color, icon);
-                                ui.label(egui::RichText::new(entry.kind).strong().small());
-                                ui.label(
-                                    egui::RichText::new(format!("[{support}]"))
-                                        .small()
-                                        .color(color),
-                                );
-                            });
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "workspace: {}  →  game: {}",
-                                    entry.workspace_path, entry.game_path
-                                ))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                            );
-                            ui.label(egui::RichText::new(entry.notes).small());
-                            ui.add_space(4.0);
+                        if let Some(dir) = &workspace {
+                            crate::ui::file_tree(ui, dir);
                         }
                     });
                 ui.add_space(4.0);
@@ -17620,6 +18743,181 @@ If you step every basis for a                          type and NONE of them mat
                 });
             });
         self.show_workspace = open;
+
+        if matches!(
+            action,
+            Some(
+                WorkspaceAction::CopyBaseFiles
+                    | WorkspaceAction::CopyBaseModel
+                    | WorkspaceAction::CopyBaseCharacter
+            )
+        ) {
+            let (Some(workspace), Some(root)) = (&workspace, &self.state.data_root) else {
+                self.state.status = "Choose a base game folder from File first.".into();
+                return;
+            };
+            let sources = if matches!(action, Some(WorkspaceAction::CopyBaseCharacter)) {
+                let Some((fighter, _, _, _)) = &fighter else {
+                    return;
+                };
+                let slot = self.workspace_asset_slot;
+                match crate::project_hub::collect_base_character_files(root, fighter, slot) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        self.state.status = format!("Could not read base character: {error:#}");
+                        return;
+                    }
+                }
+            } else if matches!(action, Some(WorkspaceAction::CopyBaseModel)) {
+                let Some((fighter, _, _, _)) = &fighter else {
+                    return;
+                };
+                let folder = root
+                    .join("fighter")
+                    .join(fighter)
+                    .join("model/body")
+                    .join(format!("c{:02}", self.workspace_asset_slot));
+                match std::fs::read_dir(&folder).and_then(|entries| {
+                    entries
+                        .filter_map(|entry| match entry {
+                            Ok(entry) if entry.path().is_file() => Some(Ok(entry.path())),
+                            Ok(_) => None,
+                            Err(error) => Some(Err(error)),
+                        })
+                        .collect::<std::io::Result<Vec<_>>>()
+                }) {
+                    Ok(files) => files,
+                    Err(error) => {
+                        self.state.status = format!("Could not read base model: {error}");
+                        return;
+                    }
+                }
+            } else {
+                let Some(files) = rfd::FileDialog::new()
+                    .set_title("Copy base game files into project")
+                    .set_directory(root)
+                    .pick_files()
+                else {
+                    return;
+                };
+                files
+            };
+            let workspace = workspace.clone();
+            let root = root.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            self.workspace_copy_rx = Some(receiver);
+            self.state.status = "Copying base game files…".into();
+            std::thread::spawn(move || {
+                let result = crate::project_hub::copy_base_files(&workspace, &root, &sources)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = sender.send(result);
+            });
+            return;
+        }
+
+        let (Some(action), Some(workspace), Some((fighter, _, _, _))) =
+            (action, workspace, fighter)
+        else {
+            return;
+        };
+        let slot = self.workspace_asset_slot;
+        let result: anyhow::Result<Vec<std::path::PathBuf>> = match action {
+            WorkspaceAction::CopyBaseFiles
+            | WorkspaceAction::CopyBaseModel
+            | WorkspaceAction::CopyBaseCharacter => unreachable!(),
+            WorkspaceAction::ImportModelFolder => {
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose model folder")
+                    .pick_folder()
+                else {
+                    return;
+                };
+                crate::project_hub::import_model_folder(&workspace, &fighter, slot, &source)
+            }
+            WorkspaceAction::ImportModelFiles => {
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose model files")
+                    .add_filter(
+                        "Smash model files",
+                        crate::project_hub::MODEL_ASSET_EXTENSIONS,
+                    )
+                    .pick_files()
+                else {
+                    return;
+                };
+                crate::project_hub::import_model_files(&workspace, &fighter, slot, &sources)
+            }
+            WorkspaceAction::ImportAnimations => {
+                let Some(sources) = rfd::FileDialog::new()
+                    .set_title("Choose animations")
+                    .add_filter("Smash animation", &["nuanmb"])
+                    .pick_files()
+                else {
+                    return;
+                };
+                crate::project_hub::import_animation_files(&workspace, &fighter, slot, &sources)
+            }
+            WorkspaceAction::ImportSwing => {
+                let Some(source) = rfd::FileDialog::new()
+                    .set_title("Choose swing.prc")
+                    .add_filter("Swing parameters", &["prc"])
+                    .pick_file()
+                else {
+                    return;
+                };
+                crate::project_hub::import_swing_prc(&workspace, &fighter, slot, &source)
+                    .map(|path| vec![path])
+            }
+            WorkspaceAction::Send => {
+                self.send_workspace_asset_bundle(&workspace, &fighter, slot);
+                return;
+            }
+            WorkspaceAction::Stop => {
+                let generation = self.next_workspace_asset_generation();
+                self.game_link
+                    .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                        generation,
+                        target: String::new(),
+                        files: Vec::new(),
+                    });
+                self.state.status = "Asset preview stop queued.".into();
+                return;
+            }
+            WorkspaceAction::Reveal => {
+                let (model, _) = match crate::project_hub::workspace_fighter_slot_dirs(
+                    &workspace, &fighter, slot,
+                ) {
+                    Ok(paths) => paths,
+                    Err(error) => {
+                        self.state.status = format!("Could not open slot folder: {error:#}");
+                        return;
+                    }
+                };
+                let slot_root = model
+                    .parent()
+                    .and_then(std::path::Path::parent)
+                    .and_then(std::path::Path::parent)
+                    .unwrap_or(&model);
+                match crate::roster::reveal::reveal(slot_root) {
+                    Ok(()) => self.state.status = format!("Opened {}", slot_root.display()),
+                    Err(error) => {
+                        self.state.status =
+                            format!("Could not open {}: {error:#}", slot_root.display())
+                    }
+                }
+                return;
+            }
+        };
+        match result {
+            Ok(files) => {
+                self.state.status = format!(
+                    "Imported {} file{} for {fighter} c{slot:02}; ready to send or export.",
+                    files.len(),
+                    if files.len() == 1 { "" } else { "s" }
+                );
+            }
+            Err(error) => self.state.status = format!("Asset import failed: {error:#}"),
+        }
     }
 
     /// Export one directly installable ARCropolis mod folder. The generated Skyline plugin
@@ -17635,8 +18933,20 @@ If you step every basis for a                          type and NONE of them mat
     }
 
     fn export_mod(&mut self, developer: bool) {
+        if self.workspace_copy_rx.is_some() {
+            self.state.status =
+                "Wait for the base game files to finish copying before exporting.".into();
+            return;
+        }
         let project = self.build_project();
-        if project.is_empty() {
+        // The manual workspace overlay is a first-class export even when there are no serialized
+        // ACMD/EFF edits. This is the common model/animation iteration case.
+        let has_workspace_overlay = self
+            .project_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .is_some_and(crate::project_hub::workspace_romfs_has_files);
+        if project.is_empty() && !has_workspace_overlay {
             self.state.status = "No edits to export yet.".into();
             return;
         }
@@ -17702,6 +19012,15 @@ If you step every basis for a                          type and NONE of them mat
             built_source_root,
             has_source,
         } = outcome;
+
+        // `run_export` has no generated source to create the destination for an overlay-only
+        // project. Create it after verification succeeds, preserving the all-or-nothing refusal
+        // behavior documented by `run_export`.
+        if has_workspace_overlay {
+            if let Err(error) = std::fs::create_dir_all(&dest) {
+                errors.push(format!("workspace overlay destination: {error}"));
+            }
+        }
 
         // Roster files ride along in the same folder as their own section in the
         // export tree. They are written after `run_export` succeeds so a refused
@@ -17816,6 +19135,20 @@ If you step every basis for a                          type and NONE of them mat
                     }
                     Err(e) => errors.push(format!("workspace overlay failed: {e:#}")),
                 }
+            }
+        }
+
+        // A binary-overlay-only export has neither generated EFF nor ACMD source, so
+        // `run_export` correctly has no generated-data reason to write this descriptor. It is
+        // still an ARCropolis mod folder and needs a descriptor to be discoverable.
+        if !developer && has_workspace_overlay && !dest.join("info.toml").is_file() {
+            let display_name = serde_json::to_string(&self.project_name)
+                .unwrap_or_else(|_| "\"Visionary mod\"".into());
+            let info = format!(
+                "display_name = {display_name}\nauthors = \"Visionary\"\nversion = \"1.0.0\"\ndescription = \"Model, animation, and other binary assets exported by Visionary\"\ncategory = \"Misc\"\n"
+            );
+            if let Err(error) = std::fs::write(dest.join("info.toml"), info) {
+                errors.push(format!("workspace overlay info.toml: {error}"));
             }
         }
 
@@ -18118,6 +19451,7 @@ If you step every basis for a                          type and NONE of them mat
         // when the JSON was opened.
         self.normalize_effect_call_storage();
         let live_report = self.rebuild_all_saved_live_rules();
+        let resume_target = live_report.resume_target.clone();
         self.push_effect_aliases();
         // Rebuild merged views for every fighter with transplant ops so the eff editor and
         // viewport show them (character-centric overlays survive project reloads).
@@ -18142,6 +19476,7 @@ If you step every basis for a                          type and NONE of them mat
         for fighter in deployable {
             self.deploy_live_eff(&fighter);
         }
+        self.restore_project_editor_selection(resume_target);
 
         // All project-owned files and in-memory stores are complete now. Release the barrier and
         // publish the replacement state in full-list protocol messages: reset old pins first,
@@ -18180,10 +19515,12 @@ If you step every basis for a                          type and NONE of them mat
             self.project_name
         );
         self.state.status.push_str(&live_report.status_suffix());
-        // Load adopts the path: the next Save writes here silently.
+        // Load adopts the path: later edits autosave here.
         let snapshot = Self::snapshot_for_dirty(&self.build_project());
         self.project_path = Some(path.to_path_buf());
         self.last_saved_snapshot = Some(snapshot);
+        self.project_autosave_pending_since = None;
+        self.project_autosave_error = None;
         if let Some(config_dir) = app_config_dir() {
             crate::project_hub::push_recent(&config_dir, path);
             self.project_hub.last = Some(path.to_path_buf());
@@ -18479,6 +19816,16 @@ If you step every basis for a                          type and NONE of them mat
         self.game_link.send_effect_control_rules(&[]);
         self.game_link.send_hitbox_rules(&[]);
         self.game_link.send_effect_aliases(&[]);
+        // Asset-bundle callbacks are a distinct full snapshot from the effect carrier. Clear it
+        // on project replacement too, otherwise a later genuine fighter load could read files
+        // staged for the project that was just closed.
+        let asset_generation = self.next_workspace_asset_generation();
+        self.game_link
+            .send_asset_bundle(&crate::game_link::AssetBundleWire {
+                generation: asset_generation,
+                target: String::new(),
+                files: Vec::new(),
+            });
         // Tear the live CARRIER down too. Authored colour edits are cloned into it (the
         // fighter's own eff cannot be reloaded mid-match), so without this they survive a
         // "clear all" and keep rendering — the carrier's donor bytes stay resident in the
@@ -26211,11 +27558,7 @@ If you step every basis for a                          type and NONE of them mat
                     ui.colored_label(egui::Color32::GRAY, "Pick a target fighter.");
                     return;
                 };
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.transplant_search)
-                        .hint_text("Search every effect entry (all fighters + sys/common)…")
-                        .desired_width(f32::INFINITY),
-                );
+                crate::ui::search_field(ui, "transplant_search", &mut self.transplant_search, "Search all effects…");
 
                 // Live kinds that match — effects the running game has actually used.
                 let q = self.transplant_search.trim().to_lowercase();
@@ -28627,7 +29970,7 @@ If you step every basis for a                          type and NONE of them mat
         );
     }
 
-    /// Record (or update) the Modify edit for effect call `i` in the current move.
+    /// Record (or update) the edit for effect call `i` in the current move.
     /// Added calls keep their `Add` record updated instead.
     fn record_effect_call_edit(&mut self, i: usize) {
         // A live capture may have been armed before the user touched this call. Letting that
@@ -28662,6 +30005,12 @@ If you step every basis for a                          type and NONE of them mat
             if let Some(p) = pristine_call {
                 existing.pristine.get_or_insert(p);
             }
+        } else if is_added {
+            edits.push(crate::data::EffectCallEdit {
+                index: i,
+                op: crate::data::EffectCallOp::Add(call),
+                pristine: None,
+            });
         } else {
             edits.push(crate::data::EffectCallEdit {
                 index: i,
@@ -28997,13 +30346,23 @@ If you step every basis for a                          type and NONE of them mat
                     rules.push(Self::build_effect_stop_suppression(old, motion));
                 }
             }
-            // Swap and/or retime: the effect NAME or FRAME changed → suppress the original
-            // spawn and inject the new effect at the new frame (transform baked in). The
-            // injected call reuses the original spawn's captured args with the graphic hash
-            // swapped to the new effect. Needs a live capture of the original; without one,
-            // fall back to a transform rule (export still applies the swap) and flag it.
+            // Swap, retime, or re-attach: the effect NAME, FRAME, or BONE changed →
+            // suppress the original spawn and inject the new effect at the new frame (bone
+            // and transform baked in). The injected call reuses the original spawn's
+            // captured args with the graphic hash swapped to the new effect. Needs a live
+            // capture of the original; without one, fall back to a transform rule (export
+            // still applies the swap) and flag it.
+            //
+            // Bone lives here rather than in the transform rule below because the plugin's
+            // per-spawn override wire carries only pos/rot/scale — there is no bone slot to
+            // rewrite (see SpawnRuleWire). A bone-only edit with no inject would otherwise
+            // push no rule at all and read exactly like issue #36: offset/rotation/scale
+            // preview live while the bone silently does not.
             let retimed = pristine
                 .map(|p| p.active_start != ec.active_start)
+                .unwrap_or(false);
+            let reattached = pristine
+                .map(|p| !p.bone_name.eq_ignore_ascii_case(&ec.bone_name))
                 .unwrap_or(false);
             let swapped = pristine
                 .map(|p| {
@@ -29013,23 +30372,23 @@ If you step every basis for a                          type and NONE of them mat
                         || p.flip_axis != ec.flip_axis
                 })
                 .unwrap_or(true);
-            if (retimed || swapped) && ec.work_int.is_some() {
+            if (retimed || swapped || reattached) && ec.work_int.is_some() {
                 // A retimed injection replays the spawn call, but not the separate WorkModule
                 // assignment that followed it in source. Without a verified runtime Work ID
                 // mapping, leaving this live path untouched is safer than storing the handle in
                 // the wrong slot.
                 unsupported_work_int = true;
             }
-            if retimed || swapped {
+            if retimed || swapped || reattached {
                 if let Some(inject) =
                     self.build_effect_inject(ec, motion, donor_hash, donor_occurrence)
                 {
-                    // A retime or a swap replaces an authored spawn, so that spawn is suppressed
-                    // at its pristine frame. An ADDED call replaces nothing: it has no pristine,
-                    // so `orig_hash` is its own hash and `window` is its own frame, and this rule
-                    // would suppress the script's spawn of that same effect there. Duplicating a
-                    // spawn then showed ONE effect in game instead of two, which reads exactly
-                    // like the add never applied.
+                    // A retime, re-attach, or swap replaces an authored spawn, so that spawn is
+                    // suppressed at its pristine frame. An ADDED call replaces nothing: it has
+                    // no pristine, so `orig_hash` is its own hash and `window` is its own
+                    // frame, and this rule would suppress the script's spawn of that same
+                    // effect there. Duplicating a spawn then showed ONE effect in game
+                    // instead of two, which reads exactly like the add never applied.
                     if pristine.is_some() {
                         rules.push(crate::game_link::SpawnRuleWire {
                             eff_hash: orig_hash,
@@ -29066,10 +30425,10 @@ If you step every basis for a                          type and NONE of them mat
                         // Unconditional here, unlike the transform rule below. An injected
                         // spawn replays the captured argument list, which is the spawn call
                         // alone — the script's `LAST_EFFECT_SET_RATE` line is a separate call
-                        // and is not in it. So a retimed or swapped spawn with any rate at
-                        // all has to be told its rate, not just one whose rate was edited.
-                        // Tint and opacity are separate lines for the same reason and are sent
-                        // on the same unconditional terms.
+                        // and is not in it. So a retimed, re-attached, or swapped spawn with
+                        // any rate at all has to be told its rate, not just one whose rate was
+                        // edited. Tint and opacity are separate lines for the same reason and
+                        // are sent on the same unconditional terms.
                         rate: ec.rate,
                         camera_offset: ec.camera_offset,
                         tint: ec.tint,
@@ -31507,6 +32866,9 @@ impl eframe::App for VisionaryApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let frame_t = self.perf.start();
         let ctx = ui.ctx().clone();
+        // Background workers and game reports must be polled even without pointer or keyboard
+        // events. This deadline also keeps an unfocused window's progress/status current.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
         // Keep the game link alive whenever the app runs — live offsets, hitbox rules,
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
@@ -31525,6 +32887,28 @@ impl eframe::App for VisionaryApp {
                 self.move_list = moves;
                 self.move_list_receiver = None;
                 self.state.status = format!("Loaded {} moves.", count);
+                if let Some((fighter_name, move_name)) = self.pending_project_move_selection.take()
+                {
+                    let still_selected = self
+                        .state
+                        .selected_fighter
+                        .and_then(|index| self.state.fighters.get(index))
+                        .is_some_and(|fighter| fighter.name.eq_ignore_ascii_case(&fighter_name));
+                    if still_selected {
+                        if let Some(move_entry) = self
+                            .move_list
+                            .iter()
+                            .find(|entry| entry.name == move_name)
+                            .cloned()
+                        {
+                            self.select_move(move_entry);
+                        } else {
+                            self.state.status = format!(
+                                "Loaded {count} moves, but {fighter_name}'s saved move {move_name} is not in this data root."
+                            );
+                        }
+                    }
+                }
                 ctx.request_repaint();
             }
         }
@@ -31657,13 +33041,7 @@ impl eframe::App for VisionaryApp {
             self.apply_history_action(HistoryAction::Redo);
             self.history_suppress_frame = true;
         }
-        // One current project holds every edit: Ctrl+S writes silently to its file.
-        if ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::CTRL, egui::Key::S)
-                || i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
-        }) {
-            self.save_project_silent();
-        }
+        // One current project holds every edit: they autosave to its file.
         self.begin_history_frame();
 
         // Edit log window
@@ -31689,27 +33067,34 @@ impl eframe::App for VisionaryApp {
 
         self.credits.show(&ctx);
 
-        // Top menu bar: File / Windows / Mod + status
+        // Top menu bar: File / Windows / Project + status
         let t_menu = self.perf.start();
         egui::Panel::top("menu").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
+                // Menus contain persistent controls such as the project-name field. The default
+                // menu policy closes on every click, which steals focus from text edits before
+                // a character can be typed. Commands still close themselves explicitly below.
+                let menu_config = egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 ui.label(egui::RichText::new("Visionary").size(16.0).color(egui::Color32::WHITE));
                 ui.separator();
 
-                ui.menu_button("File", |ui| {
+                egui::containers::menu::MenuButton::new("File")
+                    .config(menu_config.clone())
+                    .ui(ui, |ui| {
                     if ui.button("Project Hub…").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
                         self.project_hub.show = true;
                         ui.close();
                     }
-                    if ui.button("Save  Ctrl+S").on_hover_text("Write the current project silently to its file (asks once when it has none)").clicked() {
-                        self.save_project_silent();
-                        ui.close();
-                    }
-                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json").clicked() {
+                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
                         self.save_project_as();
                         ui.close();
                     }
-                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there (warns first with unsaved edits)").clicked() {
+                    if ui.button("Open Project…").clicked() {
+                        self.load_project();
+                        ui.close();
+                    }
+                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there and autosaves").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
                             self.request_hub_action(crate::project_hub::HubAction::New(folder));
                         }
@@ -31722,7 +33107,7 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     ui.separator();
-                    if ui.button("Open Data Root…").clicked() {
+                    if ui.button("Choose base game folder…").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_folder() {
                             self.set_data_root(path);
                         }
@@ -31769,7 +33154,7 @@ impl eframe::App for VisionaryApp {
                         ui.close();
                     }
                     if !self.recent_effs.is_empty() {
-                        ui.menu_button("Open Recent Eff", |ui| {
+                        ui.menu_button("Recent Effect Files", |ui| {
                             let recents = self.recent_effs.clone();
                             for p in recents {
                                 let label = p
@@ -31785,14 +33170,16 @@ impl eframe::App for VisionaryApp {
                     }
                 });
 
-                ui.menu_button("Windows", |ui| {
+                egui::containers::menu::MenuButton::new("Windows")
+                    .config(menu_config.clone())
+                    .ui(ui, |ui| {
                     ui.checkbox(&mut self.roster.open, "Roster")
                         .on_hover_text(
                             "Mod library, character select screen, new characters, and \
                              fighter-wide trait values (separate window)",
                         );
                     let eff_toggle = ui
-                        .checkbox(&mut self.eff_editor.open, "Eff Editor  Ctrl+Shift+E")
+                        .checkbox(&mut self.eff_editor.open, "Effect Editor  Ctrl+Shift+E")
                         .on_hover_text("Edit .eff authored values with in-game live preview (separate window)");
                     if eff_toggle.changed() && self.eff_editor.open {
                         // Opening the window always shows the selected fighter's eff (a
@@ -31831,7 +33218,14 @@ impl eframe::App for VisionaryApp {
                         .on_hover_text("The people who helped make Visionary possible");
                 });
 
-                ui.menu_button("Mod", |ui| {
+                egui::containers::menu::MenuButton::new("Project")
+                    .config(menu_config)
+                    .ui(ui, |ui| {
+                    if ui.button("Project files…").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
+                        self.show_workspace = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("name:");
                         ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(140.0));
@@ -31844,47 +33238,17 @@ impl eframe::App for VisionaryApp {
                         );
                     } else {
                         ui.label(
-                            egui::RichText::new("file: in memory (Save will ask)")
+                            egui::RichText::new("file: in memory (use File → Save As… for autosave)")
                                 .small()
                                 .color(egui::Color32::GRAY),
                         );
                     }
                     ui.separator();
-                    if ui.button("Save  Ctrl+S")
-                        .on_hover_text("Write the current project silently to its file")
-                        .clicked()
-                    {
-                        self.save_project_silent();
-                        ui.close();
-                    }
-                    if ui.button("Save As…")
-                        .on_hover_text("Relocate the current project to a new modproject.json")
-                        .clicked()
-                    {
-                        self.save_project_as();
-                        ui.close();
-                    }
                     if ui.button("Export Project…")
                         .on_hover_text("Export an editable modproject.json and its assets separately from installable mod and developer files")
                         .clicked()
                     {
                         self.export_project();
-                        ui.close();
-                    }
-                    if ui.button("Load Project…")
-                        .on_hover_text("Load a project/mod (modproject.json) for further editing; re-applies edits to the running game")
-                        .clicked()
-                    {
-                        self.load_project();
-                        ui.close();
-                    }
-                    if ui.button("Import Mod as Project…")
-                        .on_hover_text("Adopt any mod folder as an editable project (roster/names/portraits/values adopted, binaries reference-only)")
-                        .clicked()
-                    {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.request_hub_action(crate::project_hub::HubAction::ImportMod(folder));
-                        }
                         ui.close();
                     }
                     ui.separator();
@@ -31965,17 +33329,7 @@ impl eframe::App for VisionaryApp {
 
                 ui.separator();
                 // Game-link status — same widget language as the Eff Editor header.
-                let (dot, gtxt) = match self.game_link.status() {
-                    crate::game_link::LinkStatus::Connected => {
-                        (egui::Color32::from_rgb(90, 220, 90), "game")
-                    }
-                    crate::game_link::LinkStatus::Connecting => (egui::Color32::YELLOW, "game"),
-                    crate::game_link::LinkStatus::Disconnected => {
-                        (egui::Color32::from_rgb(220, 90, 90), "game")
-                    }
-                };
-                ui.colored_label(dot, "●");
-                ui.label(egui::RichText::new(gtxt).small());
+                crate::ui::game_connection(ui, self.game_link.status());
                 ui.separator();
             });
         });
@@ -31992,11 +33346,6 @@ impl eframe::App for VisionaryApp {
             .resizable(false)
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Status").small().strong())
-                        .on_hover_text(
-                        "The latest load, edit, live-sync, or export result for the main editor.",
-                    );
-                    ui.separator();
                     ui.label(
                         RichText::new(&self.state.status)
                             .small()
@@ -32010,25 +33359,29 @@ impl eframe::App for VisionaryApp {
                                 .color(Color32::GRAY),
                         );
                     }
-                    if self.has_undo() {
-                        ui.separator();
-                        ui.label(
-                            RichText::new("Unsaved edits")
-                                .small()
-                                .color(Color32::YELLOW),
-                        );
-                    }
-                    // One current project holds every edit: always show where Save goes.
+                    // One current project holds every edit: always show where autosave goes.
                     ui.separator();
+                    if let Some(err) = &self.project_autosave_error {
+                        ui.label(RichText::new(err.clone()).small().color(Color32::YELLOW));
+                        ui.separator();
+                    } else if self.project_autosave_pending_since.is_some() {
+                        ui.label(RichText::new("saving…").small().color(Color32::YELLOW));
+                        ui.separator();
+                    }
                     if let Some(path) = &self.project_path {
+                        let suffix = if self.project_autosave_error.is_some() {
+                            ""
+                        } else {
+                            " · autosaved"
+                        };
                         ui.label(
-                            RichText::new(format!("Project: {}", path.display()))
+                            RichText::new(format!("Project: {}{suffix}", path.display()))
                                 .small()
                                 .color(Color32::GRAY),
                         );
                     } else {
                         ui.label(
-                            RichText::new("Project: in memory")
+                            RichText::new("Project: in memory (File → Save As… to autosave)")
                                 .small()
                                 .color(Color32::GRAY),
                         );
@@ -32167,6 +33520,9 @@ impl eframe::App for VisionaryApp {
         }
         let t = self.perf.start();
         self.eff_editor.show(&ctx, &self.game_link);
+        if std::mem::take(&mut self.eff_editor.transplant_requested) {
+            self.show_transplant = true;
+        }
         // Which moves each added character has replaced, read from the edit log so the roster
         // panel does not need its own copy of it.
         self.roster.authored_moves = self.roster.replaced_moves(&self.state.edit_log);
@@ -32176,12 +33532,12 @@ impl eframe::App for VisionaryApp {
             self.state.data_root.as_ref(),
             &self.state.labels,
         );
-        // Deploy stages from in-memory state, so persist the project alongside
+        // Deploy stages from in-memory state, so flush the project alongside
         // it — `build_project` carries the roster edits (order, names, new
         // characters, traits), keeping the file on disk level with the SD.
-        // Silent only when the project has a path: a Save As dialog popping
+        // Only when the project has a path: a Save As dialog popping
         // out of Deploy would hijack the flow, so a pathless project stages
-        // from memory and is told to save.
+        // from memory and is told to use Save As.
         if self.roster.take_save_request() {
             let saved = self.project_path.is_some() && self.save_project_silent();
             self.roster.note_deploy_saved(saved);
@@ -32389,6 +33745,9 @@ impl eframe::App for VisionaryApp {
             }
         }
 
+        // Project autosave: every edit lands on disk without a keybind or button.
+        self.poll_project_autosave(&ctx);
+
         // Delayed serving-chain probe after a live-eff deploy.
         if let Some(due) = self.live_eff_probe_due {
             if std::time::Instant::now() >= due {
@@ -32434,14 +33793,14 @@ impl eframe::App for VisionaryApp {
 
         // Pin-sync check: on a new plugin connection, wait for the resync notifies to land,
         // then prompt about in-game pins this session doesn't know about ("ask on connect").
-        let client = self.game_link.client_id();
+        let client = self.game_link.connection_epoch();
         if client != self.pin_sync_client {
             self.pin_sync_client = client;
             self.pin_sync_prompt = None;
             self.pin_sync_wait = client.map(|_| std::time::Instant::now());
             if client.is_some() {
-                // Fresh plugin connection (game restarted): its RAM-held state is gone —
-                // re-push the live spawn/hitbox rules and transplant aliases we hold.
+                // Re-push the authoritative live state after every fresh plugin connection.
+                // This also restores state when the game restarted between socket sessions.
                 let spawn: Vec<crate::game_link::SpawnRuleWire> = self
                     .effect_rules_store
                     .values()
@@ -32470,6 +33829,7 @@ impl eframe::App for VisionaryApp {
                     self.game_link.send_hitbox_rules(&hit);
                 }
                 self.push_effect_aliases();
+                self.live_overrides.resend_tweaks(&self.game_link);
             }
         }
         if let Some(t0) = self.pin_sync_wait {
@@ -35471,6 +36831,12 @@ fn run_export(
         .as_ref()
         .map(|generated| generated.warnings.clone())
         .unwrap_or_default();
+
+    // A project with only a manual workspace overlay has no generated EFF/source directory to
+    // create `dest` for. Verification has completed above, so creating it here still leaves a
+    // refused export untouched while allowing the shared README/overlay path below to work.
+    std::fs::create_dir_all(dest)
+        .map_err(|error| format!("creating export destination {}: {error}", dest.display()))?;
 
     let mut report: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -40201,6 +41567,40 @@ mod live_effect_capture_tests {
                 assert_eq!(inject.args[11], A::Int(1));
             }
         }
+    }
+
+    /// Issue #36: re-attaching a spawn to another bone must replay the spawn with the new
+    /// bone baked in. The inject builder already writes `bone_name` into the arg vector;
+    /// this pins that contract so a future refactor cannot silently drop it again.
+    #[test]
+    fn reattached_effect_injection_bakes_the_new_bone() {
+        let effect = hash40::hash40("sys_attack_line").0;
+        let bones = HashMap::from([(hash40::hash40("top").0, "top".to_string())]);
+        let effects = HashMap::from([(effect, "sys_attack_line".to_string())]);
+        let capture = spawn("EFFECT_FOLLOW", 4.0, effect);
+        let calls = VisionaryApp::effect_calls_from_captures(
+            std::slice::from_ref(&capture),
+            &bones,
+            &effects,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].bone_name, "top");
+
+        let mut edited = calls[0].clone();
+        edited.bone_name = "haver".into();
+        let inject = VisionaryApp::build_effect_inject_from_captures(
+            &edited,
+            std::slice::from_ref(&capture),
+            Some(effect),
+            0,
+        )
+        .expect("a re-attached spawn replays from its captured donor");
+        assert_eq!(inject.func, "EFFECT_FOLLOW");
+        assert_eq!(
+            inject.args[1],
+            A::Hash(hash40::hash40("haver").0),
+            "the edited bone must reach the game, not the captured one"
+        );
     }
 
     #[test]

@@ -573,26 +573,26 @@ impl RosterWindow {
         }
     }
 
-    /// Take a pending "save the project as part of deploying" request.
+    /// Take a pending "persist the project as part of deploying" request.
     ///
-    /// Deploy stages from in-memory state; without a save alongside it, the
+    /// Deploy stages from in-memory state; without a write alongside it, the
     /// staged files can run ahead of the project file on disk, and a crash
-    /// loses everything since the last save. `app.rs` polls this after the
-    /// window draws and saves silently when the project has a path.
+    /// loses everything since the last autosave. `app.rs` polls this after the
+    /// window draws and flushes the project when it has a path.
     pub fn take_save_request(&mut self) -> bool {
         std::mem::replace(&mut self.save_requested, false)
     }
 
-    /// Note the outcome of the save `app.rs` performed for a deploy, so the
+    /// Note the outcome of the write `app.rs` performed for a deploy, so the
     /// status line reads as one story: what was persisted, then staged.
     /// `false` covers both "no path yet" and a failed write — the latter is
     /// already reported in the main window's own status line.
     pub fn note_deploy_saved(&mut self, saved: bool) {
         if saved {
-            self.status = format!("Saved project. {}", self.status);
+            self.status = format!("Autosaved project. {}", self.status);
         } else {
             self.status = format!(
-                "{}. Project isn't saved — Save it to keep these edits.",
+                "{}. Project isn't saved — use File → Save As… to keep these edits.",
                 self.status
             );
         }
@@ -603,7 +603,7 @@ impl RosterWindow {
     /// emulator yourself afterwards — these files are read at boot.
     ///
     /// Synchronous: the staging is a few small files. Also raises
-    /// `save_requested` so `app.rs` persists the project (roster edits
+    /// `save_requested` so `app.rs` flushes the project (roster edits
     /// included) alongside the staged files.
     fn deploy_to_emulator(&mut self, fighters: &[FighterEntry], data_root: Option<&PathBuf>) {
         let summary = self.export_summary();
@@ -837,10 +837,9 @@ impl RosterWindow {
             .inner_margin(egui::Margin::symmetric(10, 8))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("▦  Mod library");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new(RichText::new("  ⟳ Rescan  ").small()))
+                            .add(egui::Button::new("Rescan"))
                             .on_hover_text("Re-read every imported mod's files from disk")
                             .clicked()
                         {
@@ -848,7 +847,7 @@ impl RosterWindow {
                         }
                         ui.add_space(4.0);
                         if ui
-                            .add(egui::Button::new(RichText::new("  ＋ Import folder  ").small().strong()))
+                            .add(egui::Button::new("Import folder…"))
                             .on_hover_text(
                                 "Pick a folder containing fighter/, effect/, or ui/ — or a folder that \
                                  wraps one.",
@@ -863,7 +862,7 @@ impl RosterWindow {
                             }
                         }
                         if ui
-                            .add(egui::Button::new(RichText::new("  ＋ Import archives  ").small().strong()))
+                            .add(egui::Button::new("Import archives…"))
                             .on_hover_text(
                                 "Pick any number of .zip / .7z mod archives. Archives are extracted for you; \
                                  folders are used in place, so your own edits stay visible.",
@@ -883,8 +882,7 @@ impl RosterWindow {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Import compiled mods here — folders or .zip/.7z archives, many at once. \
-                         Load order decides conflicts: later mods win any file two mods both provide.",
+                        "Later mods take priority when files overlap.",
                     )
                     .small()
                     .weak(),

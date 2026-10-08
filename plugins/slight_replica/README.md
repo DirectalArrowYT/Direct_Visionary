@@ -181,13 +181,15 @@ host-side FTP bridge is not needed there.
 
 The plugin creates its SLight runtime directories automatically. The optional
 setup helper writes `gateway.txt`, whose port value changes the plugin's listen
-port. Keep port `7878` when using Visionary because the editor currently expects
-that port.
+port. Visionary reads the same file from the configured emulator SD card. For
+other layouts, set `VISIONARY_PLUGIN_PORT` or a full `VISIONARY_PLUGIN_ADDR` in
+the environment before starting the editor.
 
 ## Troubleshooting
 
 - If Visionary remains offline, confirm that the game has reached a mode where
-  frames are advancing and that TCP port `7878` is reachable.
+  frames are advancing and that the configured TCP port is reachable (`7878`
+  by default).
 - If the plugin does not start, verify the Skyline loader and all three runtime
   dependencies, then fully restart the game.
 - If live effects never appear, verify that the installed Smashline plugin is
@@ -227,7 +229,7 @@ so one per line or comma-separated both work:
 | --- | --- |
 | `reload` | the effect-manager `load_effects` / `unload_effects` hooks |
 | `liveeff` | the editor's merged-eff manifest registration |
-| `effect` | the seventeen `EffectModule` request and kill hooks |
+| `effect` | the fifteen `EffectModule` request and kill hooks |
 | `acmd` | the ACMD capture and injection hooks |
 | `hitbox` | live ACMD capture and injection for hitboxes and sounds |
 | `agent` | the Smashline line callbacks that drive the per-frame engine |
@@ -237,16 +239,19 @@ Inside the `effect` group the parts can be named separately: `carrier` for the
 carrier-proxy redirection, `remap` for the transplant alias lookup, and `track`
 for the whole spawn-tracking body. Individual `EffectModule` hooks go by
 `req`, `req2d`, `reqfollow`, `reqonjoint`, `reqemit`, `reqcommon`,
-`reqcontinual`, `reqtime`, `reqtimefollow`, `kill`, `endkind`, `detachkind`,
+`reqcontinual`, `reqtime`, `reqtimefollow`, `kill`, `endkind`,
 `killall`, `remove`, `removecommon` and `removetime`, with `reqs` and `kills`
-covering each family at once. `killpass` reduces the stop-kind hooks to a bare
-call through to the game, and `fanout` stops them re-issuing that call for the
-aliased kind and for the carrier.
+covering each family at once. `killpass` reduces the remaining stop-kind hook
+to a bare call through to the game, and `fanout` stops it re-issuing that call
+for the aliased kind and for the carrier. (`detachkind` in an old `off.txt` is
+silently ignored.)
 
-`EffectModule::kill_kind` is not in that list because it is not hooked at all.
-Hooking it deadlocks match loading for any moveset that depends on One Slot
-Effects; the reasoning is recorded where the hook used to be, in
-`effect_viewer/mod.rs`.
+`EffectModule::kill_kind` and `EffectModule::detach_kind` are not in that list
+because neither is hooked at all.
+Hooking either deadlocks for any setup that depends on One Slot
+Effects (`kill_kind` wedges match loading; `detach_kind` freezes the game the
+moment any move hits a shield); the reasoning is recorded where each hook used
+to be, in `effect_viewer/mod.rs`.
 
 Disabling `agent` or `systems` stops the per-frame engine, so live editing and
 the editor connection go with it. Every boot records what it actually installed
