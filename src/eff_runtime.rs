@@ -557,23 +557,33 @@ impl Default for QuadPlanes {
         // emitter. That is a second, independent frame correction living in the same field, and
         // worth separating if a type ever needs different values for the two.
         //
-        //   0  camera facing   X 90, Y 90   (particle motion frame)
+        //   0  camera facing   none: a camera-facing quad has no plane to turn
         //   3  local XY        X 180, Z -90 SYS_ATTACK_ARC
         //   5  local XY        X 90         MIIGUNNER_ATK_SHOT_S, RIDLEY_SMASH_BOMB
         //
         // 1, 4, 6 and 7 are untouched: no effect using them has been checked against the game,
         // and a guessed default is worse than an obvious one because it looks deliberate.
+        //
+        // These turn the QUAD only. Where particles sit and fly is not a convention question:
+        // it is the spawn's frame times the emitter's, both read from the game, and an earlier
+        // turn on type 0 that moved particles was compensating for getting those wrong.
         let mut offsets = [[0.0f32; 3]; 8];
-        offsets[0] = [90.0, 90.0, 0.0];
         offsets[3] = [180.0, 0.0, -90.0];
         offsets[5] = [90.0, 0.0, 0.0];
         Self {
             planes: [0, 1, 1, 1, 1, 1, 1, 1],
             offsets,
-            // Y, Z, X with a quarter frame turn: stepped through live against Dabi's jabs,
-            // the one reading that matched all three. See
-            // `spawn_rotation_defaults_match_dabis_jabs_in_game`.
-            spawn_order: 3,
+            // X, then Y, then Z, about fixed axes: the game's own order. Its effect update
+            // (0x356d7a0 in 13.0.3) turns the spawn's angles into a quaternion with the
+            // helper at 0x3d7950 in mode 0, which run in an emulator gives Rz * Ry * Rx.
+            //
+            // The quarter turn is the fighter's facing: the game's frame has the fighter
+            // looking down +X, the bone's has it looking down +Z. That one was found by eye
+            // against Dabi's jabs, and with it the game's order reproduces all three of them
+            // -- see `spawn_rotation_defaults_match_dabis_jabs_in_game`. Y, Z, X, the order
+            // first dialled in there, agrees with it on that ring's plane and nowhere else,
+            // which is why a ring looked right and an arc did not.
+            spawn_order: 0,
             spawn_frame_turns: 1,
         }
     }
@@ -699,8 +709,9 @@ impl QuadPlanes {
 }
 
 /// Every order a spawn's three angles can be applied in, each about the FIXED axes, as the
-/// axis indices in application order. [`QuadPlanes::default`] picks index 3 (Y, Z, X); index 5
-/// (Z, Y, X) is glam's intrinsic `XYZ`, which is what the renderer used originally.
+/// axis indices in application order. [`QuadPlanes::default`] picks index 0 (X, Y, Z), the
+/// game's own; index 5 (Z, Y, X) is glam's intrinsic `XYZ`, which is what the renderer used
+/// originally.
 pub const SPAWN_ORDERS: [[usize; 3]; 6] =
     [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
 
@@ -720,8 +731,9 @@ pub const SPAWN_ORDER_NAMES: [&str; 6] = [
 /// any of them and cannot tell them apart. Dabi's jabs can: they spawn one flat ring at three
 /// combined rotations. No order alone matched them -- attack13's plane faced the camera under
 /// every one -- until the effect frame was also turned a quarter turn about up from the bone's.
-/// With that turn, Y, Z, X is the order that matched all three; X, Z, Y got two of them and
-/// swung attack11 out of plane. Both stay selectable in case another effect disagrees.
+/// With that turn, X, Y, Z (the game's order) and Y, Z, X both put all three rings in the
+/// right plane, and a ring cannot tell them apart; X, Z, Y got two and swung attack11 out of
+/// plane. All stay selectable for comparison.
 pub fn spawn_rotation_in(degrees: glam::Vec3, order: usize) -> glam::Quat {
     let angles = [degrees.x, degrees.y, degrees.z];
     let axes = [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z];
@@ -881,12 +893,11 @@ pub fn build_particle_batches(
                 // it stacks every emitter of an effect at one point -- SYS_TURN_SMOKE separates
                 // its five by up to 2 units, and collapsed together they are a blob rather than
                 // a cloud.
-                let emitter_rotation = glam::Quat::from_euler(
-                    glam::EulerRot::XYZ,
-                    sim.rotation.x,
-                    sim.rotation.y,
-                    sim.rotation.z,
-                );
+                // X first, then Y, then Z, about fixed axes: Rz * Ry * Rx, which is what the
+                // game's emitter setup (0x88320) builds.
+                let emitter_rotation = glam::Quat::from_rotation_z(sim.rotation.z)
+                    * glam::Quat::from_rotation_y(sim.rotation.y)
+                    * glam::Quat::from_rotation_x(sim.rotation.x);
                 // Bone, then the call's aim, then the emitter's own. Order matters: the call
                 // rotates the whole effect in the bone's frame, and the emitter is a further
                 // turn inside that.
@@ -909,7 +920,19 @@ pub fn build_particle_batches(
                 // They need no correction. Applying one to all of them at once is also why
                 // dialling in the correction for one arc moved the others: a single per-type
                 // constant cannot serve three differently-shaped meshes.
+                //
+                // It turns the quad's axes and nothing else. Particle positions and headings
+                // go through `placed`: they are real geometry too.
                 let orientation = placed * planes.offset_for(sim.billboard_type);
+                // Gravity the emitter marks as the world's pulls down the screen however the
+                // script aimed the effect; the rest of a particle's motion turns with it.
+                let fall = |particle: &crate::eff_sim::SimParticle| {
+                    if sim.world_gravity {
+                        particle.fallen
+                    } else {
+                        placed * particle.fallen
+                    }
+                };
                 // The ACMD call's own offset is in the effect's local frame, as is the
                 // emitter's; both ride through the bone's rotation to reach world space.
                 // The emitter's own offset is inside the effect's rotated frame; the call's is
@@ -991,7 +1014,8 @@ pub fn build_particle_batches(
                                 particle.spin.z,
                             );
                         mesh_batches[batch_index].instances.push(ParticleInstance {
-                            position: (origin + placed * (particle.offset * *scale))
+                            position: (origin
+                                + (placed * particle.offset + fall(&particle)) * *scale)
                                 .to_array(),
                             size: particle.size * *scale,
                             color: [
@@ -1006,7 +1030,7 @@ pub fn build_particle_batches(
                             uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                             orientation: spun.to_array(),
                             plane: quad_mode,
-                            velocity: (orientation * particle.velocity).to_array(),
+                            velocity: (placed * particle.velocity).to_array(),
                             flags: combiner_flags(&sim, key1.is_some()),
                             uv_anim: particle.uv_anim,
                         });
@@ -1049,7 +1073,8 @@ pub fn build_particle_batches(
                             )
                     };
                     batches[batch_index].instances.push(ParticleInstance {
-                        position: (origin + orientation * (particle.offset * *scale))
+                        position: (origin
+                            + (placed * particle.offset + fall(&particle)) * *scale)
                             .to_array(),
                         size: particle.size * *scale,
                         color: [
@@ -1065,7 +1090,7 @@ pub fn build_particle_batches(
                         uv_rect: crate::eff_sim::cell_uv(particle.cell, columns, rows),
                         orientation: spun.to_array(),
                         plane: quad_mode,
-                        velocity: (orientation * particle.velocity).to_array(),
+                        velocity: (placed * particle.velocity).to_array(),
                         flags: combiner_flags(&sim, key1.is_some()),
                         uv_anim: particle.uv_anim,
                     });
@@ -3576,13 +3601,20 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
     ///   attack11  (178, 236, 90)  attack13's arc turned within its plane, peaking overhead
     ///
     /// In the viewer's side view, screen right is the bone's +Z, up is +Y and toward the camera
-    /// is -X. Each candidate was stepped through live; Y, Z, X with a quarter frame turn is the
-    /// one that matched all three.
+    /// is -X. Each candidate was stepped through live with a quarter frame turn. The order is
+    /// now the game's own, X, Y, Z, read from the executable; this is the check that it
+    /// still agrees with everything that was seen.
     #[test]
     fn spawn_rotation_defaults_match_dabis_jabs_in_game() {
         let planes = QuadPlanes::default();
-        assert_eq!(SPAWN_ORDER_NAMES[planes.spawn_order], "Y, Z, X");
+        assert_eq!(SPAWN_ORDER_NAMES[planes.spawn_order], "X, Y, Z");
         assert_eq!(planes.spawn_frame_turns, 1);
+        // The game's order as a product: Rz * Ry * Rx.
+        let degrees = glam::Vec3::new(20.0, 40.0, 60.0);
+        let product = glam::Quat::from_rotation_z(degrees.z.to_radians())
+            * glam::Quat::from_rotation_y(degrees.y.to_radians())
+            * glam::Quat::from_rotation_x(degrees.x.to_radians());
+        assert!(spawn_rotation_in(degrees, planes.spawn_order).dot(product).abs() > 0.9999);
 
         // (right, up, toward camera) for a local axis of the ring.
         let screen = |planes: &QuadPlanes, deg: [f32; 3], local: glam::Vec3| {
@@ -3607,11 +3639,26 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
             .to_degrees();
         assert!((roll - 56.0).abs() < 1.0, "in-plane turn was {roll}");
 
-        // The near miss, X, Z, Y: attack12 and attack13 come out identical, but the Y argument
-        // lands last as a turn about up, swinging attack11 out of the plane like an open door.
+        // The near miss, X, Z, Y: attack12 and attack13 come out in the same planes, but the Y
+        // argument lands last as a turn about up, swinging attack11 out of the plane like an
+        // open door.
         let door = QuadPlanes { spawn_order: 1, ..planes };
-        assert!(screen(&door, jab13, glam::Vec3::Y).dot(n13) > 0.99);
+        assert!(screen(&door, jab13, glam::Vec3::Y).dot(n13).abs() > 0.99);
         assert!(screen(&door, jab11, glam::Vec3::Y).dot(n13).abs() < 0.7);
+
+        // Y, Z, X, the order first settled on, puts all three rings in these same planes. It
+        // differs in how each ring is turned within its plane, which a ring does not show and
+        // an arc does.
+        let first = QuadPlanes { spawn_order: 3, ..planes };
+        for jab in [jab11, jab12, jab13] {
+            let (was, now) = (
+                screen(&first, jab, glam::Vec3::Y),
+                screen(&planes, jab, glam::Vec3::Y),
+            );
+            assert!(was.dot(now).abs() > 0.99, "{jab:?}: {was:?} against {now:?}");
+        }
+        let turned = first.spawn_turn(glam::Vec3::from(jab11));
+        assert!(turned.dot(planes.spawn_turn(glam::Vec3::from(jab11))).abs() < 0.99);
     }
 
     /// The dialled-in orientation defaults. These came from comparing the viewport against the
@@ -3621,9 +3668,9 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
     fn the_orientation_defaults_are_the_ones_measured_against_the_game() {
         let planes = QuadPlanes::default();
 
-        // Type 0 faces the camera; its turn corrects particle motion, not the quad.
+        // Type 0 faces the camera, so there is no plane for a turn to act on.
         assert_eq!(planes.plane_for(0), 0);
-        assert_eq!(planes.offsets[0], [90.0, 90.0, 0.0]);
+        assert_eq!(planes.offsets[0], [0.0; 3]);
 
         // SYS_ATTACK_ARC and MIIGUNNER_ATK_SHOT_S both sit in the effect's local XY plane and
         // differ only in the turn they need.
@@ -3633,7 +3680,7 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         assert_eq!(planes.offsets[5], [90.0, 0.0, 0.0]);
 
         // Unverified types carry no turn. A guessed default is worse than an obvious one.
-        for kind in [1, 4, 6, 7] {
+        for kind in [0, 1, 4, 6, 7] {
             assert_eq!(
                 planes.offsets[kind], [0.0; 3],
                 "type {kind} has an unverified turn baked in"

@@ -4,7 +4,7 @@ A raw import has no analysis to mark either. Function starts are every `bl` in .
 in the range plus every relocated data pointer into it (vtable slots); strings are the rodata
 addresses the range's own adrp+add pairs form. Defaults to where NintendoWare Vfx sits in 13.0.3.
 
-usage: vfx_targets.py [start end]   ->  vfx_targets.txt  ("F addr" / "S addr" lines)
+usage: vfx_targets.py [start end [out]]   ->  vfx_targets.txt  ("F addr" / "S addr" lines)
 """
 import struct, sys
 import numpy as np
@@ -33,7 +33,7 @@ for p in range(start,end,4):
         if ro<=t<len(img):
             z=img.find(b'\0',t,t+512)
             if z-t>=3 and all(32<=c<127 or c in(9,10) for c in img[t:z]): strings.add(t)
-with open('vfx_targets.txt','w') as f:
+with open(sys.argv[3] if len(sys.argv)>3 else 'vfx_targets.txt','w') as f:
     for s in sorted(starts): f.write('F %#x\n'%s)
     for s in sorted(strings): f.write('S %#x\n'%s)
 print('functions',len(starts),'strings',len(strings))

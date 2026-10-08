@@ -71,6 +71,8 @@ pub struct EmitterSim {
     /// Radius of a random shell around the spawn point: a unit direction times this, not a
     /// box.
     pub position_random: f32,
+    /// Whether gravity pulls along the world's axes rather than the emitter's own.
+    pub world_gravity: bool,
     /// Per-frame multiplier on velocity. 1 is no drag.
     pub air_res: f32,
     /// Symmetric spread on how far a particle travels per frame for its velocity: each one
@@ -263,6 +265,7 @@ pub struct Slots {
     emission_start: Option<usize>,
     emission_duration: Option<usize>,
     is_one_time: Option<usize>,
+    is_world_gravity: Option<usize>,
     position_random: Option<usize>,
     air_res: Option<usize>,
     momentum_random: Option<usize>,
@@ -333,6 +336,7 @@ impl Slots {
             interval: at("emission.interval"),
             interval_random: at("emission.interval_random"),
             is_one_time: at("emission.is_one_time"),
+            is_world_gravity: at("emission.is_world_gravity"),
             air_res: at("emitter_static.air_res"),
             momentum_random: at("particle_data.momentum_random"),
             diffusion_dir_angle: at("particle_velocity.diffusion_dir_angle"),
@@ -525,6 +529,7 @@ impl EmitterSim {
             emission_start: get(slots.emission_start).unwrap_or(0.0),
             emission_duration: get(slots.emission_duration).unwrap_or(0.0),
             is_one_time: get(slots.is_one_time).map(|v| v != 0.0),
+            world_gravity: get(slots.is_world_gravity).unwrap_or(0.0) != 0.0,
             position_random: get(slots.position_random).unwrap_or(0.0),
             // Zero is a real setting -- a handful of emitters use it to throw a particle one
             // step and leave it to gravity -- so only a missing field means "no drag".
@@ -789,7 +794,11 @@ fn travel(v0: glam::Vec3, gravity: glam::Vec3, drag: f32, age: f32) -> (glam::Ve
 /// One particle, evaluated.
 #[derive(Debug, Clone, Copy)]
 pub struct SimParticle {
+    /// Where the particle is in the emitter's frame, from everything but gravity.
     pub offset: glam::Vec3,
+    /// How far gravity has carried it. Kept apart because an emitter can ask for the world's
+    /// down rather than its own, and only the caller knows which way that is.
+    pub fallen: glam::Vec3,
     pub size: f32,
     pub color: [f32; 4],
     pub rotation: f32,
@@ -1180,8 +1189,10 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
 
             let spawn = born + unit_vector(seed, id, 0x51) * sim.position_random;
             let pace = 1.0 + sim.momentum_random * hashed_signed(seed, id ^ 0x54);
-            let (travelled, heading) = travel(velocity, sim.gravity, sim.air_res, age);
+            let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, age);
+            let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, age);
             let offset = spawn + travelled * pace;
+            let fallen = fallen * pace;
 
             let fraction = (age / life).clamp(0.0, 1.0);
             let color = sample_keys(&sim.color0, age, life, [1.0, 1.0, 1.0, 1.0]);
@@ -1254,6 +1265,7 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             let height = curve.y * sim.particle_scale.y * shrink_y.max(0.0) * sim.scale.y;
             particles.push(SimParticle {
                 offset,
+                fallen,
                 size: width.max(height).max(0.01),
                 color: [
                     color[0] * sim.color_scale,
@@ -1267,7 +1279,7 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
                 // Where it is heading now rather than where it was thrown: taking the birth
                 // velocity would point every particle of a falling burst upwards for its
                 // whole life.
-                velocity: heading,
+                velocity: heading + falling,
                 // Rates are per frame, so the animation at this age is its start plus rate x
                 // age.
                 uv_anim: {
@@ -1307,6 +1319,7 @@ mod tests {
             num_divide_circle: (1, 0.0),
             num_divide_line: (1, 0.0),
             is_one_time: None,
+            world_gravity: false,
             interval_random: 0.0,
             air_res: 1.0,
             momentum_random: 0.0,
@@ -1741,9 +1754,11 @@ mod tests {
         let particles = evaluate(&sim, 5.0, 3);
         let oldest = particles
             .iter()
-            .map(|particle| particle.offset.y)
+            .map(|particle| particle.fallen.y)
             .fold(f32::INFINITY, f32::min);
         assert!((oldest + 20.0).abs() < 0.001, "fell to {oldest}, expected -20");
+        // Gravity's share is reported apart from the rest, so the caller can aim it.
+        assert!(particles.iter().all(|particle| particle.offset.y.abs() < 1e-6));
     }
 
     #[test]

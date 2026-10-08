@@ -1,10 +1,14 @@
 # Decompile every function listed in vfx_targets.txt (see ../vfx_targets.py) into vfx_decomp.txt.
+# Script arguments, both optional: the targets file, then the output file.
 # Jython rather than Java: Ghidra 10.1's script bundles do not resolve on a newer JDK.
 from ghidra.app.decompiler import DecompInterface
 from java.lang import Exception as JavaException
 
 starts, strings = [], []
-for line in open("vfx_targets.txt"):
+args = getScriptArgs()
+targets = args[0] if len(args) > 0 else "vfx_targets.txt"
+output = args[1] if len(args) > 1 else "vfx_decomp.txt"
+for line in open(targets):
     kind, addr = line.split()
     (starts if kind == "F" else strings).append(int(addr, 16))
 
@@ -25,7 +29,7 @@ for s in starts:
 
 dec = DecompInterface()
 dec.openProgram(currentProgram)
-out = open("vfx_decomp.txt", "w")
+out = open(output, "w")
 done = failed = 0
 for s in starts:
     f = getFunctionAt(toAddr(s))
