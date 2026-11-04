@@ -1,6 +1,17 @@
 # Visionary
 ---
-A copy of visionary that adds scuffed effects to be viewed in the editor. Its not 1:1 and expect things to not to be 1:1. But this serves as a quicker way of adding effects to moves
+DISCLAIMER:
+
+This project is ai-assisted. If you don't want to touch it, then don't. 
+I also don't claim that the effects are 1:1, but its pretty close. It's bound that there will be bugs, and its expected.
+This is a tool to help you with your workflow with making moveset mods. 
+This branch also has some workflow changes than you would expect from main's workflow. Some of These
+changes are designed on my workflow and Q.O.L features i wanted.
+
+Just to state again, You will encounter bugs. This project is AI assisted, (Claude).
+I don't intend on making a PR request, as I can't really claim i understand all the technical know how.
+If someone wants to make their own PR based on the changes here, I have no issue with it.
+
 ---
 Visionary is a desktop editor for viewing and editing most things about fighters in Super Smash Bros. Ultimate, except for models and animations. Changes are previewed in the running game through the included Skyline plugin.
 
@@ -8,10 +19,16 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 
 - `src/` contains the desktop application.
 - `plugins/slight_replica/` contains the in-game effect viewer and live-edit plugin.
-- The upstream `ssbh_wgpu` crate provides character model, animation, skeleton,
-  and weapon rendering.
-- The [`effect_library`](https://crates.io/crates/effect_library) crate on
-  crates.io provides `.eff` parsing, editing, and export.
+- `ssbh_wgpu` provides character model, animation, skeleton, and weapon
+  rendering. This fork builds a patched copy from `vendor/ssbh_wgpu/`, which
+  lets effects draw into the model's picture against its depth.
+- The [`effect_library`](https://crates.io/crates/effect_library) crate
+  provides `.eff` parsing, editing, and export. This fork builds a patched copy
+  from `vendor/effect_library/`: files with a few hundred effect entries were
+  written unreadable.
+- `src/eff_*.rs` draw a move's effects in the viewport, and `src/mx/` translates
+  the game's own effect shaders for that preview (see
+  [Effects in the viewport](#effects-in-the-viewport)).
 - The effect editor exposes the documented emitter, particle, animation,
   rendering, sampler, shader, and spawn settings described by
   [EffectResearch](https://github.com/LilyLavender/EffectResearch).
@@ -21,8 +38,8 @@ Visionary is a desktop editor for viewing and editing most things about fighters
 - A recent Rust toolchain
 - The `cargo-skyline` toolchain for building the in-game plugin
 
-Cargo downloads the pinned `ssbh_wgpu` revision, `effect_library`, and the other
-Rust dependencies automatically during the build.
+Cargo downloads the Rust dependencies automatically during the build; the
+patched `ssbh_wgpu` and `effect_library` are built from `vendor/`.
 
 ## Game data
 
@@ -192,6 +209,25 @@ fighter**. Visionary removes that fighter's cached scripts, saved edits, and
 live effect previews while leaving the dumped and mod files unchanged. Use the
 **Restore** button beside the Fighters heading to show forgotten fighters
 again.
+
+### Effects in the viewport
+
+The viewport draws the effects a move spawns, on the frame they spawn, following
+the bones and offsets their script gives them. Particles are simulated with the
+rules of the game's own particle library, worked out as a function of each
+particle's age, so scrubbing backwards shows the same frame as playing forwards.
+Collision and turbulence that builds up frame by frame are not modelled.
+
+With **Game shaders** on (next to **All frames** in **Visual effects**), each
+emitter draws with Smash's own shader for it rather than Visionary's generic
+particle shader. Visionary translates the shaders in an `.eff` the first time
+that file is drawn: a few seconds, in the background, after which they are
+cached under your data folder in `Visionary/eff_shaders/`. Until then, and for
+any shader the translator does not handle, the effect draws with the generic
+shader. Turn **Game shaders** off to compare the two.
+
+The preview is close to the game, not identical to it. Check anything that
+matters in game.
 
 ## Eden emulator setup
 
