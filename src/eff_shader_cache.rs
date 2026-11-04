@@ -157,3 +157,55 @@ pub fn ready(eff_path: &Path) -> Option<PathBuf> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every distinct shader stage of every .eff under a folder, once each: `<fnv of the code>_s<stage>.code` / `.ctl`.
+    /// The corpus a shader translator has to cover.
+    ///
+    /// `VISIONARY_SHADER_CORPUS_EFFS` = the folder (searched recursively), `VISIONARY_SHADER_CORPUS_OUT` = where to write.
+    #[test]
+    fn dump_shader_corpus() {
+        let (Ok(root), Ok(out)) = (std::env::var("VISIONARY_SHADER_CORPUS_EFFS"), std::env::var("VISIONARY_SHADER_CORPUS_OUT"))
+        else {
+            return;
+        };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let mut stack = vec![std::path::PathBuf::from(root)];
+        let (mut files, mut stages, mut unique) = (0, 0, std::collections::HashSet::new());
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("eff")) {
+                    continue;
+                }
+                let Ok(eff) = std::fs::read(&path) else { continue };
+                let Ok(namco) = effect_library::NamcoEffectFile::load(&eff) else { continue };
+                let Some(grsc) = namco.ptcl_file.as_ref().and_then(|p| p.shader_info.as_ref()).and_then(|i| i.binary_data.as_ref())
+                else {
+                    continue;
+                };
+                let Ok(bnsh) = effect_library::bnsh::BnshFile::read(grsc) else { continue };
+                files += 1;
+                for variation in &bnsh.variations {
+                    for (s, stage) in variation.binary_program.stages.iter().enumerate() {
+                        let Some(stage) = stage else { continue };
+                        stages += 1;
+                        let key = (super::fnv(&stage.byte_code), s);
+                        if unique.insert(key) {
+                            let name = format!("{:016x}_s{s}", key.0);
+                            std::fs::write(out.join(format!("{name}.code")), &stage.byte_code).unwrap();
+                            std::fs::write(out.join(format!("{name}.ctl")), &stage.control_code).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+        println!("{files} effect files, {stages} stages, {} distinct", unique.len());
+    }
+}
