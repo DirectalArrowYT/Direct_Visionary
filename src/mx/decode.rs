@@ -240,8 +240,9 @@ pub type Components = &'static [u8];
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
     Fadd { d: Reg, a: Reg, b: Src, neg_a: bool, abs_a: bool, neg_b: bool, abs_b: bool, sat: bool, round: Round, ftz: bool },
-    Fmul { d: Reg, a: Reg, b: Src, neg_b: bool, sat: bool, round: Round, scale: FmulScale },
-    Ffma { d: Reg, a: Reg, b: Src, c: Src, neg_b: bool, neg_c: bool, sat: bool, round: Round },
+    /// `fmz`: a zero factor makes the product zero, whatever the other one is (inf, NaN).
+    Fmul { d: Reg, a: Reg, b: Src, neg_b: bool, sat: bool, round: Round, scale: FmulScale, fmz: bool },
+    Ffma { d: Reg, a: Reg, b: Src, c: Src, neg_b: bool, neg_c: bool, sat: bool, round: Round, fmz: bool },
     Fmnmx { d: Reg, a: Reg, b: Src, neg_a: bool, abs_a: bool, neg_b: bool, abs_b: bool, min: Pred },
     Mufu { d: Reg, a: Reg, op: MufuOp, neg: bool, abs: bool, sat: bool },
     /// Range reduction before MUFU sin/cos/ex2: no-op in a translation that uses the real functions.
@@ -542,11 +543,20 @@ fn decode_op(w: u64, addr: u32, name: &str) -> Result<Op> {
                 6 => FmulScale::M2,
                 v => bail!("fmul scale {v}"),
             };
-            Op::Fmul { d, a, b: src_f(w)?, neg_b: bit(w, 48), sat: bit(w, 50), round: Round::from(bits(w, 39, 2)), scale }
+            Op::Fmul { d, a, b: src_f(w)?, neg_b: bit(w, 48), sat: bit(w, 50), round: Round::from(bits(w, 39, 2)), scale, fmz: bits(w, 44, 2) == 2 }
         }
         "fmul32i" => {
             no_cc(w, 52)?;
-            Op::Fmul { d, a, b: Src::Imm(bits(w, 20, 32)), neg_b: false, sat: bit(w, 55), round: Round::Rn, scale: FmulScale::None }
+            Op::Fmul {
+                d,
+                a,
+                b: Src::Imm(bits(w, 20, 32)),
+                neg_b: false,
+                sat: bit(w, 55),
+                round: Round::Rn,
+                scale: FmulScale::None,
+                fmz: bits(w, 53, 2) == 2,
+            }
         }
         "ffma" | "ffma_rc" => {
             no_cc(w, 47)?;
@@ -556,7 +566,17 @@ fn decode_op(w: u64, addr: u32, name: &str) -> Result<Op> {
                 (_, Form::C) => (cbuf(w)?, Src::Reg(reg(w, 39))),
                 (_, Form::I) => (Src::Imm(imm20(w) << 12), Src::Reg(reg(w, 39))),
             };
-            Op::Ffma { d, a, b, c, neg_b: bit(w, 48), neg_c: bit(w, 49), sat: bit(w, 50), round: Round::from(bits(w, 51, 2)) }
+            Op::Ffma {
+                d,
+                a,
+                b,
+                c,
+                neg_b: bit(w, 48),
+                neg_c: bit(w, 49),
+                sat: bit(w, 50),
+                round: Round::from(bits(w, 51, 2)),
+                fmz: bits(w, 53, 2) == 2,
+            }
         }
         "fmnmx" => {
             no_cc(w, 47)?;
@@ -946,7 +966,11 @@ fn decode_op(w: u64, addr: u32, name: &str) -> Result<Op> {
                     bail!("bra .lmt / .u");
                 }
             }
-            let target = (addr as i64 + 8 + sign_extend(bits(w, 20, 24), 24) as i64) as u32;
+            let mut target = (addr as i64 + 8 + sign_extend(bits(w, 20, 24), 24) as i64) as u32;
+            // a target on a scheduling word (bundles are 32 bytes) means the bundle's first instruction
+            if target % 32 == 0 {
+                target += 8;
+            }
             if name == "bra" {
                 Op::Bra { target }
             } else {
@@ -1011,6 +1035,7 @@ mod tests {
                             Op::Csetp { test, .. } => format!("csetp test {test}"),
                             Op::Texs { kind, components, .. } => format!("texs {kind:?} {components:?}"),
                             Op::Ipa { mode, sat, .. } => format!("ipa {mode:?} sat {sat}"),
+                            Op::Fmul { fmz: true, .. } | Op::Ffma { fmz: true, .. } => "fmz".into(),
                             Op::I2i { cc, src, dst, .. } => format!("i2i {src:?}->{dst:?} cc {cc}"),
                             Op::I2f { src, dst, .. } => format!("i2f {src:?}->{dst:?}"),
                             Op::F2i { src, dst, round, .. } => format!("f2i {src:?}->{dst:?} {round:?}"),

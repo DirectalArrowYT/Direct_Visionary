@@ -2,8 +2,8 @@
 //!
 //! Every emitter names one shader variation of its file (`shader_references.shader_index`): a Maxwell vertex and
 //! fragment program in the file's BNSH. `eff_render` approximates what those programs do; this runs them. The programs
-//! are translated offline (tools/eft_shaders.py: the recomp's Maxwell translator, then glslang) into SPIR-V that wgpu
-//! reads through naga, with this binding layout:
+//! are translated to WGSL by Visionary's own translator (`mx`, through eff_shader_cache; older caches hold
+//! tools/eft_shaders.py's SPIR-V, which still loads), with this binding layout:
 //!
 //! * set 0: the vertex stage's constant buffer `c<n>` at binding n, the fragment stage's at 20 + n, each a read-only
 //!   storage buffer of `uint`; the alpha test / point size block at 19 (vertex) and 39 (fragment).
@@ -103,16 +103,19 @@ fn le_u32(b: &[u8], at: usize) -> Option<u32> {
 }
 
 /// The translated shaders of one effect file: Visionary's shader dump (`v<i>_s<stage>.code` / `.ctl`, test
-/// `dump_shader_variations`) with eft_shaders.py's `spv/` beside it.
+/// `dump_shader_variations`) with its translation beside it: `wgsl/` (mx) or eft_shaders.py's `spv/`.
 pub struct ShaderLibrary {
     dir: PathBuf,
+    /// Visionary's own translation (`wgsl/`, eff_shader_cache) rather than eft_shaders.py's SPIR-V (`spv/`).
+    wgsl: bool,
     stages: HashMap<(u32, u32), StageInfo>,
     by_code: HashMap<(u32, u64), Vec<u32>>,
 }
 
 impl ShaderLibrary {
     pub fn open(dir: &Path) -> Result<Self> {
-        let index_path = dir.join("spv").join("index.json");
+        let wgsl = dir.join("wgsl").join("index.json").exists();
+        let index_path = dir.join(if wgsl { "wgsl" } else { "spv" }).join("index.json");
         let index: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&index_path).with_context(|| format!("reading {}", index_path.display()))?,
         )?;
@@ -162,7 +165,7 @@ impl ShaderLibrary {
                 stages.insert((variation, stage), info);
             }
         }
-        Ok(Self { dir: dir.to_path_buf(), stages, by_code })
+        Ok(Self { dir: dir.to_path_buf(), wgsl, stages, by_code })
     }
 
     pub fn stage(&self, variation: u32, stage: u32) -> Option<&StageInfo> {
@@ -180,6 +183,15 @@ impl ShaderLibrary {
     /// Is this program (as `eff_capture::Program::bytes` gives it) the given stage of the given variation?
     pub fn is_program(&self, variation: u32, stage: u32, program: &[u8]) -> bool {
         self.stages.get(&(variation, stage)).is_some_and(|s| s.code_hash == fnv(program))
+    }
+
+    fn source(&self, variation: u32, stage: u32) -> Result<wgpu::ShaderSource<'static>> {
+        if self.wgsl {
+            let path = self.dir.join("wgsl").join(format!("v{variation:04}_s{}.wgsl", if stage == VERTEX { 0 } else { 4 }));
+            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            return Ok(wgpu::ShaderSource::Wgsl(text.into()));
+        }
+        Ok(wgpu::ShaderSource::SpirV(self.spirv(variation, stage)?.into()))
     }
 
     fn spirv(&self, variation: u32, stage: u32) -> Result<Vec<u32>> {
@@ -417,10 +429,10 @@ impl GameEffectRenderer {
         if let Some(m) = self.modules.get(&(variation, stage)) {
             return Ok(m.clone());
         }
-        let words = self.library.spirv(variation, stage)?;
+        let source = self.library.source(variation, stage)?;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("effect shader v{variation} s{stage}")),
-            source: wgpu::ShaderSource::SpirV(words.into()),
+            source,
         });
         self.modules.insert((variation, stage), module.clone());
         Ok(module)
@@ -855,7 +867,7 @@ mod replay {
     //!                         split_cycle.py file (programs from progs.bin in that folder)
     //! VISIONARY_REPLAY_FRAME  a frame, or "grabs" for every frame with framebuffer grabs (default: the busiest frame)
     //! VISIONARY_REPLAY_LOOK   <distance>: replace the game's camera by one looking at the effect from that far
-    //! VISIONARY_SHADERS       the effect file's shader dump, with eft_shaders.py's spv/
+    //! VISIONARY_SHADERS       the effect file's shader dump, with its wgsl/ (or eft_shaders.py's spv/)
     //! VISIONARY_EFF           the effect file (for textures)
     //! VISIONARY_REPLAY_OUT    output folder
     //! VISIONARY_REPLAY_LOG    the run's game log: frames are named by the eftcycle entry being shown

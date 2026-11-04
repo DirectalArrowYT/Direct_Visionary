@@ -2,3 +2,5 @@
 
 #[allow(dead_code)]
 pub mod decode;
+#[allow(dead_code)]
+pub mod wgsl;
