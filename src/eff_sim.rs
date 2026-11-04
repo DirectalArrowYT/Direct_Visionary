@@ -124,6 +124,13 @@ pub struct EmitterSim {
     /// divide" variants space their particles evenly around the sweep instead of scattering
     /// them, which is what makes a shockwave ring a ring rather than a smear.
     pub volume_type: i64,
+    /// shape_info.prim_emit_type. On an evenly divided shape, 2 makes a firing `rate` particles that take the
+    /// divisions in turn (the attack speed lines: rate 2 on 4 divisions, 2 particles a firing, 90 degrees apart)
+    /// instead of `rate` on every division.
+    pub prim_emit_type: i64,
+    /// shape_info.is_gpu_emitter: the game hands the shader each particle as born (spawn position, first velocity)
+    /// and the shader moves it; the attack speed lines' line2 keeps y 0 and the same velocity frame after frame.
+    pub gpu: bool,
     /// Half-extent of that shape per axis.
     pub volume_radius: glam::Vec3,
     /// How much of the shape is used, in radians: longitude around, latitude from the pole.
@@ -241,6 +248,12 @@ pub struct EmitterSim {
     /// file's descriptor table -- it is not an index, and treating it as one finds the wrong
     /// mesh or none.
     pub primitive_id: Option<u64>,
+    /// emitter_info.random_seed_type: 0 the emitter draws its own random numbers, 1 every type-1
+    /// emitter of one effect instance draws the same ones (the game's mark_b/mark_f and the
+    /// impact*/line1/cylinder1 groups of the smoke and line effects match particle for particle),
+    /// 2 the fixed `random_seed` below.
+    pub seed_type: i64,
+    pub fixed_seed: u64,
     /// The emitter's own offset from the effect's origin, and its orientation.
     ///
     /// Ignored until now, which stacked every emitter of an effect at one point: SYS_TURN_SMOKE
@@ -297,6 +310,8 @@ pub struct Slots {
     uv_scale: [Option<usize>; 2],
     uv_scale_add: [Option<usize>; 2],
     volume_type: Option<usize>,
+    prim_emit_type: Option<usize>,
+    gpu: Option<usize>,
     volume_radius: [Option<usize>; 3],
     volume_form_scale: [Option<usize>; 3],
     sweep_longitude: Option<usize>,
@@ -310,6 +325,8 @@ pub struct Slots {
     particle_scale: [Option<usize>; 3],
     scale_random: [Option<usize>; 3],
     primitive_id: Option<usize>,
+    seed_type: Option<usize>,
+    fixed_seed: Option<usize>,
     translation: [Option<usize>; 3],
     rotation: [Option<usize>; 3],
     pattern_cells: Option<usize>,
@@ -391,6 +408,8 @@ impl Slots {
                 at("emitter_info.scale_z"),
             ],
             primitive_id: at("particle_data.primitive_id"),
+            seed_type: at("emitter_info.random_seed_type"),
+            fixed_seed: at("emitter_info.random_seed"),
             translation: [
                 at("emitter_info.trans_x"),
                 at("emitter_info.trans_y"),
@@ -438,6 +457,8 @@ impl Slots {
                 at("emitter_static.tex_scroll_anim0.scale_add_y"),
             ],
             volume_type: at("shape_info.volume_type"),
+            prim_emit_type: at("shape_info.prim_emit_type"),
+            gpu: at("shape_info.is_gpu_emitter"),
             volume_radius: [
                 at("shape_info.volume_radius_x"),
                 at("shape_info.volume_radius_y"),
@@ -535,6 +556,12 @@ impl EmitterSim {
                     _ => None,
                 }
             }),
+            seed_type: get(slots.seed_type).unwrap_or(0.0) as i64,
+            fixed_seed: slots.fixed_seed.and_then(|slot| match emitter.attrs.get(slot)?.as_ref()? {
+                AttrValue::UInt(v) => Some(*v),
+                AttrValue::Int(v) => Some(*v as u64),
+                AttrValue::Float(v) => Some(v.to_bits() as u64),
+            }).unwrap_or(0),
             translation: vec3(&slots.translation),
             rotation: vec3(&slots.rotation),
             rate: get(slots.rate).unwrap_or(1.0).max(0.0),
@@ -616,6 +643,8 @@ impl EmitterSim {
                 (axis(slots.uv_div[0]), axis(slots.uv_div[1]))
             },
             volume_type: get(slots.volume_type).unwrap_or(0.0) as i64,
+            prim_emit_type: get(slots.prim_emit_type).unwrap_or(0.0) as i64,
+            gpu: get(slots.gpu).unwrap_or(0.0) != 0.0,
             // The shape's own per-axis stretch multiplies its radius (0x8dc80).
             volume_radius: vec3(&slots.volume_radius)
                 * glam::Vec3::new(
@@ -718,6 +747,11 @@ impl EmitterSim {
         }
     }
 
+    /// Do a firing's particles take an evenly divided shape's positions in turn, one each, rather than filling all?
+    fn divisions_in_turn(&self) -> bool {
+        matches!(self.volume_type, 2 | 13) && self.prim_emit_type == 2
+    }
+
     /// How many positions an evenly divided shape has on this firing. `None` for every other
     /// shape.
     fn divisions(&self, unit: f32) -> Option<u32> {
@@ -777,7 +811,7 @@ fn bursts(sim: &EmitterSim, until: f32, seed: u64) -> Vec<Burst> {
         let whole = saving as u32;
         saving -= whole as f32;
         let divisions = sim.divisions(unit);
-        let count = whole.saturating_mul(divisions.unwrap_or(1));
+        let count = whole.saturating_mul(if sim.divisions_in_turn() { 1 } else { divisions.unwrap_or(1) });
         if count > 0 {
             out.push(Burst {
                 time,
@@ -820,7 +854,7 @@ fn bursts_by_distance(sim: &EmitterSim, distance: Distance, until: f32, seed: u6
         if whole > 0 {
             let unit = hashed(seed, index ^ 0xb0_0000);
             let divisions = sim.divisions(unit).unwrap_or(1);
-            let count = whole.saturating_mul(divisions);
+            let count = whole.saturating_mul(if sim.divisions_in_turn() { 1 } else { divisions });
             out.push(Burst { time: frame, first, count, divisions, unit });
             first += count as u64;
         }
@@ -1191,6 +1225,8 @@ fn initial(sim: &EmitterSim, burst: &Burst, slot: u32, id: u64, seed: u64) -> In
     let short = (hashed(seed, id ^ 0x11) * sim.life_random.max(0.0)).floor();
     let life = (sim.life * (1.0 - short / 100.0)).max(1.0);
 
+    // Taken in turn, a particle's position on a divided shape follows the emitter's count, not the firing's.
+    let slot = if sim.divisions_in_turn() { (id % burst.divisions.max(1) as u64) as u32 } else { slot };
     let (born, thrown) = volume_spawn(sim, burst, slot, id, seed);
     let mut velocity = thrown * sim.all_direction;
     if sim.xz_diffusion != 0.0 {
@@ -1265,6 +1301,18 @@ pub struct Spawn {
 
 /// Every particle this emitter has alive at `age_frames` since the effect started, as born. The same particles, in
 /// the same order, as [`evaluate`].
+impl EmitterSim {
+    /// The seed for this emitter's random numbers: `instance` identifies the effect instance,
+    /// `own` the emitter within it. Type-1 emitters share the instance's numbers.
+    pub fn seed(&self, instance: u64, own: u64) -> u64 {
+        match self.seed_type {
+            1 => instance,
+            2 => self.fixed_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            _ => instance ^ own,
+        }
+    }
+}
+
 pub fn spawns(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<Spawn> {
     spawns_moving(sim, age_frames, seed, None)
 }
@@ -1297,9 +1345,13 @@ pub fn spawns_moving(sim: &EmitterSim, age_frames: f32, seed: u64, travelled: Op
             if age >= life {
                 continue;
             }
-            // Where it is now and how fast it is going, as evaluate has it.
-            let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, age);
-            let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, age);
+            // Where it is now and how fast it is going. The game's buffer at effect time t holds a particle born at b
+            // moved t - b + 1 times: it is stepped in the frame it is born, before it is first drawn (captured
+            // impact1 of the attack smoke, v0 -1 with air resistance 0.9: -1.9 / -0.81 at age 1, not -1 / -0.9).
+            // A GPU emitter's particles stay as born: its shader does the moving.
+            let steps = if sim.gpu { 0.0 } else { age + 1.0 };
+            let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, steps);
+            let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, steps);
             let shrink = 1.0 - sim.scale_random.x / 100.0 * hashed(seed, id ^ 0x91);
             // The initial angle only: the game's vertex shaders add the random spread themselves,
             // (sysRandomAttr - 0.5) * rotate_init_rand from the emitter block (c9[452..454]), so a
@@ -1321,6 +1373,9 @@ pub fn spawns_moving(sim: &EmitterSim, age_frames: f32, seed: u64, travelled: Op
             });
         }
     }
+    // Walked newest first (so the cap keeps the newest), handed out oldest first: the game's particle list is in birth
+    // order and an instanced draw blends in list order, so newer puffs lie over older ones.
+    out.reverse();
     out
 }
 
@@ -1469,6 +1524,8 @@ mod tests {
             uv_scale: glam::Vec2::ONE,
             uv_scale_add: glam::Vec2::ZERO,
             volume_type: 0,
+            prim_emit_type: 0,
+            gpu: false,
             volume_radius: glam::Vec3::ZERO,
             sweep_longitude: std::f32::consts::TAU,
             sweep_latitude: std::f32::consts::PI,
@@ -1529,6 +1586,8 @@ mod tests {
             pattern_frequency: 1.0,
             sheet_cells: 0,
             primitive_id: None,
+            seed_type: 0,
+            fixed_seed: 0,
             translation: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
             color0: Vec::new(),

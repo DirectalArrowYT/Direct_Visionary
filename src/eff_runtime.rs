@@ -812,7 +812,7 @@ fn game_draw(
     crate::eff_shader_cache::ready(file)?;
     let game = loaded.game.get(set_idx)?.get(emitter_index)?.clone()?;
     let sim = crate::eff_sim::EmitterSim::read(emitter, slots);
-    let seed = (set_idx as u64) << 32 ^ (emitter_index as u64) << 8;
+    let seed = sim.seed((set_idx as u64) << 32, (emitter_index as u64) << 8);
     let placement = place.bone
         * glam::Mat4::from_translation(place.call_offset)
         * glam::Mat4::from_quat(place.call_turn)
@@ -1150,7 +1150,7 @@ pub fn build_particle_batches(
                 // script put the effect, not how big it is.
                 let origin = matrix
                     .transform_point3(*call_offset + call_turn * (sim.translation * *scale));
-                let seed = (part.set_idx as u64) << 32 ^ (emitter_index as u64) << 8 ^ index as u64;
+                let seed = sim.seed((part.set_idx as u64) << 32 ^ index as u64, (emitter_index as u64) << 8);
                 let particle_age = age - part.start_frame as f32;
                 if particle_age < 0.0 {
                     continue;

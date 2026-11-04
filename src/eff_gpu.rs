@@ -918,6 +918,8 @@ mod replay {
         views: HashMap<usize, wgpu::TextureView>,
         /// Visionary's own reading of each emitter, in the same order (for the simulation).
         defs: Vec<crate::effects::EmitterDef>,
+        /// The emitter set each emitter belongs to, by name.
+        set_names: Vec<String>,
         slots: crate::eff_sim::Slots,
         /// Generated emitter block (c9) -> emitter: a draw's emitter, exactly, now that c9 is solved.
         by_block: HashMap<Vec<u8>, usize>,
@@ -938,13 +940,16 @@ mod replay {
             for set in &ptcl.emitter_list.emitter_sets {
                 flatten(&set.emitters, &mut emitters);
             }
-            let defs: Vec<crate::effects::EmitterDef> = crate::effects::load_effect(Path::new(path))
+            let (defs, set_names): (Vec<crate::effects::EmitterDef>, Vec<String>) = crate::effects::load_effect(Path::new(path))
                 .unwrap()
                 .ptcl
                 .emitter_sets
                 .into_iter()
-                .flat_map(|set| set.emitters)
-                .collect();
+                .flat_map(|set| {
+                    let name = set.name;
+                    set.emitters.into_iter().map(move |e| (e, name.clone()))
+                })
+                .unzip();
             assert_eq!(defs.len(), emitters.len(), "Visionary's emitter list and the file's differ");
             let by_block = emitters
                 .iter()
@@ -957,6 +962,7 @@ mod replay {
                 emitters,
                 views: HashMap::new(),
                 defs,
+                set_names,
                 slots: crate::eff_sim::Slots::new(),
                 by_block,
             }
@@ -1154,7 +1160,9 @@ mod replay {
     struct Frame<'a> {
         number: i64,
         draws: Vec<&'a Draw>,
-        shots: Vec<&'a Shot>,
+        /// Each with the number of the frame's draws recorded before it: a capture writes a target's "before"
+        /// picture, then the effect draws, then its "after" picture, so the draws of one batch lie between them.
+        shots: Vec<(&'a Shot, usize)>,
     }
 
     /// One target of one frame, compared with the game: effect pixels (changed in the game's picture or ours), their
@@ -1179,10 +1187,7 @@ mod replay {
         fbos.sort();
         fbos.dedup();
         let generate = std::env::var("VISIONARY_REPLAY_GENERATE").is_ok();
-        let shot = |fbo: u32, phase: u32, kind: u32| -> Option<&Shot> {
-            let mut it = frame.shots.iter().filter(|s| s.fbo == fbo && s.phase == phase && s.kind == kind);
-            if phase == 0 { it.next().copied() } else { it.last().copied() }
-        };
+        let game_random = std::env::var("VISIONARY_REPLAY_GAME_RANDOM").is_ok();
         let look_camera = look.and_then(|distance| {
             let target = frame
                 .draws
@@ -1202,19 +1207,61 @@ mod replay {
             let view = glam::Mat4::look_at_rh(target + glam::Vec3::new(0.0, 0.0, distance), target, glam::Vec3::Y);
             Some(camera_block(view, proj, floats[72], floats[73], floats[76..80].try_into().unwrap()))
         });
-        for (fbo, w, h) in fbos {
+        // One batch of effect draws per "before" picture: a target can take effects, then other drawing (the fighter,
+        // a blurred copy of the scene drawn into the half-size target), then effects again. Captures that took one
+        // "before" per target and frame pair it with the last "after", over all of that target's draws.
+        let mut batches: Vec<(u32, u32, u32, usize, Option<&Shot>, Option<&Shot>, Option<&Shot>, std::ops::Range<usize>)> = Vec::new();
+        for &(fbo, w, h) in &fbos {
             let (w, h) = (w as u32, h as u32);
-            let sized = |s: &&Shot| s.width == w && s.height == h && look.is_none();
-            let before = shot(fbo, 0, 0).filter(sized);
-            let before_depth = shot(fbo, 0, 1).filter(sized);
-            let after = shot(fbo, 1, 0).filter(sized);
+            let sized = |s: &Shot| s.width == w && s.height == h && look.is_none();
+            let is = |i: usize, phase: u32, kind: u32| {
+                let (s, _) = frame.shots[i];
+                s.fbo == fbo && s.phase == phase && s.kind == kind
+            };
+            let befores: Vec<usize> = (0..frame.shots.len()).filter(|&i| is(i, 0, 0)).collect();
+            if befores.is_empty() {
+                batches.push((fbo, w, h, 0, None, None, None, 0..frame.draws.len()));
+                continue;
+            }
+            for (k, &b) in befores.iter().enumerate() {
+                let next = befores.get(k + 1).copied().unwrap_or(frame.shots.len());
+                let after = (b..next).rev().find(|&i| is(i, 1, 0));
+                let depth = (b..next).find(|&i| is(i, 0, 1));
+                let end = match (after, befores.get(k + 1)) {
+                    (Some(a), _) => frame.shots[a].1,
+                    (None, Some(&n)) => frame.shots[n].1,
+                    (None, None) => frame.draws.len(),
+                };
+                let pick = |i: Option<usize>| i.map(|i| frame.shots[i].0).filter(|s| sized(s));
+                batches.push((fbo, w, h, k, pick(Some(b)), pick(depth), pick(after), frame.shots[b].1..end));
+            }
+        }
+        for (fbo, w, h, batch, before, before_depth, after, range) in batches {
+            if before.is_none() || std::env::var("VISIONARY_REPLAY_SHOTS").is_ok() {
+                let have: Vec<String> = frame
+                    .shots
+                    .iter()
+                    .filter(|(s, _)| s.fbo == fbo)
+                    .map(|(s, at)| {
+                        let mean = if s.kind == 0 {
+                            let p = halves(&s.pixels);
+                            p.iter().map(|q| q[0] + q[1] + q[2]).sum::<f32>() / (3.0 * p.len().max(1) as f32)
+                        } else {
+                            0.0
+                        };
+                        format!("after draw {at}: phase {} kind {} {}x{} mean {mean:.3}", s.phase, s.kind, s.width, s.height)
+                    })
+                    .collect();
+                let what = if before.is_none() { "no usable 'before' picture" } else { "pictures" };
+                println!("  fbo {fbo} batch {batch} ({w}x{h}), draws {range:?}: {what}; shots of it: {have:?}");
+            }
             let depth_image = before_depth.map(|s| {
                 texture(gpu, w, h, wgpu::TextureFormat::R32Float, wgpu::TextureUsages::TEXTURE_BINDING, Some(&s.pixels))
                     .create_view(&Default::default())
             });
             let mut prepared = Vec::new();
             let mut names = Vec::new();
-            for d in frame.draws.iter().filter(|d| d.fbo == fbo) {
+            for d in frame.draws[range.clone()].iter().filter(|d| d.fbo == fbo) {
                 let name = d.emitter_name().unwrap_or_default();
                 let (Some(vs), Some(fs)) = (programs.get(&(d.vs, 0)), programs.get(&(d.fs, 1))) else {
                     println!("  draw {} {name}: program {}/{} not captured", d.draw, d.vs, d.fs);
@@ -1293,6 +1340,7 @@ mod replay {
                     })
                     .collect();
                 let (mut variation, mut vertices, mut state, mut instances) = (variation, vertices, DrawState::from_capture(d), d.instances);
+                let mut per_particle_base = 0u32;
                 // VISIONARY_REPLAY_GENERATE: the draw rebuilt from Visionary's own data (eff_game). Kept from the
                 // capture: the camera, and the effect instance's placement, clock, colour and particle scale (c10's
                 // matrices and scalars), which belong to the script that spawned it, not to the file.
@@ -1306,7 +1354,20 @@ mod replay {
                         let reflection = renderer.library.stage(v, VERTEX)?.reflection.clone();
                         let c10: Vec<f32> = bytemuck::cast_slice(d.cbuf(0, 10)?.get(..192)?).to_vec();
                         let sim = crate::eff_sim::EmitterSim::read(&eff.defs[k], &eff.slots);
-                        let spawns = crate::eff_sim::spawns(&sim, c10[8], k as u64);
+                        let mut spawns = crate::eff_sim::spawns(&sim, c10[8], sim.seed(0x5eed << 32, (k as u64) << 8));
+                        // VISIONARY_REPLAY_GAME_RANDOM: the game's own per-particle randoms (sysRandomAttr) in place of
+                        // ours, when the counts agree, so what is left of the error is not down to the dice.
+                        if game_random && spawns.len() == d.instances as usize {
+                            let names = renderer.library.stage(variation, VERTEX).map(|s| s.reflection.clone()).unwrap_or_default();
+                            if let Some(l) = names.input("sysRandomAttr") {
+                                let inputs = vertex_inputs_from_capture(d).0;
+                                if let Some(data) = inputs.iter().find(|v| v.location == l && v.per_instance).map(|v| &v.data) {
+                                    for (spawn, r) in spawns.iter_mut().zip(data) {
+                                        spawn.random = *r;
+                                    }
+                                }
+                            }
+                        }
                         let rows = |a: &[f32]| glam::Mat4::from_cols_array(a.try_into().unwrap()).transpose();
                         let dynamic = crate::eff_game::Dynamic {
                             colour0: c10[0..4].try_into().unwrap(),
@@ -1342,11 +1403,46 @@ mod replay {
                         let w = data.iter().map(|p| p[3]).sum::<f32>() / n;
                         Some((xyz, w))
                     };
-                    let mut line = format!("  draw {} {name}: particles game {} ours {}", d.draw, d.instances, spawns.len());
+                    let set_name = block.and_then(|b| eff.by_block.get(b.get(..crate::eff_block::BLOCK_LEN)?)).map(|&k| eff.set_names[k].as_str()).unwrap_or("?");
+                    let mut line = format!("  draw {} {set_name}/{name}: particles game {} ours {}", d.draw, d.instances, spawns.len());
+                    if d.base_instance != 0 || std::env::var_os("VISIONARY_REPLAY_PARTICLES").is_some() {
+                        line += &format!(" (base {}, buffer {})", d.base_instance, game_inputs.iter().filter(|v| v.per_instance).map(|v| v.data.len()).max().unwrap_or(0));
+                    }
                     for (label, attr) in [("pos/life", "sysLocalPosAttr"), ("vel/birth", "sysLocalVecAttr"), ("scale", "sysScaleAttr")] {
                         if let (Some(g), Some(o)) = (summary(&game_inputs, names, attr), summary(&ours, reflection, attr)) {
                             line += &format!(" | {label} game {:.2}/{:.2} ours {:.2}/{:.2}", g.0, g.1, o.0, o.1);
                         }
+                    }
+                    // VISIONARY_REPLAY_PARTICLES: every particle's life and birth (the w of pos and vel), both sides.
+                    if std::env::var_os("VISIONARY_REPLAY_PARTICLES").is_some() {
+                        let ws = |inputs: &[VertexInput], reflection: &Reflection, name: &str| -> Vec<f32> {
+                            reflection
+                                .input(name)
+                                .and_then(|l| inputs.iter().find(|v| v.location == l && v.per_instance))
+                                .map(|v| v.data.iter().map(|p| p[3]).collect())
+                                .unwrap_or_default()
+                        };
+                        let full = |inputs: &[VertexInput], reflection: &Reflection, name: &str| -> Vec<[f32; 4]> {
+                            reflection
+                                .input(name)
+                                .and_then(|l| inputs.iter().find(|v| v.location == l && v.per_instance))
+                                .map(|v| v.data.iter().take(4).copied().collect())
+                                .unwrap_or_default()
+                        };
+                        for attr in ["sysLocalPosAttr", "sysLocalVecAttr", "sysScaleAttr", "sysRandomAttr"] {
+                            println!(
+                                "    {name} {attr} game {:.3?} ours {:.3?}",
+                                full(&game_inputs, names, attr),
+                                full(&ours, reflection, attr)
+                            );
+                        }
+                        println!(
+                            "    {name} life/birth game {:?} / {:?} ours {:?} / {:?}",
+                            ws(&game_inputs, names, "sysLocalPosAttr"),
+                            ws(&game_inputs, names, "sysLocalVecAttr"),
+                            ws(&ours, reflection, "sysLocalPosAttr"),
+                            ws(&ours, reflection, "sysLocalVecAttr"),
+                        );
                     }
                     // The first particle's rotation and randoms, as they are (they pick spin direction, UV flips ...).
                     let first = |inputs: &[VertexInput], reflection: &Reflection, name: &str| -> Option<[f32; 4]> {
@@ -1441,6 +1537,13 @@ mod replay {
                     }
                     state = crate::eff_game::draw_state(stored, d.prim, d.kind == 1);
                     instances = spawns.len() as u32;
+                    // A sorted emitter (sort_type) is drawn a particle at a time, back to front, each draw picking its
+                    // particle by base instance: ours are drawn the same way, so each is drawn once and in that order.
+                    if d.instances < instances {
+                        let base = d.base_instance.min(instances - 1);
+                        instances = d.instances.min(instances - base);
+                        per_particle_base = base;
+                    }
                 }
                 let inputs = DrawInputs {
                     variation,
@@ -1455,7 +1558,7 @@ mod replay {
                     first: if d.kind == 1 { 0 } else { d.first.max(0) as u32 },
                     base_vertex: d.base_vertex,
                     // generated particles are their own buffers, from instance 0
-                    base_instance: if generated.is_some() { 0 } else { d.base_instance },
+                    base_instance: if generated.is_some() { per_particle_base } else { d.base_instance },
                     textures,
                 };
                 match renderer.prepare(&gpu.device, &inputs, COLOR, Some(DEPTH)) {
@@ -1555,7 +1658,7 @@ mod replay {
                     }
                 }
             }
-            let path = out_dir.join(format!("f{}_fbo{fbo}.png", frame.number));
+            let path = out_dir.join(if batch == 0 { format!("f{}_fbo{fbo}.png", frame.number) } else { format!("f{}_fbo{fbo}_b{batch}.png", frame.number) });
             png.save(&path).unwrap();
             let mean = if changed > 0 { sum / changed as f32 } else { 0.0 };
             let share = if changed > 0 { off as f32 / changed as f32 } else { 0.0 };
@@ -1632,7 +1735,7 @@ mod replay {
             .collect();
         let mut all: Vec<Compared> = Vec::new();
         let mut camera_checked = false;
-        let mut process = |number: i64, draws: &[Draw], shots: &[Shot], programs: &HashMap<(i32, u32), Program>| {
+        let mut process = |number: i64, draws: &[Draw], shots: &[(Shot, usize)], programs: &HashMap<(i32, u32), Program>| {
             if !camera_checked {
                 if let Some(captured) = draws.iter().find_map(|d| d.cbuf(0, 8)) {
                     // camera_block must rebuild the game's own camera.
@@ -1650,7 +1753,7 @@ mod replay {
             if !starts.is_empty() {
                 println!("frame {number}: {}", entry_at(number));
             }
-            let frame = Frame { number, draws: draws.iter().collect(), shots: shots.iter().collect() };
+            let frame = Frame { number, draws: draws.iter().collect(), shots: shots.iter().map(|(s, at)| (s, *at)).collect() };
             all.extend(replay_frame(&gpu, &mut sets, programs, &frame, look, &out_dir));
         };
         let wanted = |frame: i64, has_shots: bool| match want.as_str() {
@@ -1660,8 +1763,8 @@ mod replay {
 
         if let Some(file) = file {
             let mut programs = HashMap::new();
-            let (mut frame, mut draws, mut shots): (i64, Vec<Draw>, Vec<Shot>) = (i64::MIN, Vec::new(), Vec::new());
-            let mut flush = |frame: i64, draws: &mut Vec<Draw>, shots: &mut Vec<Shot>, programs: &HashMap<(i32, u32), Program>| {
+            let (mut frame, mut draws, mut shots): (i64, Vec<Draw>, Vec<(Shot, usize)>) = (i64::MIN, Vec::new(), Vec::new());
+            let mut flush = |frame: i64, draws: &mut Vec<Draw>, shots: &mut Vec<(Shot, usize)>, programs: &HashMap<(i32, u32), Program>| {
                 if !draws.is_empty() && wanted(frame, !shots.is_empty()) {
                     process(frame, draws, shots, programs);
                 }
@@ -1684,7 +1787,7 @@ mod replay {
                         flush(frame, &mut draws, &mut shots, &programs);
                         frame = s.frame;
                     }
-                    shots.push(s);
+                    shots.push((s, draws.len()));
                 }
             })
             .unwrap();

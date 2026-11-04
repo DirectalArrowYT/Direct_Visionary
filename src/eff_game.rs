@@ -89,8 +89,10 @@ pub fn draw_state(stored: &[u8], prim: u32, indexed: bool) -> DrawState {
     DrawState {
         prim,
         indexed,
-        // The alpha channel's own blend (ZERO * src + DST_ALPHA * dst) keeps the target's alpha.
-        blend: Some([SRC_ALPHA, dst, eq, 0, 0x304, ADD]),
+        // The alpha channel's own blend: ZERO * src + DST_ALPHA * dst keeps a full-size target's alpha; on the
+        // half-resolution target it is ZERO * src + dst-factor * dst, so its alpha carries how much of the scene
+        // still shows through, for the composite (every draw of the captures).
+        blend: Some([SRC_ALPHA, dst, eq, 0, if half_resolution(stored) { dst } else { 0x304 }, ADD]),
         depth_test: (stored[0x89b] == 0).then_some(0x203),
         depth_write: false,
     }
