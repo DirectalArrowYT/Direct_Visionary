@@ -69,6 +69,31 @@ pub struct ShaderReflectionData {
     slots: Vec<i32>,
 }
 
+impl ShaderReflectionData {
+    fn named(&self, names: &[String], first: i32) -> Vec<(String, i32)> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), self.slots.get(first.max(0) as usize + i).copied().unwrap_or(-1)))
+            .collect()
+    }
+
+    /// Vertex inputs (attribute name, location). Visionary addition.
+    pub fn input_slots(&self) -> Vec<(String, i32)> {
+        self.named(&self.inputs, 0)
+    }
+
+    /// Samplers (name, texture unit). Visionary addition.
+    pub fn sampler_slots(&self) -> Vec<(String, i32)> {
+        self.named(&self.samplers, self.header.sampler_idx)
+    }
+
+    /// Constant buffers (block name, binding). Visionary addition.
+    pub fn constant_buffer_slots(&self) -> Vec<(String, i32)> {
+        self.named(&self.constant_buffers, self.header.const_buffer_idx)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingReflection<'a> {
     data: &'a ShaderReflectionData,

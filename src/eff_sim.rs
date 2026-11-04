@@ -220,6 +220,12 @@ pub struct EmitterSim {
     /// Zero means the emitter never set it, not "stop instantly": treating an unset field as
     /// total damping would freeze every rotation in the game.
     pub rotate_regist: f32,
+    /// How particles keep to the emitter once born: 0 they move with it, 1 they stay where they were born (what every
+    /// trail in the game uses), 2 they follow its position but not its turn.
+    pub follow_type: i64,
+    /// Fire by how far the emitter has moved rather than by the clock: `rate` particles every `unit` of travel. A
+    /// standing emitter makes none. Every trail in the game is built this way.
+    pub distance: Option<Distance>,
     /// Number of cells the emitter's texture is divided into. Zero or one means the texture is
     /// a single image and the particle uses all of it.
     pub pattern_cells: u32,
@@ -324,6 +330,8 @@ pub struct Slots {
     rotate_add_rand: [Option<usize>; 3],
     is_rotate: [Option<usize>; 3],
     rotate_regist: Option<usize>,
+    follow_type: Option<usize>,
+    distance: [Option<usize>; 4],
 }
 
 impl Slots {
@@ -489,6 +497,13 @@ impl Slots {
                 at("particle_data.is_rotate_z"),
             ],
             rotate_regist: at("emitter_static.rotate_regist"),
+            follow_type: at("emitter_info.follow_type"),
+            distance: [
+                at("emission.is_emit_dist_enabled"),
+                at("emission.emitter_dist_unit"),
+                at("emission.emitter_dist_min"),
+                at("emission.emitter_dist_max"),
+            ],
         }
     }
 }
@@ -677,6 +692,12 @@ impl EmitterSim {
                 get(slots.is_rotate[2]).unwrap_or(0.0) != 0.0,
             ],
             rotate_regist: get(slots.rotate_regist).unwrap_or(0.0),
+            follow_type: get(slots.follow_type).unwrap_or(0.0) as i64,
+            distance: (get(slots.distance[0]).unwrap_or(0.0) != 0.0).then(|| Distance {
+                unit: get(slots.distance[1]).unwrap_or(1.0).max(0.01),
+                min: get(slots.distance[2]).unwrap_or(0.0).max(0.0),
+                max: get(slots.distance[3]).unwrap_or(0.0).max(0.0),
+            }),
             color0: emitter.color0.clone(),
             alpha0: emitter.alpha0_keys.clone(),
         }
@@ -708,6 +729,17 @@ impl EmitterSim {
         let short = (unit * random * 0.01 * count as f32) as u32;
         Some(count.saturating_sub(short).max(1))
     }
+}
+
+/// Distance emission's settings.
+#[derive(Debug, Clone, Copy)]
+pub struct Distance {
+    /// Travel between firings.
+    pub unit: f32,
+    /// A frame's travel below this counts for nothing; above `max` (when set) it counts as `max`, so a teleport
+    /// doesn't pour out a wall of particles.
+    pub min: f32,
+    pub max: f32,
 }
 
 /// One firing of an emitter: when, and which particles it made.
@@ -759,6 +791,40 @@ fn bursts(sim: &EmitterSim, until: f32, seed: u64) -> Vec<Burst> {
         let extra = (hashed(seed, index ^ 0xb2_0000) * sim.interval_random).floor();
         time += sim.interval + 1.0 + extra;
         index += 1;
+    }
+    out
+}
+
+/// Firings of a distance emitter on a moving emitter: `travelled(t)` is how far it has gone by frame `t` after its
+/// start. Walked a frame at a time, as the game measures each frame's move.
+fn bursts_by_distance(sim: &EmitterSim, distance: Distance, until: f32, seed: u64, travelled: &dyn Fn(f32) -> f32) -> Vec<Burst> {
+    let span = sim.emission_span();
+    let mut out = Vec::new();
+    let (mut first, mut saving, mut gone) = (0u64, 0.0f32, 0.0f32);
+    let mut frame = 0.0f32;
+    while frame <= until && frame < span && out.len() < MAX_BURSTS {
+        let mut step = travelled(frame + 1.0) - travelled(frame);
+        if step < distance.min {
+            step = 0.0;
+        }
+        if distance.max > 0.0 {
+            step = step.min(distance.max);
+        }
+        gone += step;
+        let units = (gone / distance.unit).floor();
+        gone -= units * distance.unit;
+        let index = frame as u64;
+        saving += units * sim.rate * (1.0 - sim.rate_random / 100.0 * hashed(seed, index ^ 0xb1_0000));
+        let whole = saving.max(0.0) as u32;
+        saving -= whole as f32;
+        if whole > 0 {
+            let unit = hashed(seed, index ^ 0xb0_0000);
+            let divisions = sim.divisions(unit).unwrap_or(1);
+            let count = whole.saturating_mul(divisions);
+            out.push(Burst { time: frame, first, count, divisions, unit });
+            first += count as u64;
+        }
+        frame += 1.0;
     }
     out
 }
@@ -1108,6 +1174,153 @@ fn volume_spawn(
     }
 }
 
+/// A particle as it is born: its life, where it appears and how it is thrown, all in the emitter's frame. Everything
+/// after birth is a function of these and its age, which is what both the CPU evaluation here and the game's own
+/// vertex shaders (fed by [`spawns`]) do with them.
+struct Initial {
+    life: f32,
+    spawn: glam::Vec3,
+    velocity: glam::Vec3,
+    /// The particle's own pace (momentum_random), applied to everything it travels.
+    pace: f32,
+}
+
+fn initial(sim: &EmitterSim, burst: &Burst, slot: u32, id: u64, seed: u64) -> Initial {
+    // A whole percentage of the life, taken off: 30 means anywhere from 70% to the
+    // full life, in steps of 1% (0x908d8). Never added.
+    let short = (hashed(seed, id ^ 0x11) * sim.life_random.max(0.0)).floor();
+    let life = (sim.life * (1.0 - short / 100.0)).max(1.0);
+
+    let (born, thrown) = volume_spawn(sim, burst, slot, id, seed);
+    let mut velocity = thrown * sim.all_direction;
+    if sim.xz_diffusion != 0.0 {
+        // Away from the emitter's Y axis. A particle born on the axis has no "away",
+        // so it gets a random one.
+        let mut outward = glam::Vec3::new(born.x, 0.0, born.z);
+        if outward.length_squared() <= f32::EPSILON {
+            outward = glam::Vec3::new(
+                hashed_signed(seed, id ^ 0x24),
+                0.0,
+                hashed_signed(seed, id ^ 0x25),
+            );
+        }
+        velocity += outward.normalize_or_zero() * sim.xz_diffusion;
+    }
+    // The directed part: straight along the designated direction, or spread over a
+    // cone about it. The cone is sampled about +Y and turned onto the direction.
+    let directed = if sim.diffusion_dir_angle == 0.0 {
+        sim.designated_dir
+    } else {
+        let floor = 1.0 - sim.diffusion_dir_angle / 90.0;
+        let turn = hashed(seed, id ^ 0x26) * std::f32::consts::TAU;
+        let y = floor + (1.0 - floor) * hashed(seed, id ^ 0x27);
+        let ring = (1.0 - y * y).max(0.0).sqrt();
+        let sample = glam::Vec3::new(ring * turn.cos(), y, ring * turn.sin());
+        let length = sim.designated_dir.length();
+        if length > f32::EPSILON {
+            glam::Quat::from_rotation_arc(glam::Vec3::Y, sim.designated_dir / length)
+                * sample
+                * length
+        } else {
+            glam::Vec3::ZERO
+        }
+    };
+    velocity += directed * sim.designated_dir_scale;
+    // A percentage taken off the speed, never added (0x8fd7c): 50 means anywhere from
+    // half speed to full. It scales the shape's throw and the directed part together.
+    velocity *= 1.0 - sim.velocity_random / 100.0 * hashed(seed, id ^ 0x31);
+    // The per-axis spread goes on afterwards, at full strength.
+    velocity += sim.diffusion
+        * glam::Vec3::new(
+            hashed_signed(seed, id ^ 0x41),
+            hashed_signed(seed, id ^ 0x42),
+            hashed_signed(seed, id ^ 0x43),
+        );
+
+    let spawn = born + unit_vector(seed, id, 0x51) * sim.position_random;
+    let pace = 1.0 + sim.momentum_random * hashed_signed(seed, id ^ 0x54);
+    Initial { life, spawn, velocity, pace }
+}
+
+/// A live particle as the game's effect shaders take it (eff_gpu): the vertex inputs `sysLocalPosAttr` (position,
+/// life), `sysLocalVecAttr` (velocity, birth), `sysScaleAttr`, `sysRandomAttr` and `sysInitRotateAttr`.
+///
+/// Measured against the game's own streams (the recomp capture): position and velocity are the particle's CURRENT
+/// ones, in the emitter's frame (a CPU emitter moves its particles on the CPU, drag and gravity included, and the
+/// shader animates size, colour and turn from the clock); life is the file's life less a whole percentage, birth is
+/// a whole frame of the emitter's clock, the scale is the particle scale less one percentage for all axes, the
+/// randoms are four uniforms in 0..1, and the initial rotation is the emitter's plus up to its random range (never
+/// less).
+#[derive(Debug, Clone, Copy)]
+pub struct Spawn {
+    pub position: glam::Vec3,
+    pub life: f32,
+    pub velocity: glam::Vec3,
+    /// Frames on the effect's clock (the same clock as `evaluate`'s `age_frames`) when it was born.
+    pub birth: f32,
+    pub scale: glam::Vec3,
+    pub random: [f32; 4],
+    pub rotation: glam::Vec3,
+}
+
+/// Every particle this emitter has alive at `age_frames` since the effect started, as born. The same particles, in
+/// the same order, as [`evaluate`].
+pub fn spawns(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<Spawn> {
+    spawns_moving(sim, age_frames, seed, None)
+}
+
+/// [`spawns`] for an emitter that moves: `travelled(t)`, how far it has gone by frame `t` of the effect, drives a
+/// distance emitter. Without it a distance emitter fires on the clock instead, so a still preview shows something.
+pub fn spawns_moving(sim: &EmitterSim, age_frames: f32, seed: u64, travelled: Option<&dyn Fn(f32) -> f32>) -> Vec<Spawn> {
+    let mut out = Vec::new();
+    if age_frames < sim.emission_start {
+        return out;
+    }
+    let since_start = age_frames - sim.emission_start;
+    let firings = match (sim.distance, travelled) {
+        (Some(distance), Some(travelled)) => {
+            bursts_by_distance(sim, distance, since_start, seed, &|t| travelled(t + sim.emission_start))
+        }
+        _ => bursts(sim, since_start, seed),
+    };
+    'bursts: for burst in firings.iter().rev() {
+        let age = since_start - burst.time;
+        if age >= sim.life.max(1.0) {
+            break;
+        }
+        for slot in (0..burst.count).rev() {
+            if out.len() >= MAX_PER_EMITTER {
+                break 'bursts;
+            }
+            let id = burst.first + slot as u64;
+            let Initial { life, spawn, velocity, pace } = initial(sim, burst, slot, id, seed);
+            if age >= life {
+                continue;
+            }
+            // Where it is now and how fast it is going, as evaluate has it.
+            let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, age);
+            let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, age);
+            let shrink = 1.0 - sim.scale_random.x / 100.0 * hashed(seed, id ^ 0x91);
+            let mut rotation = glam::Vec3::ZERO;
+            for axis in 0..3 {
+                if sim.rotate_enabled[axis] {
+                    rotation[axis] = sim.rotate_init[axis] + sim.rotate_init_rand[axis] * hashed(seed, id ^ (0x61 + axis as u64));
+                }
+            }
+            out.push(Spawn {
+                position: spawn + (travelled + fallen) * pace,
+                life,
+                velocity: heading + falling,
+                birth: sim.emission_start + burst.time,
+                scale: sim.particle_scale * shrink.max(0.0),
+                random: [0xa1u64, 0xa2, 0xa3, 0xa4].map(|salt| hashed(seed, id ^ salt)),
+                rotation,
+            });
+        }
+    }
+    out
+}
+
 /// Every particle this emitter has alive at `age_frames` since the effect started.
 ///
 /// `seed` distinguishes emitters so two emitters with identical settings do not produce
@@ -1133,62 +1346,10 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
                 break 'bursts;
             }
             let id = burst.first + slot as u64;
-            // A whole percentage of the life, taken off: 30 means anywhere from 70% to the
-            // full life, in steps of 1% (0x908d8). Never added.
-            let short = (hashed(seed, id ^ 0x11) * sim.life_random.max(0.0)).floor();
-            let life = (sim.life * (1.0 - short / 100.0)).max(1.0);
+            let Initial { life, spawn, velocity, pace } = initial(sim, burst, slot, id, seed);
             if age >= life {
                 continue;
             }
-
-            let (born, thrown) = volume_spawn(sim, burst, slot, id, seed);
-            let mut velocity = thrown * sim.all_direction;
-            if sim.xz_diffusion != 0.0 {
-                // Away from the emitter's Y axis. A particle born on the axis has no "away",
-                // so it gets a random one.
-                let mut outward = glam::Vec3::new(born.x, 0.0, born.z);
-                if outward.length_squared() <= f32::EPSILON {
-                    outward = glam::Vec3::new(
-                        hashed_signed(seed, id ^ 0x24),
-                        0.0,
-                        hashed_signed(seed, id ^ 0x25),
-                    );
-                }
-                velocity += outward.normalize_or_zero() * sim.xz_diffusion;
-            }
-            // The directed part: straight along the designated direction, or spread over a
-            // cone about it. The cone is sampled about +Y and turned onto the direction.
-            let directed = if sim.diffusion_dir_angle == 0.0 {
-                sim.designated_dir
-            } else {
-                let floor = 1.0 - sim.diffusion_dir_angle / 90.0;
-                let turn = hashed(seed, id ^ 0x26) * std::f32::consts::TAU;
-                let y = floor + (1.0 - floor) * hashed(seed, id ^ 0x27);
-                let ring = (1.0 - y * y).max(0.0).sqrt();
-                let sample = glam::Vec3::new(ring * turn.cos(), y, ring * turn.sin());
-                let length = sim.designated_dir.length();
-                if length > f32::EPSILON {
-                    glam::Quat::from_rotation_arc(glam::Vec3::Y, sim.designated_dir / length)
-                        * sample
-                        * length
-                } else {
-                    glam::Vec3::ZERO
-                }
-            };
-            velocity += directed * sim.designated_dir_scale;
-            // A percentage taken off the speed, never added (0x8fd7c): 50 means anywhere from
-            // half speed to full. It scales the shape's throw and the directed part together.
-            velocity *= 1.0 - sim.velocity_random / 100.0 * hashed(seed, id ^ 0x31);
-            // The per-axis spread goes on afterwards, at full strength.
-            velocity += sim.diffusion
-                * glam::Vec3::new(
-                    hashed_signed(seed, id ^ 0x41),
-                    hashed_signed(seed, id ^ 0x42),
-                    hashed_signed(seed, id ^ 0x43),
-                );
-
-            let spawn = born + unit_vector(seed, id, 0x51) * sim.position_random;
-            let pace = 1.0 + sim.momentum_random * hashed_signed(seed, id ^ 0x54);
             let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, age);
             let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, age);
             let offset = spawn + travelled * pace;
@@ -1358,6 +1519,8 @@ mod tests {
             rotate_add_rand: glam::Vec3::ZERO,
             rotate_enabled: [false; 3],
             rotate_regist: 0.0,
+            follow_type: 0,
+            distance: None,
             pattern_cells: 0,
             pattern_table: Vec::new(),
             pattern_frequency: 1.0,

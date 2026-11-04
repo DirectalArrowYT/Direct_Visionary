@@ -1,0 +1,12 @@
+# ssbh_wgpu at f7bfb4b (github.com/ScanMountGoat/ssbh_wgpu, MIT), vendored for one change: Renderer::effect_targets,
+# so Visionary can draw the game's effect shaders into the model's final colour with its depth.
+[workspace]
+resolver = "2"
+members = ["ssbh_wgpu", "nutexb_wgpu"]
+
+[workspace.dependencies]
+ssbh_data = "0.19.0"
+wgpu = "29.0.1"
+glam = "0.28.0"
+rayon = "1.8.1"
+wgsl_to_wgpu = "0.18.0"

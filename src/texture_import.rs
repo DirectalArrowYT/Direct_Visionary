@@ -179,6 +179,50 @@ pub fn decode_rgba(
     Ok(fit(image, max_edge))
 }
 
+/// A pool texture as a shader samples it: every mip level as RGBA8 with the BRTI channel swizzle
+/// ([`BRTI_COMP_SEL`]) already applied, and whether the format is sRGB (the sampler linearises it).
+///
+/// [`decode_rgba`] is the picture of a texture, for showing and editing; this is what the game's
+/// shaders read, which is what drawing with them needs: a BC4 mask sampled as `.a` reads the
+/// broadcast red, and the shaders pick their own mip levels.
+pub struct SampledTexture {
+    pub levels: Vec<image::RgbaImage>,
+    pub srgb: bool,
+}
+
+pub fn decode_for_sampling(pool: &[u8], index: usize, name: &str) -> Result<SampledTexture> {
+    let desc = describe(pool, index, name)?;
+    if !desc.convertible {
+        bail!("'{name}' is {} — Visionary cannot convert that format", desc.format);
+    }
+    let comp_sel = le_u32(pool, brti_offset(pool, index)? + BRTI_COMP_SEL)?.to_le_bytes();
+    let bntx = parse_single(&slice_one(pool, index, name)?, name)?;
+    let surface = bntx
+        .to_surface()
+        .map_err(|e| anyhow!("cannot read '{name}' as an image: {e}"))?;
+    let rgba = surface
+        .decode_rgba8()
+        .map_err(|e| anyhow!("cannot decode '{name}' ({}): {e}", desc.format))?;
+    let mut levels = Vec::new();
+    for level in 0..rgba.mipmaps.max(1) {
+        let mut image = rgba
+            .to_image(level)
+            .map_err(|e| anyhow!("cannot build mip {level} of '{name}': {e}"))?;
+        if comp_sel != [2, 3, 4, 5] {
+            for pixel in image.pixels_mut() {
+                let src = pixel.0;
+                pixel.0 = comp_sel.map(|sel| match sel {
+                    0 => 0,
+                    2..=5 => src[sel as usize - 2],
+                    _ => 255,
+                });
+            }
+        }
+        levels.push(image);
+    }
+    Ok(SampledTexture { levels, srgb: desc.format.contains("Srgb") })
+}
+
 /// Decode a PNG the user picked, to the same straight RGBA8 the pool decode produces.
 ///
 /// The editor previews an imported texture from ITS OWN file rather than from the pool: the

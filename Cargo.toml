@@ -14,7 +14,8 @@ eframe = { version = "0.34.3", default-features = false, features = ["wgpu"] }
 egui = { version = "0.34.3" }
 egui-wgpu = "0.34.3"
 egui_extras = { version = "0.34.3", features = ["all_loaders"] }
-wgpu = "29.0.0"
+# spirv: the game's own effect shaders reach wgpu as SPIR-V (eff_gpu, tools/eft_shaders.py)
+wgpu = { version = "29.0.0", features = ["spirv"] }
 glam = "0.28.0"
 
 # SSBU file formats
@@ -92,9 +93,14 @@ opt-level = 1
 [dev-dependencies]
 # Compiles the WGSL in tests: wgpu only validates a shader when a pipeline is created, so a
 # broken particle shader would otherwise surface as a crash on opening the preview.
-naga = { version = "29.0.1", features = ["wgsl-in"] }
+naga = { version = "29.0.1", features = ["wgsl-in", "spv-in"] }
 
 # Local fix for the eff writer's header page count (vendor/effect_library/src/namco_file.rs):
 # files with a few hundred effect entries were written unreadable.
 [patch.crates-io]
 effect_library = { path = "vendor/effect_library" }
+
+# Renderer::effect_targets (vendor/ssbh_wgpu): the game's effect shaders draw into the model's picture with its depth.
+[patch."https://github.com/ScanMountGoat/ssbh_wgpu.git"]
+ssbh_wgpu = { path = "vendor/ssbh_wgpu/ssbh_wgpu" }
+nutexb_wgpu = { path = "vendor/ssbh_wgpu/nutexb_wgpu" }

@@ -10,11 +10,17 @@ mod carrier_support;
 mod credits;
 mod data;
 mod eff_attrs;
+mod eff_block;
+#[cfg_attr(not(test), allow(dead_code))] // read by the capture replay tests
+mod eff_capture;
 mod eff_editor;
 mod eff_export;
+mod eff_game;
+mod eff_gpu;
 mod eff_mesh;
 mod eff_mesh_io;
 mod eff_render;
+mod eff_shader_cache;
 mod eff_runtime;
 mod eff_sim;
 mod eff_subsections;

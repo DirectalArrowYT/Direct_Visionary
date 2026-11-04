@@ -4,6 +4,12 @@ use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
+/// VISIONARY_PREVIEW_TEST_MOVE: frames waited for the selected move's effects (0 = not waiting)
+static PREVIEW_TEST_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// VISIONARY_PREVIEW_TEST_MOVE: the move was picked
+static PREVIEW_TEST_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// VISIONARY_PREVIEW_TEST_MOVE: the profile's fighter and costume were picked
+static PREVIEW_TEST_PICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use std::path::{Path, PathBuf};
 
 /// Whether the game has reached the terminal state requested by a carrier send.
@@ -4050,7 +4056,12 @@ impl VisionaryApp {
             .iter()
             .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
             .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
-            .filter(|call| frame >= call.active_start && frame <= call.active_end)
+            // EFFECT_OFF_KIND without fading ends it on its frame; with fading (and for one that does not follow, which
+            // plays out after its frame) its particles say when it is over
+            .filter(|call| {
+                frame >= call.active_start
+                    && (frame <= call.active_end || (!call.follows_bone && call.off_fade != Some(false)) || call.off_fade == Some(true))
+            })
             .map(|call| crate::eff_runtime::LiveEffect {
                 name: call.effect_name.clone(),
                 bone: call.bone_name.clone(),
@@ -4069,6 +4080,10 @@ impl VisionaryApp {
                 // both spawn the shared arc at 0.75 -- so an effect drawn at 1.0 regardless is
                 // the wrong size on every call that is not already 1.0.
                 scale: call.scale,
+                follows: call.follows_bone,
+                // emitters stop at the kill (with fading; one without is filtered out above)
+                stopped: (call.off_fade.is_some() && call.active_end < crate::data::OPEN_ENDED_EFFECT_FRAME)
+                    .then(|| call.active_end.saturating_sub(call.active_start) as f32),
             })
             .collect()
     }
@@ -14364,6 +14379,20 @@ If you step every basis for a                          type and NONE of them mat
             }
         });
         ui.checkbox(&mut self.state.show_all_effect_calls, "All frames");
+        {
+            use std::sync::atomic::Ordering;
+            let mut game = crate::eff_shader_cache::ENABLED.load(Ordering::Relaxed);
+            if ui
+                .checkbox(&mut game, "Game shaders")
+                .on_hover_text(
+                    "Draw effects with Smash's own effect shaders, translated from the .eff (the first time a file is \
+                     drawn this takes about a minute, in the background). Off: Visionary's own particle renderer.",
+                )
+                .changed()
+            {
+                crate::eff_shader_cache::ENABLED.store(game, Ordering::Relaxed);
+            }
+        }
         ui.checkbox(&mut self.show_effect_advanced, "Advanced overrides")
             .on_hover_text(
                 "Reveal optional rate, camera, WorkModule, tint, alpha, and scale overrides",
@@ -18072,6 +18101,10 @@ If you step every basis for a                          type and NONE of them mat
         }
         let mut chosen: Option<crate::project_hub::HubAction> = None;
         let last = self.project_hub.last.clone();
+        // VISIONARY_PREVIEW_TEST_MOVE: the test runs in the last project (whose scripts the move comes from)
+        if std::env::var_os("VISIONARY_PREVIEW_TEST_MOVE").is_some() {
+            chosen = last.clone().map(crate::project_hub::HubAction::ResumeLast);
+        }
         let recent = self.project_hub.recent.clone();
         let current_path = self.project_path.clone();
         // Computed once before the window: building the project commits pending
@@ -32873,6 +32906,63 @@ impl eframe::App for VisionaryApp {
         // ACMD capture, the reconnect modal, and the Transplant pool all need it, not just
         // the Eff Editor window (which used to be the only thing that started it).
         self.game_link.ensure_started();
+        // VISIONARY_PREVIEW_TEST_MOVE=<motion name>,<script frame> (tests): with the effects previewed here, that move and
+        // frame once the fighter's moves are listed; stderr says which effects are live on it
+        if !self.project_hub.show
+            && std::env::var_os("VISIONARY_PREVIEW_TEST_MOVE").is_some()
+            && !PREVIEW_TEST_DONE.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // resuming the project replaces the fighter and costume the profile variables picked: pick them again
+            let want = std::env::var("VISIONARY_PROFILE_FIGHTER").unwrap_or_default();
+            if !PREVIEW_TEST_PICKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                if let Some(i) = self.state.fighters.iter().position(|f| f.name.eq_ignore_ascii_case(&want)) {
+                    self.select_fighter(i);
+                    if let Some(slot) = std::env::var("VISIONARY_PROFILE_COSTUME").ok().and_then(|s| s.trim().parse().ok()) {
+                        self.select_costume_slot(i, slot);
+                    }
+                }
+            }
+            if let Ok(spec) = std::env::var("VISIONARY_PREVIEW_TEST_MOVE") {
+                let mut parts = spec.split(',');
+                let name = parts.next().unwrap_or_default().trim().to_string();
+                let at = parts.next().and_then(|f| f.trim().parse().ok()).unwrap_or(1);
+                let hash = hash40::hash40(&name.to_ascii_lowercase()).0;
+                if let Some(entry) = self
+                    .move_list
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(&name) || m.hash == hash)
+                    .cloned()
+                    .map(|mut m| {
+                        // the list can be built before the motion names load; the test knows the name
+                        m.name = name.clone();
+                        m
+                    })
+                {
+                    self.select_move(entry);
+                    self.state.current_frame = at;
+                    PREVIEW_TEST_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
+                    PREVIEW_TEST_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        // the move's effects arrive after it is selected: report once they do (or after ~10 s without)
+        let wait = PREVIEW_TEST_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+        if wait > 0 {
+            if !self.state.effects.is_empty() || wait > 100 {
+                PREVIEW_TEST_WAIT.store(0, std::sync::atomic::Ordering::Relaxed);
+                let live: Vec<String> = self.live_effect_spawns().iter().map(|e| format!("{} on {} age {}", e.name, e.bone, e.age)).collect();
+                eprintln!(
+                    "[preview] test: frame {}, {} effect calls (source {:?}, error {:?}, fighter {:?}), live effects {live:?}",
+                    self.state.current_frame,
+                    self.state.effects.len(),
+                    self.state.acmd_source,
+                    self.acmd_error,
+                    self.state.selected_fighter.map(|i| self.state.fighters[i].name.clone()),
+                );
+            } else {
+                PREVIEW_TEST_WAIT.store(wait + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // Poll background move list loader
         if let Some(rx) = &self.move_list_receiver {
             if let Ok(moves) = rx.try_recv() {
@@ -34098,6 +34188,7 @@ impl eframe::App for VisionaryApp {
                                         &mut self.effect_meshes,
                                         self.effect_quad_planes,
                                         &bones,
+                                        &|back| rs.bone_world_matrices_at((animation_frame - back).max(0.0)),
                                         &live,
                                     );
                                 newly_undecodable = undecodable;
@@ -34131,6 +34222,7 @@ impl eframe::App for VisionaryApp {
                             .map(|texture| (texture.key, texture.image))
                             .collect(),
                         pending_meshes: frame_effects.pending_meshes,
+                        game_draws: frame_effects.game_draws,
                     },
                 );
                 ui.painter().add(callback);

@@ -134,6 +134,9 @@ pub struct LoadedEffect {
     /// The file's BNTX pool, verbatim. Kept so the editor can decode a texture to PNG for
     /// editing — `PtclFile` only carries what a texture IS, not its pixels.
     pub texture_pool: Option<Vec<u8>>,
+    /// Per emitter set, per emitter in `ptcl`'s flattened order: what drawing it with the game's own shaders needs
+    /// (eff_game). `None` for an emitter the game path cannot draw.
+    pub game: Vec<Vec<Option<crate::eff_game::GameEmitter>>>,
 }
 
 pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
@@ -184,11 +187,38 @@ pub fn load_effect(path: &Path) -> Result<LoadedEffect> {
         .and_then(|p| p.texture_info.as_ref())
         .and_then(|info| info.binary_data.clone());
     let entries = read_entries(&file);
+    let game = file
+        .ptcl_file
+        .as_ref()
+        .map(|p| {
+            let textures = p.texture_info.as_ref().map(|i| i.descriptors.as_slice()).unwrap_or_default();
+            fn walk(
+                list: &[effect_library::Emitter],
+                textures: &[effect_library::ptcl_file::TextureDescriptor],
+                out: &mut Vec<Option<crate::eff_game::GameEmitter>>,
+            ) {
+                for e in list {
+                    out.push(crate::eff_game::GameEmitter::read(e, textures));
+                    walk(&e.children, textures, out);
+                }
+            }
+            p.emitter_list
+                .emitter_sets
+                .iter()
+                .map(|set| {
+                    let mut out = Vec::new();
+                    walk(&set.emitters, textures, &mut out);
+                    out
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(LoadedEffect {
         index: EffIndex { handles },
         ptcl,
         entries,
         texture_pool,
+        game,
     })
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "nutexb_wgpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu.workspace = true
+nutexb = "0.7.0"
+log = "0.4.17"
+bytemuck = { version = "1.7", features = [ "derive" ] }
+thiserror = "1.0"
+
+[build-dependencies]
+wgsl_to_wgpu.workspace = true

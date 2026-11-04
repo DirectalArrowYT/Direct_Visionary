@@ -22,6 +22,9 @@ pub struct Camera {
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
+    /// The game viewport's side by side: the game's own camera instead of this one (model space -> view, and the
+    /// vertical field of view), so the preview frames the fighter exactly as the game's picture does.
+    pub game_view: Option<(Mat4, f32)>,
 }
 
 impl Default for Camera {
@@ -32,6 +35,7 @@ impl Default for Camera {
             fov_y: 30f32.to_radians(),
             near: 1.0,
             far: 400_000.0,
+            game_view: None,
         }
     }
 }
@@ -60,8 +64,11 @@ impl Camera {
             self.rotation.y,
             self.rotation.z,
         );
-        let model_view = Mat4::from_translation(self.translation) * rotation;
-        let projection = Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far);
+        let (model_view, fov_y) = match self.game_view {
+            Some((model_view, fov_y)) => (model_view, fov_y),
+            None => (Mat4::from_translation(self.translation) * rotation, self.fov_y),
+        };
+        let projection = Mat4::perspective_rh(fov_y, aspect, self.near, self.far);
         let mvp = projection * model_view;
         CameraTransforms {
             model_view_matrix: model_view,
@@ -107,6 +114,207 @@ pub struct HitboxRenderState {
     /// Effect particles, drawn as their own pass after the model. Optional only so a device
     /// that cannot build the pipeline still renders fighters rather than failing to start.
     pub particles: Option<crate::eff_render::ParticleRenderer>,
+    /// Effects drawn with the game's own shaders (eff_game), after the particles.
+    pub game_effects: GameEffectsGpu,
+}
+
+/// The game's effect shaders on the GPU: a renderer per translated shader set (one per effect file), the effect
+/// textures as the shaders sample them, and this frame's prepared draws.
+pub struct GameEffectsGpu {
+    renderers: std::collections::HashMap<std::path::PathBuf, Option<crate::eff_gpu::GameEffectRenderer>>,
+    textures: std::collections::HashMap<crate::eff_render::TextureKey, wgpu::TextureView>,
+    pub(crate) prepared: Vec<crate::eff_gpu::PreparedDraw>,
+    /// The models' depth, one sample per pixel (the model renderer's is multisampled), and its size.
+    depth: Option<((u32, u32), wgpu::TextureView)>,
+    /// Writes `depth` from the model renderer's multisampled depth.
+    resolve: Option<wgpu::RenderPipeline>,
+}
+
+/// The model renderer's (ssbh_wgpu) final colour, which the effects draw into: its RGBA_COLOR_FORMAT.
+pub(crate) const MODEL_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+/// Its DEPTH_FORMAT, and the effects' depth.
+const MODEL_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+impl GameEffectsGpu {
+    pub(crate) fn new() -> Self {
+        Self { renderers: Default::default(), textures: Default::default(), prepared: Vec::new(), depth: None, resolve: None }
+    }
+
+    /// Draw the prepared draws into the model's picture (`color`, before its overlays), depth tested against the
+    /// models (`model_depth`, multisampled), as the game draws them into its scene. `size` is the picture's.
+    pub(crate) fn draw_into(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        model_depth: &wgpu::TextureView,
+        size: (u32, u32),
+    ) {
+        if self.prepared.is_empty() || size.0 == 0 || size.1 == 0 {
+            return;
+        }
+        if self.depth.as_ref().is_none_or(|(s, _)| *s != size) {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("game effect depth"),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: MODEL_DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth = Some((size, texture.create_view(&Default::default())));
+        }
+        let resolve = self.resolve.get_or_insert_with(|| {
+            // the nearest of the pixel's samples: an effect is hidden wherever any of the model covers the pixel
+            const WGSL: &str = r#"
+                @group(0) @binding(0) var src: texture_depth_multisampled_2d;
+                @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+                    let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+                    return vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0);
+                }
+                struct Out { @builtin(frag_depth) depth: f32 }
+                @fragment fn fs(@builtin(position) pos: vec4<f32>) -> Out {
+                    var o: Out;
+                    var d = 1.0;
+                    for (var s = 0; s < i32(textureNumSamples(src)); s++) {
+                        d = min(d, textureLoad(src, vec2<i32>(pos.xy), s));
+                    }
+                    o.depth = d;
+                    return o;
+                }
+            "#;
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("game effect depth resolve"),
+                source: wgpu::ShaderSource::Wgsl(WGSL.into()),
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("game effect depth resolve"),
+                layout: None,
+                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[], compilation_options: Default::default() }),
+                primitive: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: MODEL_DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: Default::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
+        let depth = &self.depth.as_ref().unwrap().1;
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &resolve.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(model_depth) }],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("game effect depth resolve"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(resolve);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("game effects"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: color,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        for draw in &self.prepared {
+            draw.encode(&mut pass);
+        }
+    }
+
+    /// Stage this frame's game-shader draws. `camera` is c8, the view block (eff_gpu::camera_block).
+    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &[crate::eff_game::GameDraw], camera: &[u8]) {
+        use crate::eff_gpu::{DrawInputs, TextureInput, FRAGMENT, VERTEX};
+        self.prepared.clear();
+        for draw in draws {
+            let Some(dir) = crate::eff_shader_cache::ready(&draw.file) else { continue };
+            let renderer = self.renderers.entry(dir.clone()).or_insert_with(|| {
+                match crate::eff_gpu::ShaderLibrary::open(&dir) {
+                    Ok(library) => Some(crate::eff_gpu::GameEffectRenderer::new(device, queue, library)),
+                    Err(e) => {
+                        eprintln!("[eff] the game's shaders in {} could not be read: {e:#}", dir.display());
+                        None
+                    }
+                }
+            });
+            let Some(renderer) = renderer.as_mut() else { continue };
+            let Some(prepared) = crate::eff_game::prepare(draw, &renderer.library) else { continue };
+            for (key, pixels) in draw.textures.iter().flatten() {
+                if !self.textures.contains_key(key) {
+                    let view = crate::eff_gpu::upload_sampled(device, queue, pixels, "game effect texture");
+                    self.textures.insert(key.clone(), view);
+                }
+            }
+            let textures: Vec<TextureInput> = draw
+                .textures
+                .iter()
+                .enumerate()
+                .filter_map(|(unit, texture)| {
+                    let (key, _) = texture.as_ref()?;
+                    Some(TextureInput {
+                        stage: FRAGMENT,
+                        unit: unit as u32,
+                        view: self.textures.get(key)?,
+                        sampler: draw.emitter.samplers[unit]?.1,
+                    })
+                })
+                .collect();
+            let mut cbufs: Vec<(u32, u32, &[u8])> = prepared.cbufs.iter().map(|(s, n, b)| (*s, *n, b.as_slice())).collect();
+            cbufs.push((VERTEX, 8, camera));
+            cbufs.push((FRAGMENT, 8, camera));
+            let inputs = DrawInputs {
+                variation: prepared.variation,
+                cbufs,
+                vertices: prepared.vertices,
+                indices: prepared.indices,
+                state: prepared.state,
+                // every captured effect draw had the alpha test off (always passes)
+                alpha_func: 8,
+                alpha_ref: 0.0,
+                count: prepared.count,
+                instances: prepared.instances,
+                first: 0,
+                base_vertex: 0,
+                base_instance: 0,
+                textures,
+            };
+            // drawn into the model's picture with its depth (draw_into)
+            match renderer.prepare(device, &inputs, MODEL_COLOR_FORMAT, Some(MODEL_DEPTH_FORMAT)) {
+                Ok(p) => self.prepared.push(p),
+                Err(e) => eprintln!("[eff] {}: {e:#}", draw.file.display()),
+            }
+        }
+    }
 }
 
 impl HitboxRenderState {
@@ -152,6 +360,7 @@ impl HitboxRenderState {
             wgpu_device: Some(device.clone()),
             wgpu_queue: Some(queue.clone()),
             particles: Some(crate::eff_render::ParticleRenderer::new(device, surface_format)),
+            game_effects: GameEffectsGpu::new(),
         }
     }
 
@@ -625,6 +834,148 @@ fn clip_to_screen(clip: glam::Vec4, viewport: egui::Rect) -> Option<egui::Pos2> 
 }
 
 #[cfg(test)]
+mod game_effects_tests {
+    /// A live effect through the whole viewport path -- the runtime's game draws, GameEffectsGpu, the viewport camera
+    /// -- headless, to a PNG. `VISIONARY_LIVE_COMMON` = ef_common.eff, `VISIONARY_LIVE_FIGHTER` = a fighter's .eff
+    /// (optional), `VISIONARY_LIVE_EFFECT` = entry name (default sys_hit_normal), `VISIONARY_LIVE_AGE` = frames since it
+    /// started (default 5), `VISIONARY_LIVE_CALL` = the spawn call's "x,y,z,rx,ry,rz,size" on the top bone (default
+    /// 0,10,0,0,0,0,1), `VISIONARY_LIVE_OUT` = the PNG. The first run of a file translates its shaders into the cache
+    /// (about a minute).
+    #[test]
+    fn live_effect_draws_with_the_game_shaders() {
+        let Ok(common) = std::env::var("VISIONARY_LIVE_COMMON") else { return };
+        let name = std::env::var("VISIONARY_LIVE_EFFECT").unwrap_or_else(|_| "sys_hit_normal".into());
+        let age: f32 = std::env::var("VISIONARY_LIVE_AGE").ok().and_then(|a| a.parse().ok()).unwrap_or(5.0);
+        let out = std::env::var("VISIONARY_LIVE_OUT").unwrap();
+        let common = std::path::PathBuf::from(common);
+        let fighter = std::env::var("VISIONARY_LIVE_FIGHTER").ok().map(std::path::PathBuf::from);
+        let call: Vec<f32> = std::env::var("VISIONARY_LIVE_CALL")
+            .unwrap_or_else(|_| "0,10,0,0,0,0,1".into())
+            .split(',')
+            .map(|v| v.trim().parse().unwrap())
+            .collect();
+
+        let started = std::time::Instant::now();
+        for file in fighter.iter().chain([&common]) {
+            while crate::eff_shader_cache::ready(file).is_none() {
+                if let crate::eff_shader_cache::State::Failed(e) = crate::eff_shader_cache::global().lock().unwrap().get(file) {
+                    panic!("shader translation of {} failed: {e}", file.display());
+                }
+                assert!(started.elapsed().as_secs() < 900, "shader translation took too long");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+        println!("shaders ready after {:.1}s", started.elapsed().as_secs_f32());
+
+        let mut resolver = crate::eff_runtime::EffectResolver::default();
+        resolver.set_search_path(fighter.clone(), Vec::new(), Some(common.clone()));
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+        let mut bones = std::collections::HashMap::new();
+        bones.insert("top".to_string(), glam::Mat4::IDENTITY);
+        let live = [crate::eff_runtime::LiveEffect {
+            name: name.clone(),
+            bone: "top".into(),
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            age,
+            offset: glam::Vec3::new(call[0], call[1], call[2]),
+            rotation: glam::Vec3::new(call[3], call[4], call[5]),
+            scale: call[6],
+            follows: true,
+            stopped: None,
+        }];
+        let (frame, _) = crate::eff_runtime::build_particle_batches(
+            &mut resolver,
+            &|_| false,
+            &|_| false,
+            &|_| false,
+            &mut meshes,
+            crate::eff_runtime::QuadPlanes::default(),
+            &bones,
+            &|_| bones.clone(),
+            &live,
+        );
+        println!("{name} at {age}: {} game draws, {} batches, {} mesh batches", frame.game_draws.len(), frame.batches.len(), frame.mesh_batches.len());
+        assert!(!frame.game_draws.is_empty(), "no emitter drew with the game's shaders");
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let adapter = rt.block_on(instance.request_adapter(&Default::default())).unwrap();
+        let (device, queue) = rt
+            .block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }))
+            .unwrap();
+        device.on_uncaptured_error(std::sync::Arc::new(|e| panic!("wgpu: {e}")));
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut game = super::GameEffectsGpu::new();
+        // The viewport's own camera, pointed at the effect.
+        let camera = super::Camera { translation: glam::Vec3::new(0.0, -10.0, -60.0), rotation: glam::Vec3::ZERO, ..Default::default() };
+        let (w, h) = (1280u32, 720u32);
+        let transforms = camera.transforms(w as f32, h as f32);
+        let block = crate::eff_gpu::camera_block(transforms.model_view_matrix, transforms.projection_matrix, camera.near, camera.far, [1.0, 1.0, 0.01, 0.0]);
+        game.prepare(&device, &queue, &frame.game_draws, &block);
+        println!("{} draws prepared", game.prepared.len());
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.1, a: 1.0 }), store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            for d in &game.prepared {
+                d.encode(&mut pass);
+            }
+        }
+        let row = (w * 4).div_ceil(256) * 256;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo { buffer: &buffer, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None } },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([encoder.finish()]);
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mapped = buffer.slice(..).get_mapped_range();
+        let mut png = image::RgbaImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let at = (y * row + x * 4) as usize;
+                png.put_pixel(x, y, image::Rgba([mapped[at], mapped[at + 1], mapped[at + 2], 255]));
+            }
+        }
+        png.save(&out).unwrap();
+        println!("wrote {out}");
+    }
+}
+
+#[cfg(test)]
 #[allow(clippy::items_after_test_module)] // Rendering helpers remain grouped before callbacks.
 mod tests {
     #[test]
@@ -849,6 +1200,8 @@ pub struct ViewportCallback {
         crate::eff_render::TextureKey,
         std::sync::Arc<image::RgbaImage>,
     )>,
+    /// Emitters drawn with the game's own shaders (not also in the batches).
+    pub game_draws: Vec<crate::eff_game::GameDraw>,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -925,6 +1278,20 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                     &self.mesh_batches,
                 );
             }
+            // The game's own effect shaders, with the viewport's camera as their view block.
+            if !self.game_draws.is_empty() {
+                let transforms = state.camera.transforms(self.width, self.height);
+                let camera = crate::eff_gpu::camera_block(
+                    transforms.model_view_matrix,
+                    transforms.projection_matrix,
+                    state.camera.near,
+                    state.camera.far,
+                    [1.0, 1.0, 0.01, 0.0],
+                );
+                state.game_effects.prepare(device, queue, &self.game_draws, &camera);
+            } else {
+                state.game_effects.prepared.clear();
+            }
 
             // Always re-render (camera may have changed, or egui needs a fresh frame)
             state.renderer.begin_render_models(
@@ -933,6 +1300,10 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.shared_data.database(),
                 &state.model_render_options,
             );
+            // the game's effects go into the picture the models were just drawn to, hidden behind them by depth
+            let size = (state.current_width, state.current_height);
+            let (color, depth) = state.renderer.effect_targets();
+            state.game_effects.draw_into(device, egui_encoder, color, depth, size);
         }
         Vec::new()
     }

@@ -87,6 +87,8 @@ pub fn extract(blob: &[u8], descriptor: usize) -> Option<EffectMesh> {
 pub struct MeshLibrary {
     pools: HashMap<PathBuf, Option<Vec<u8>>>,
     meshes: HashMap<MeshKey, Option<EffectMesh>>,
+    /// Every attribute of a primitive (normals, colours, both UV sets), for the game's own shaders (eff_game).
+    full: HashMap<MeshKey, Option<std::sync::Arc<crate::eff_mesh_io::MeshData>>>,
     /// `primitive_id` to descriptor index, per file. The id is a name hash, so this is a
     /// lookup rather than arithmetic.
     ids: HashMap<PathBuf, HashMap<u64, usize>>,
@@ -148,9 +150,23 @@ impl MeshLibrary {
         self.meshes.get(key).and_then(|slot| slot.as_ref())
     }
 
+    /// The primitive with all its attributes, extracting and caching it on first use.
+    pub fn mesh_data(&mut self, key: &MeshKey) -> Option<std::sync::Arc<crate::eff_mesh_io::MeshData>> {
+        if !self.full.contains_key(key) {
+            let data = self
+                .pool(&key.file)
+                .cloned()
+                .and_then(|blob| crate::eff_mesh_io::read_primitive(&blob, key.descriptor).ok())
+                .map(|(_, mesh)| std::sync::Arc::new(mesh));
+            self.full.insert(key.clone(), data);
+        }
+        self.full.get(key).cloned().flatten()
+    }
+
     pub fn clear(&mut self) {
         self.pools.clear();
         self.meshes.clear();
+        self.full.clear();
         self.ids.clear();
     }
 }

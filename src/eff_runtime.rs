@@ -462,6 +462,13 @@ pub struct LiveEffect {
     /// game does, where reading it as "unset, use 1.0" would silently show two effects the
     /// game does not.
     pub scale: f32,
+    /// Whether it moves with its bone (`EFFECT_FOLLOW` and the like). One that does not stays where the bone was on the
+    /// frame it was spawned.
+    pub follows: bool,
+    /// Frames into the effect at which the script killed it with fading on (`EFFECT_OFF_KIND(.., true, ..)`, the
+    /// game's kill_kind with fade): its emitters stop there and what they made plays out. One killed without fading
+    /// is simply not live after its kill.
+    pub stopped: Option<f32>,
 }
 
 /// Put a decoded effect texture into one form the shader can treat uniformly.
@@ -747,10 +754,138 @@ pub fn spawn_rotation_in(degrees: glam::Vec3, order: usize) -> glam::Quat {
 
 #[derive(Default)]
 pub struct FrameEffects {
+    /// Emitters drawn with the game's own shaders (eff_game), where their file's shaders are translated. These are
+    /// not also in the batches.
+    pub game_draws: Vec<crate::eff_game::GameDraw>,
     pub batches: Vec<crate::eff_render::ParticleBatch>,
     pub mesh_batches: Vec<crate::eff_render::MeshBatch>,
     pub pending_textures: Vec<PendingTexture>,
     pub pending_meshes: Vec<(crate::eff_mesh::MeshKey, crate::eff_mesh::EffectMesh)>,
+}
+
+/// Where a live effect is and how it looks, for [`game_draw`].
+struct Placement {
+    bone: glam::Mat4,
+    call_offset: glam::Vec3,
+    call_turn: glam::Quat,
+    scale: f32,
+    tint: [f32; 3],
+    alpha: f32,
+    /// Frames into the emitter at which it stops emitting ([`LiveEffect::stopped`]).
+    stopped: Option<f32>,
+}
+
+/// The texture pixels the game's shaders sample, decoded once per texture (decode_for_sampling: every mip, the
+/// channel swizzle applied). `None` for one that will not decode.
+fn sampled_texture(
+    key: &crate::eff_render::TextureKey,
+    pool: &[u8],
+    name: &str,
+) -> Option<std::sync::Arc<crate::texture_import::SampledTexture>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Cache = Mutex<std::collections::HashMap<crate::eff_render::TextureKey, Option<Arc<crate::texture_import::SampledTexture>>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cache
+        .entry(key.clone())
+        .or_insert_with(|| crate::texture_import::decode_for_sampling(pool, key.index, name).ok().map(Arc::new))
+        .clone()
+}
+
+/// One emitter of a live effect as the game's own shaders draw it: `None` when its file's shaders are not translated
+/// (yet), or the emitter is not one the game path can draw, and it then draws as a batch instead.
+///
+/// The emitter's matrix is the effect's placement (bone, the call's offset, turn and size) times the emitter's own
+/// transform from the file; the emitter's clock is the effect's age less the part's start; its particles are the
+/// simulation's, as born (eff_sim::spawns).
+#[allow(clippy::too_many_arguments)]
+fn game_draw(
+    file: &std::path::Path,
+    loaded: &crate::effects::LoadedEffect,
+    set_idx: usize,
+    emitter_index: usize,
+    emitter: &crate::effects::EmitterDef,
+    slots: &crate::eff_sim::Slots,
+    meshes: &mut crate::eff_mesh::MeshLibrary,
+    place: &Placement,
+    particle_age: f32,
+    history: &dyn Fn(f32) -> Option<glam::Mat4>,
+) -> Option<crate::eff_game::GameDraw> {
+    crate::eff_shader_cache::ready(file)?;
+    let game = loaded.game.get(set_idx)?.get(emitter_index)?.clone()?;
+    let sim = crate::eff_sim::EmitterSim::read(emitter, slots);
+    let seed = (set_idx as u64) << 32 ^ (emitter_index as u64) << 8;
+    let placement = place.bone
+        * glam::Mat4::from_translation(place.call_offset)
+        * glam::Mat4::from_quat(place.call_turn)
+        * glam::Mat4::from_scale(glam::Vec3::splat(place.scale));
+    let (_, rotation, translation) = placement.to_scale_rotation_translation();
+    let placement_rt = glam::Mat4::from_rotation_translation(rotation, translation);
+    let (local, local_rt) = crate::eff_game::emitter_local(&game.stored);
+    // The emitter's matrix `back` frames ago, from the bone's pose then: the move's animation is known ahead, so the past
+    // is worked out rather than remembered.
+    let emitter_at = |back: f32| (if back <= 0.0 { placement } else { history(back).unwrap_or(placement) }) * local;
+    // A distance emitter fires by how far the emitter has gone: its path, a frame at a time on the emitter's clock.
+    let path: Option<Vec<f32>> = sim.distance.map(|_| {
+        let frames = particle_age.max(0.0).ceil() as usize + 1;
+        let mut gone = vec![0.0f32; frames + 1];
+        let mut last = emitter_at(particle_age).w_axis.truncate();
+        for t in 1..=frames {
+            let here = emitter_at(particle_age - t as f32).w_axis.truncate();
+            gone[t] = gone[t - 1] + here.distance(last);
+            last = here;
+        }
+        gone
+    });
+    let travelled = |t: f32| match &path {
+        Some(gone) => {
+            let t = t.clamp(0.0, (gone.len() - 1) as f32);
+            let (i, f) = (t.floor() as usize, t.fract());
+            gone[i] + (gone[(i + 1).min(gone.len() - 1)] - gone[i]) * f
+        }
+        None => 0.0,
+    };
+    let mut spawns = crate::eff_sim::spawns_moving(
+        &sim,
+        particle_age,
+        seed,
+        path.is_some().then_some(&travelled as &dyn Fn(f32) -> f32),
+    );
+    if let Some(stopped) = place.stopped {
+        // killed with fading: nothing born after the kill
+        spawns.retain(|spawn| spawn.birth < stopped);
+    }
+    // Particles of an emitter that does not follow (1: they stay where they were born, 2: they keep only its position)
+    // are drawn by the emitter as it was at their birth; the shader reads which from the emitter's flags.
+    let births = if sim.follow_type == 0 {
+        Vec::new()
+    } else {
+        spawns.iter().map(|spawn| emitter_at(particle_age - spawn.birth)).collect()
+    };
+    let colour = [place.tint[0], place.tint[1], place.tint[2], place.alpha];
+    let dynamic = crate::eff_game::Dynamic {
+        colour0: colour,
+        colour1: colour,
+        time: particle_age,
+        particles: spawns.len() as u32,
+        particle_scale: [1.0, 1.0],
+        set_scale: [1.0, place.scale, place.scale, place.scale],
+        matrix: placement * local,
+        matrix_rt: placement_rt * local_rt,
+    };
+    let mesh = sim.primitive_id.and_then(|id| {
+        let descriptor = meshes.descriptor_for(file, id)?;
+        meshes.mesh_data(&crate::eff_mesh::MeshKey { file: file.to_path_buf(), descriptor })
+    });
+    let pool = loaded.texture_pool.as_deref().unwrap_or_default();
+    let textures = game.samplers.map(|sampler| {
+        let (index, _) = sampler?;
+        let key = crate::eff_render::TextureKey { file: file.to_path_buf(), index };
+        let name = &loaded.ptcl.bntx_textures.get(index)?.tex_name;
+        let pixels = sampled_texture(&key, pool, name)?;
+        Some((key, pixels))
+    });
+    Some(crate::eff_game::GameDraw { file: file.to_path_buf(), emitter: game, dynamic, spawns, births, mesh, textures })
 }
 
 /// Turn the effects live on this frame into particles the viewport can draw.
@@ -770,6 +905,7 @@ pub fn build_particle_batches(
     meshes: &mut crate::eff_mesh::MeshLibrary,
     planes: QuadPlanes,
     bone_matrices: &std::collections::HashMap<String, glam::Mat4>,
+    bones_before: &dyn Fn(f32) -> std::collections::HashMap<String, glam::Mat4>,
     live: &[LiveEffect],
 ) -> (
     FrameEffects,
@@ -778,6 +914,7 @@ pub fn build_particle_batches(
     use crate::eff_render::{MeshBatch, ParticleBatch, ParticleInstance, TextureKey};
 
     let mut batches: Vec<ParticleBatch> = Vec::new();
+    let mut game_draws: Vec<crate::eff_game::GameDraw> = Vec::new();
     let mut mesh_batches: Vec<MeshBatch> = Vec::new();
     let mut pending_meshes: Vec<(crate::eff_mesh::MeshKey, crate::eff_mesh::EffectMesh)> =
         Vec::new();
@@ -787,6 +924,9 @@ pub fn build_particle_batches(
     let mut undecodable: Vec<TextureKey> = Vec::new();
     let mut decoded: std::collections::HashSet<TextureKey> = std::collections::HashSet::new();
     let slots = crate::eff_sim::Slots::new();
+    // Earlier poses, a whole frame apart, for particles that keep where they were born: shared by every effect this frame.
+    let poses: std::cell::RefCell<std::collections::HashMap<u32, std::collections::HashMap<String, glam::Mat4>>> =
+        Default::default();
 
     for LiveEffect {
         name,
@@ -797,14 +937,25 @@ pub fn build_particle_batches(
         offset: call_offset,
         rotation: call_rotation,
         scale,
+        follows,
+        stopped,
     } in live
     {
         let Ok(resolved) = resolver.resolve(name) else {
             continue;
         };
+        // An earlier pose of the bone the call named, `back` frames before this one (whole frames).
+        let bone_before = |back: f32| {
+            let back = back.round().max(0.0) as u32;
+            let mut poses = poses.borrow_mut();
+            let pose = poses.entry(back).or_insert_with(|| bones_before(back as f32));
+            lookup_bone(pose, bone)
+        };
         // The bone the ACMD call named. Without it there is no world position to place the
-        // effect at, and drawing it at the origin would be worse than not drawing it.
-        let Some(matrix) = lookup_bone(bone_matrices, bone) else {
+        // effect at, and drawing it at the origin would be worse than not drawing it. An effect that does not follow
+        // stays where the bone was when it was spawned.
+        let matrix = if *follows { lookup_bone(bone_matrices, bone) } else { bone_before(*age) };
+        let Some(matrix) = matrix else {
             continue;
         };
         // The whole bone matrix, not just its translation. A bone's rotation is part of where
@@ -861,6 +1012,38 @@ pub fn build_particle_batches(
             };
 
             for (emitter_index, emitter) in set.emitters.iter().enumerate() {
+                // The game's own shaders, where this file's are translated: the emitter is drawn as the game draws
+                // it, and not by the batches below.
+                let particle_age = age - part.start_frame as f32;
+                if particle_age >= 0.0 {
+                    let place = Placement {
+                        bone: matrix,
+                        call_offset: *call_offset,
+                        // The game's own convention, measured from its emitter matrices (Bowser's tilts in the
+                        // recomp): the call's degrees about X, then Y, then Z, in the bone's frame, and nothing
+                        // else -- not the quarter turn or order the batch path's QuadPlanes settings apply.
+                        call_turn: spawn_rotation_in(*call_rotation, 0),
+                        scale: *scale,
+                        tint: *tint,
+                        alpha: *alpha,
+                        stopped: stopped.map(|at| at - part.start_frame as f32),
+                    };
+                    let history = |back: f32| {
+                        let bone = if *follows { bone_before(back) } else { Some(matrix) };
+                        bone.map(|bone| {
+                            bone * glam::Mat4::from_translation(place.call_offset)
+                                * glam::Mat4::from_quat(place.call_turn)
+                                * glam::Mat4::from_scale(glam::Vec3::splat(place.scale))
+                        })
+                    };
+                    if let Some(draw) = game_draw(
+                        &file, loaded, part.set_idx, emitter_index, emitter, &slots, meshes, &place, particle_age, &history,
+                    )
+                    {
+                        game_draws.push(draw);
+                        continue;
+                    }
+                }
                 let Some(texture_index) = emitter.texture_index else {
                     continue;
                 };
@@ -1101,6 +1284,7 @@ pub fn build_particle_batches(
 
     (
         FrameEffects {
+            game_draws,
             batches,
             mesh_batches,
             pending_textures: pending,
@@ -2221,11 +2405,13 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
             scale: 1.0,
+            follows: true,
+            stopped: None,
         }];
         let (effects, _) =
             build_particle_batches(
                 &mut resolver, &|_| false, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &live);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &|_| bones.clone(), &live);
         // Both of this effect's emitters draw a primitive, so its particles arrive as mesh
         // batches rather than quads. The two paths are checked together: what matters is that
         // the effect produced placed, textured particles, not which pipeline draws them.
@@ -2280,7 +2466,7 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
         let (again_effects, _) =
             build_particle_batches(
                 &mut resolver, &|k| *k == key, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &live);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &|_| bones.clone(), &live);
         assert!(
             again_effects
                 .pending_textures
@@ -2299,11 +2485,13 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
             scale: 1.0,
+            follows: true,
+            stopped: None,
         }];
         let (none_effects, _) =
             build_particle_batches(
                 &mut resolver, &|_| false, &|_| false, &|_| false,
-                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &missing);
+                &mut crate::eff_mesh::MeshLibrary::default(), QuadPlanes::default(), &bones, &|_| bones.clone(), &missing);
         let none: Vec<usize> = none_effects
             .batches
             .iter()
@@ -3032,6 +3220,8 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
             scale: 1.0,
+            follows: true,
+            stopped: None,
         }];
         let (effects, _) = build_particle_batches(
             &mut resolver,
@@ -3041,6 +3231,7 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
             &mut meshes,
             QuadPlanes::default(),
             &bones,
+            &|_| bones.clone(),
             &live,
         );
 
@@ -3172,9 +3363,11 @@ EDGE_ATTACK_DASH_HIT: {} quad batch(es)/{quad_instances} instances,             
             offset: glam::Vec3::ZERO,
             rotation: glam::Vec3::ZERO,
             scale: 1.0,
+            follows: true,
+            stopped: None,
         }];
         let (effects, _) = build_particle_batches(
-            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, QuadPlanes::default(), &bones, &live,
+            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, QuadPlanes::default(), &bones, &|_| bones.clone(), &live,
         );
 
         let positions: Vec<glam::Vec3> = effects
@@ -3433,9 +3626,11 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
                 scale: 1.0,
                 offset: glam::Vec3::ZERO,
                 rotation,
+                follows: true,
+                stopped: None,
             }];
             let (effects, _) = build_particle_batches(
-                &mut resolver, &|_| false, &|_| false, &|_| false, meshes, QuadPlanes::default(), &bones, &live,
+                &mut resolver, &|_| false, &|_| false, &|_| false, meshes, QuadPlanes::default(), &bones, &|_| bones.clone(), &live,
             );
             effects
                 .batches

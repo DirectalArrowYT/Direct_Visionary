@@ -1278,6 +1278,26 @@ mod tests {
         println!("{} entries dumped to {out}", rows.len());
     }
 
+    /// Every shader variation of an eff, as raw NVN sections: `v<i>_s<stage>.code` (magic
+    /// 0x12345678, program header at +0x30) and `.ctl` (code length at +0x6f8, constants at
+    /// +0x700/+0x6fc). The input to the recompilation project's Maxwell->GLSL translator.
+    ///
+    /// `VISIONARY_SHADER_EFF` = the eff, `VISIONARY_SHADER_OUT` = the folder.
+    #[test]
+    fn dump_shader_variations() {
+        let (Ok(path), Ok(out)) = (
+            std::env::var("VISIONARY_SHADER_EFF"),
+            std::env::var("VISIONARY_SHADER_OUT"),
+        ) else {
+            return;
+        };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let eff = std::fs::read(path).unwrap();
+        let written = crate::eff_shader_cache::dump_variations(&eff, &out).unwrap();
+        println!("{written} stages written to {}", out.display());
+    }
+
     /// Every pool texture: name, size, mips, format. For choosing templates to import art onto.
     ///
     /// `VISIONARY_TEXTURES_EFF` = the eff.
@@ -1331,5 +1351,40 @@ mod tests {
         )
         .unwrap();
         println!("{} meshes written to {}", index.len(), out.display());
+    }
+}
+
+#[cfg(test)]
+mod game_shader_probe {
+    /// Do the game's translated effect shaders (tools/eft_shaders.py SPIR-V) parse and validate in naga, the shader
+    /// front end wgpu uses, with no optional capabilities? `VISIONARY_SPV` = a folder of .spv files.
+    #[test]
+    fn game_effect_shaders_pass_naga() {
+        let Ok(dir) = std::env::var("VISIONARY_SPV") else { return };
+        let (mut ok, mut bad) = (0, 0);
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "spv") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let module = match naga::front::spv::parse_u8_slice(&bytes, &naga::front::spv::Options::default()) {
+                Ok(m) => m,
+                Err(e) => {
+                    bad += 1;
+                    if bad <= 10 { println!("{}: PARSE FAILED: {e:?}", path.display()); }
+                    continue;
+                }
+            };
+            let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty());
+            match v.validate(&module) {
+                Ok(_) => ok += 1,
+                Err(e) => {
+                    bad += 1;
+                    if bad <= 10 { println!("{}: VALIDATION FAILED: {:?}", path.display(), e.as_inner()); }
+                }
+            }
+        }
+        println!("{ok} valid, {bad} failed");
     }
 }
