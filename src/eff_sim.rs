@@ -748,6 +748,18 @@ impl EmitterSim {
     }
 
     /// Do a firing's particles take an evenly divided shape's positions in turn, one each, rather than filling all?
+    /// The size factor from scale_random: a percentage taken off, never added (0x90750). Axes
+    /// with the same percentage share one draw, so a square stays square; an axis whose
+    /// percentage differs draws its own (captured speed lines, 30/36 %, vary in shape per
+    /// particle; smoke at 20/20/20 % never does).
+    pub fn shrink(&self, seed: u64, id: u64) -> glam::Vec3 {
+        let r = self.scale_random / 100.0;
+        let x = hashed(seed, id ^ 0x91);
+        let y = if r.y == r.x { x } else { hashed(seed, id ^ 0x92) };
+        let z = if r.z == r.x { x } else if r.z == r.y { y } else { hashed(seed, id ^ 0x93) };
+        (glam::Vec3::ONE - r * glam::Vec3::new(x, y, z)).max(glam::Vec3::ZERO)
+    }
+
     fn divisions_in_turn(&self) -> bool {
         matches!(self.volume_type, 2 | 13) && self.prim_emit_type == 2
     }
@@ -1352,7 +1364,7 @@ pub fn spawns_moving(sim: &EmitterSim, age_frames: f32, seed: u64, travelled: Op
             let steps = if sim.gpu { 0.0 } else { age + 1.0 };
             let (travelled, heading) = travel(velocity, glam::Vec3::ZERO, sim.air_res, steps);
             let (fallen, falling) = travel(glam::Vec3::ZERO, sim.gravity, sim.air_res, steps);
-            let shrink = 1.0 - sim.scale_random.x / 100.0 * hashed(seed, id ^ 0x91);
+            let shrink = sim.shrink(seed, id);
             // The initial angle only: the game's vertex shaders add the random spread themselves,
             // (sysRandomAttr - 0.5) * rotate_init_rand from the emitter block (c9[452..454]), so a
             // spread baked in here is applied twice. Captured particles carry exactly rotate_init.
@@ -1367,7 +1379,7 @@ pub fn spawns_moving(sim: &EmitterSim, age_frames: f32, seed: u64, travelled: Op
                 life,
                 velocity: heading + falling,
                 birth: sim.emission_start + burst.time,
-                scale: sim.particle_scale * shrink.max(0.0),
+                scale: sim.particle_scale * shrink,
                 random: [0xa1u64, 0xa2, 0xa3, 0xa4].map(|salt| hashed(seed, id ^ salt)),
                 rotation,
             });
@@ -1470,18 +1482,10 @@ pub fn evaluate(sim: &EmitterSim, age_frames: f32, seed: u64) -> Vec<SimParticle
             }
 
             let curve = sample_scale(&sim.scale_keys, age, life);
-            // A percentage taken off the size, never added (0x90750). One draw sizes both
-            // axes when their percentages match, so a square stays square; when they differ
-            // each axis draws its own.
-            let shrink_x = 1.0 - sim.scale_random.x / 100.0 * hashed(seed, id ^ 0x91);
-            let shrink_y = if sim.scale_random.x == sim.scale_random.y {
-                shrink_x
-            } else {
-                1.0 - sim.scale_random.y / 100.0 * hashed(seed, id ^ 0x92)
-            };
+            let shrink = sim.shrink(seed, id);
             // Base size, the curve over life, and the emitter's own scale on top, per axis.
-            let width = curve.x * sim.particle_scale.x * shrink_x.max(0.0) * sim.scale.x;
-            let height = curve.y * sim.particle_scale.y * shrink_y.max(0.0) * sim.scale.y;
+            let width = curve.x * sim.particle_scale.x * shrink.x * sim.scale.x;
+            let height = curve.y * sim.particle_scale.y * shrink.y * sim.scale.y;
             particles.push(SimParticle {
                 offset,
                 fallen,
