@@ -268,7 +268,12 @@ impl GameEffectsGpu {
                 }
             });
             let Some(renderer) = renderer.as_mut() else { continue };
-            let Some(prepared) = crate::eff_game::prepare(draw, &renderer.library) else { continue };
+            let Some(prepared) = crate::eff_game::prepare(draw, &renderer.library) else {
+                if std::env::var_os("VISIONARY_EFFECT_PLACEMENT_LOG").is_some() {
+                    eprintln!("[eff] draw not prepared: {} spawns, shader {}", draw.spawns.len(), draw.emitter.shader_index);
+                }
+                continue;
+            };
             for (key, pixels) in draw.textures.iter().flatten() {
                 if !self.textures.contains_key(key) {
                     let view = crate::eff_gpu::upload_sampled(device, queue, pixels, "game effect texture");
@@ -905,7 +910,8 @@ mod game_effects_tests {
             .block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }))
             .unwrap();
         device.on_uncaptured_error(std::sync::Arc::new(|e| panic!("wgpu: {e}")));
-        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        // The viewport's own colour target: the game-effect pipelines are built for it.
+        let format = super::MODEL_COLOR_FORMAT;
         let mut game = super::GameEffectsGpu::new();
         // The viewport's own camera, pointed at the effect.
         let camera = super::Camera { translation: glam::Vec3::new(0.0, -10.0, -60.0), rotation: glam::Vec3::ZERO, ..Default::default() };
@@ -926,6 +932,17 @@ mod game_effects_tests {
             view_formats: &[],
         });
         let view = target.create_view(&Default::default());
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: super::MODEL_DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth.create_view(&Default::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder
@@ -937,7 +954,11 @@ mod game_effects_tests {
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.05, g: 0.05, b: 0.1, a: 1.0 }), store: wgpu::StoreOp::Store },
                     })],
-                    depth_stencil_attachment: None,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
                     multiview_mask: None,
@@ -947,7 +968,7 @@ mod game_effects_tests {
                 d.encode(&mut pass);
             }
         }
-        let row = (w * 4).div_ceil(256) * 256;
+        let row = (w * 8).div_ceil(256) * 256;
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: (row * h) as u64,
@@ -966,12 +987,29 @@ mod game_effects_tests {
         let mut png = image::RgbaImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let at = (y * row + x * 4) as usize;
-                png.put_pixel(x, y, image::Rgba([mapped[at], mapped[at + 1], mapped[at + 2], 255]));
+                // Linear half floats to sRGB bytes, clamped.
+                let at = (y * row + x * 8) as usize;
+                let channel = |c: usize| {
+                    let linear = half_to_f32(u16::from_le_bytes([mapped[at + 2 * c], mapped[at + 2 * c + 1]])).clamp(0.0, 1.0);
+                    let srgb = if linear <= 0.0031308 { linear * 12.92 } else { 1.055 * linear.powf(1.0 / 2.4) - 0.055 };
+                    (srgb * 255.0 + 0.5) as u8
+                };
+                png.put_pixel(x, y, image::Rgba([channel(0), channel(1), channel(2), 255]));
             }
         }
         png.save(&out).unwrap();
         println!("wrote {out}");
+    }
+
+    fn half_to_f32(h: u16) -> f32 {
+        let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+        let exponent = i32::from((h >> 10) & 0x1f);
+        let mantissa = f32::from(h & 0x3ff);
+        sign * match exponent {
+            0 => mantissa * 2f32.powi(-24),
+            31 => f32::INFINITY,
+            e => (1.0 + mantissa / 1024.0) * 2f32.powi(e - 15),
+        }
     }
 }
 

@@ -2166,7 +2166,22 @@ ef_common: {declared} emitters declare a primitive, {resolved} resolve,         
             let Some(set) = loaded.ptcl.emitter_sets.get(part.set_idx) else { continue };
             for emitter in &set.emitters {
                 println!("
---- {} / {} ---", name, emitter.name);
+--- {} / {} (depth {}) ---", name, emitter.name, emitter.depth);
+                // Emitter animations (EA*) drive emitter fields over time; print their keys.
+                for section in &emitter.subsections {
+                    let d = &section.data;
+                    if !section.magic.starts_with("EA") || d.len() < 12 {
+                        println!("  [{}] {} bytes", section.magic, d.len());
+                        continue;
+                    }
+                    let f = |o: usize| f32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+                    let n = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
+                    let keys: Vec<String> = (0..n)
+                        .filter(|k| 12 + k * 16 + 16 <= d.len())
+                        .map(|k| { let o = 12 + k * 16; format!("t{} ({}, {}, {})", f(o + 12), f(o), f(o + 4), f(o + 8)) })
+                        .collect();
+                    println!("  [{}] enable {} loop {} keys {}", section.magic, d[0], d[1], keys.join("  "));
+                }
                 for (i, attr) in table.iter().enumerate() {
                     if !needle.is_empty() && !attr.id.contains(&needle) {
                         continue;
