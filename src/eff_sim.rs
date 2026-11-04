@@ -28,6 +28,9 @@ use crate::effects::{ColorKey, EmitterDef};
 /// Not a sequence: a hash. The nth particle's jitter has to be the same value whether the
 /// viewport arrived at this frame by playing forward, scrubbing backwards, or opening the move
 /// cold, and a stateful generator gives three different answers.
+/// The life the game stores for an `infinite_life` particle (0x10000000, captured P_PitSword).
+pub const INFINITE_LIFE: f32 = 268_435_456.0;
+
 fn hashed(seed: u64, salt: u64) -> f32 {
     let mut x = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -297,6 +300,7 @@ pub struct Slots {
     gravity_scale: Option<usize>,
     gravity_dir: [Option<usize>; 3],
     life: Option<usize>,
+    infinite_life: Option<usize>,
     life_random: Option<usize>,
     all_direction: Option<usize>,
     designated_dir: [Option<usize>; 3],
@@ -388,6 +392,7 @@ impl Slots {
                 at("emission.gravity_dir_z"),
             ],
             life: at("particle_data.life"),
+            infinite_life: at("particle_data.infinite_life"),
             life_random: at("particle_data.life_random"),
             all_direction: at("particle_velocity.all_direction"),
             designated_dir: [
@@ -593,7 +598,14 @@ impl EmitterSim {
                 get(slots.num_divide_line[1]).unwrap_or(0.0),
             ),
             gravity: vec3(&slots.gravity_dir) * gravity_scale,
-            life: get(slots.life).unwrap_or(20.0).max(1.0),
+            // An endless particle (a held sword's glow) carries 2^28 frames in the game's
+            // buffer instead of its life field: it never dies, and its life-ratio curves stay
+            // at their start.
+            life: if get(slots.infinite_life).unwrap_or(0.0) != 0.0 {
+                INFINITE_LIFE
+            } else {
+                get(slots.life).unwrap_or(20.0).max(1.0)
+            },
             life_random: get(slots.life_random).unwrap_or(0.0),
             all_direction: get(slots.all_direction).unwrap_or(0.0),
             designated_dir: vec3(&slots.designated_dir),
