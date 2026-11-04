@@ -4076,7 +4076,7 @@ impl VisionaryApp {
                 // How the script aims the effect. The same explosion points along the punch or
                 // up off the ground purely by this.
                 rotation: glam::Vec3::from(call.rotation),
-                // The spawn macro's `size` argument. Scripts lean on it hard -- Bakugo's tilts
+                // The spawn macro's `size` argument. Scripts lean on it hard -- a moveset's tilts
                 // both spawn the shared arc at 0.75 -- so an effect drawn at 1.0 regardless is
                 // the wrong size on every call that is not already 1.0.
                 scale: call.scale,
@@ -15998,7 +15998,7 @@ If you step every basis for a                          type and NONE of them mat
     ///
     /// Grouped by where an effect comes from, with this fighter's own first and open — a
     /// moveset mostly spawns its own effects and the system ones, and a mod's transplanted
-    /// effects (Dabi's `dabi_*`, in a carrier under his fighter directory) are its own too.
+    /// effects (a mod's `<name>_*`, in a carrier under its fighter directory) are its own too.
     /// Searching filters the list; it is not the only way to find anything.
     ///
     /// Returns the chosen effect name, to assign to the selected spawn.
@@ -34155,6 +34155,7 @@ impl eframe::App for VisionaryApp {
                 // hitbox overlay does, at the same requested frame, so particles and hitboxes
                 // cannot disagree about where a bone is.
                 let mut newly_undecodable: Vec<crate::eff_render::TextureKey> = Vec::new();
+                let t_fx = self.perf.start();
                 let frame_effects = {
                     let live = self.live_effect_spawns();
                     if live.is_empty() {
@@ -34201,6 +34202,7 @@ impl eframe::App for VisionaryApp {
                     }
                 };
 
+                self.perf.end("effects_build", t_fx);
                 // Remember textures that would not decode, so the attempt is not repeated
                 // every frame for the whole time the effect is live.
                 self.undecodable_textures.extend(newly_undecodable);

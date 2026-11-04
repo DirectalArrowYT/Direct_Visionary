@@ -586,8 +586,8 @@ impl Default for QuadPlanes {
             //
             // The quarter turn is the fighter's facing: the game's frame has the fighter
             // looking down +X, the bone's has it looking down +Z. That one was found by eye
-            // against Dabi's jabs, and with it the game's order reproduces all three of them
-            // -- see `spawn_rotation_defaults_match_dabis_jabs_in_game`. Y, Z, X, the order
+            // against a moveset's jabs, and with it the game's order reproduces all three of them
+            // -- see `spawn_rotation_defaults_match_a_ring_jab_in_game`. Y, Z, X, the order
             // first dialled in there, agrees with it on that ring's plane and nowhere else,
             // which is why a ring looked right and an arc did not.
             spawn_order: 0,
@@ -735,7 +735,7 @@ pub const SPAWN_ORDER_NAMES: [&str; 6] = [
 /// An ACMD spawn's rotation arguments (degrees), applied in `SPAWN_ORDERS[order]`.
 ///
 /// Orders only disagree when more than one angle is set, so single-axis spawns look right under
-/// any of them and cannot tell them apart. Dabi's jabs can: they spawn one flat ring at three
+/// any of them and cannot tell them apart. A moveset's jabs can: they spawn one flat ring at three
 /// combined rotations. No order alone matched them -- attack13's plane faced the camera under
 /// every one -- until the effect frame was also turned a quarter turn about up from the bone's.
 /// With that turn, X, Y, Z (the game's order) and Y, Z, X both put all three rings in the
@@ -967,7 +967,9 @@ pub fn build_particle_batches(
         let Some(loaded) = resolver.loaded(&file) else {
             continue;
         };
-        let Some(pool) = loaded.texture_pool.clone() else {
+        // Borrowed: an effect file's texture pool can be tens of megabytes, and copying it for every live effect on every
+        // frame was most of the viewport's frame time.
+        let Some(pool) = loaded.texture_pool.as_deref() else {
             continue;
         };
 
@@ -1411,8 +1413,8 @@ mod tests {
     /// game; and three arc spawns whose on-screen shape is known because they are correct in
     /// the game already and needed no editing:
     ///
-    ///   Bakugo  down tilt   rot [-90,  0, 0]   reads as ")"
-    ///   Bakugo  side tilt   rot [ 55,-90, 0]   reads as "U"
+    ///   mod     down tilt   rot [-90,  0, 0]   reads as ")"
+    ///   mod     side tilt   rot [ 55,-90, 0]   reads as "U"
     ///   Pit     up tilt     rot [ 80, 15, 0]   reads as ")"
     ///
     /// Start each of those from a plane whose normal is the effect's Y and all three come out
@@ -3788,7 +3790,7 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         assert!(spawn_rotation_in(degrees, 5).dot(intrinsic).abs() > 0.9999);
     }
 
-    /// The default spawn reading, matched by eye against Dabi's jabs in game. All three spawn
+    /// The default spawn reading, matched by eye against a moveset's jabs in game. All three spawn
     /// the same ring mesh -- flat in its XZ plane, normal on local Y -- on `top`, at
     ///
     ///   attack12  (0, 0, -30)     flat, on a `\` tilt
@@ -3800,7 +3802,7 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
     /// now the game's own, X, Y, Z, read from the executable; this is the check that it
     /// still agrees with everything that was seen.
     #[test]
-    fn spawn_rotation_defaults_match_dabis_jabs_in_game() {
+    fn spawn_rotation_defaults_match_a_ring_jab_in_game() {
         let planes = QuadPlanes::default();
         assert_eq!(SPAWN_ORDER_NAMES[planes.spawn_order], "X, Y, Z");
         assert_eq!(planes.spawn_frame_turns, 1);

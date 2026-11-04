@@ -2123,7 +2123,7 @@ mod tests {
         }
     }
 
-    /// `VISIONARY_CARRIER`, `VISIONARY_EFF_ROOT`, `VISIONARY_MHA_DIR`, `VISIONARY_WRITE_OUT`.
+    /// `VISIONARY_CARRIER`, `VISIONARY_EFF_ROOT`, `VISIONARY_EFFECT_ART_DIR`, `VISIONARY_WRITE_OUT`.
     #[test]
     fn stage_carrier_from_manifest() {
         use crate::eff_attrs::AttrValue;
@@ -2133,9 +2133,9 @@ mod tests {
         let (Ok(carrier), Some(root), Ok(mha)) = (
             std::env::var("VISIONARY_CARRIER"),
             std::env::var_os("VISIONARY_EFF_ROOT").map(std::path::PathBuf::from),
-            std::env::var("VISIONARY_MHA_DIR"),
+            std::env::var("VISIONARY_EFFECT_ART_DIR"),
         ) else {
-            eprintln!("VISIONARY_CARRIER / VISIONARY_EFF_ROOT / VISIONARY_MHA_DIR not set — skipping");
+            eprintln!("VISIONARY_CARRIER / VISIONARY_EFF_ROOT / VISIONARY_EFFECT_ART_DIR not set — skipping");
             return;
         };
         let mha = std::path::PathBuf::from(mha);
@@ -2835,15 +2835,15 @@ mod tests {
     /// The MHA sheets are 4x4. `uv_div` is the grid; the random pattern mode is the one the
     /// original bolts already used (type 4 with loop-random), pointed at a range of cells.
     ///
-    /// `VISIONARY_CARRIER`, `VISIONARY_MHA_DIR`, and `VISIONARY_WRITE_OUT` to write.
+    /// `VISIONARY_CARRIER`, `VISIONARY_EFFECT_ART_DIR`, and `VISIONARY_WRITE_OUT` to write.
     #[test]
     fn build_shiga_dark_lightning_into_pikachu_elec() {
         use crate::eff_attrs::AttrValue::{self, Float, Int};
         use crate::mod_project::{AuthoredEdit, EffMod, EmitterFieldEdits, TextureAddition};
         let (Ok(carrier), Ok(mha)) =
-            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_MHA_DIR"))
+            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_EFFECT_ART_DIR"))
         else {
-            eprintln!("VISIONARY_CARRIER / VISIONARY_MHA_DIR not set — skipping");
+            eprintln!("VISIONARY_CARRIER / VISIONARY_EFFECT_ART_DIR not set — skipping");
             return;
         };
         const ENTRY: &str = "PIKACHU_ELEC";
@@ -3020,7 +3020,7 @@ mod tests {
     /// second phase resolves it by ENTRY name rather than assuming where it landed. Nothing is
     /// written unless every edit reads back and the rest of the carrier is untouched.
     ///
-    /// `VISIONARY_CARRIER`, `VISIONARY_MHA_DIR`, and `VISIONARY_WRITE_OUT` to write.
+    /// `VISIONARY_CARRIER`, `VISIONARY_EFFECT_ART_DIR`, and `VISIONARY_WRITE_OUT` to write.
     #[test]
     fn build_shiga_telegraph_ring_into_the_pikachu_carrier() {
         use crate::eff_attrs::AttrValue::{Float, Int};
@@ -3029,9 +3029,9 @@ mod tests {
             TransplantOp,
         };
         let (Ok(carrier), Ok(mha)) =
-            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_MHA_DIR"))
+            (std::env::var("VISIONARY_CARRIER"), std::env::var("VISIONARY_EFFECT_ART_DIR"))
         else {
-            eprintln!("VISIONARY_CARRIER / VISIONARY_MHA_DIR not set — skipping");
+            eprintln!("VISIONARY_CARRIER / VISIONARY_EFFECT_ART_DIR not set — skipping");
             return;
         };
         const ENTRY: &str = "SHIGA_TELEGRAPH_RING";

@@ -331,7 +331,7 @@ pub enum EffectOrigin {
 /// Which bucket an effect belongs in for `fighter`.
 ///
 /// The file decides it, not the name: a transplanted effect is named for the character it was
-/// drawn for rather than the fighter it rides on -- Dabi's `dabi_*` live in a carrier under
+/// drawn for rather than the fighter it rides on -- a mod's `hero_*` live in a carrier under
 /// `fighter/snake/`, and nothing about either string mentions the other. The name is a
 /// fallback for the ordinary case where an effect is named after its fighter.
 pub fn origin_of(rel: &str, name: &str, fighter: Option<&str>) -> EffectOrigin {
@@ -478,8 +478,8 @@ mod picker_tests {
 
     /// A mod's transplanted effects belong to the fighter that carries them.
     ///
-    /// This is the case the old picker could not express at all: Dabi's effects are named
-    /// `dabi_*` and ride on snake, so neither the fighter's name nor the effect's mentions the
+    /// This is the case the old picker could not express at all: a mod's effects are named
+    /// `hero_*` and ride on snake, so neither the fighter's name nor the effect's mentions the
     /// other. The file path is what connects them.
     /// The picker's regression: a pool made from the export folder never saw ef_common, which
     /// lives in the game dump, so the System group came up empty. Roots learned about later
@@ -525,8 +525,8 @@ mod picker_tests {
     fn a_transplanted_effect_belongs_to_the_fighter_that_carries_it() {
         assert_eq!(
             origin_of(
-                "Dabi (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
-                "dabi_attack_dash",
+                "Hero (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
+                "hero_attack_dash",
                 Some("snake"),
             ),
             EffectOrigin::Fighter
@@ -534,8 +534,8 @@ mod picker_tests {
         // And not to whoever the carrier was borrowed from.
         assert_eq!(
             origin_of(
-                "Dabi (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
-                "dabi_attack_dash",
+                "Hero (Moveset)/effect/fighter/snake/transplant/pikachu/ef_pikachu.eff",
+                "hero_attack_dash",
                 Some("pikachu"),
             ),
             EffectOrigin::Elsewhere
