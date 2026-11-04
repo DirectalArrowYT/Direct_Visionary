@@ -14,7 +14,7 @@ eframe = { version = "0.34.3", default-features = false, features = ["wgpu"] }
 egui = { version = "0.34.3" }
 egui-wgpu = "0.34.3"
 egui_extras = { version = "0.34.3", features = ["all_loaders"] }
-# spirv: the game's own effect shaders reach wgpu as SPIR-V (eff_gpu, tools/eft_shaders.py)
+# spirv: shader caches written before Visionary's own translator (src/mx) hold SPIR-V, which eff_gpu still loads
 wgpu = { version = "29.0.0", features = ["spirv"] }
 glam = "0.28.0"
 

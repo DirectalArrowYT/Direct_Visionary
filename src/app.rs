@@ -14386,7 +14386,7 @@ If you step every basis for a                          type and NONE of them mat
                 .checkbox(&mut game, "Game shaders")
                 .on_hover_text(
                     "Draw effects with Smash's own effect shaders, translated from the .eff (the first time a file is \
-                     drawn this takes about a minute, in the background). Off: Visionary's own particle renderer.",
+                     drawn this takes a few seconds, in the background). Off: Visionary's own particle renderer.",
                 )
                 .changed()
             {
