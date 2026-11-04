@@ -6,7 +6,7 @@
 //! same lua args (decomp FUN_71000baa90 calls `lib::L2CAgent::pop_lua_stack` repeatedly).
 //!
 //! Shared arg layout of the hooked variants (acmd EFFECT macro family):
-//!   1 = graphic (hash40), 2 = joint (hash40), 3..5 = pos xyz, 6..8 = rot zr,yr,xr, 9 = size
+//!   1 = graphic (hash40), 2 = joint (hash40), 3..5 = pos xyz, 6..8 = rot xr,yr,zr, 9 = size
 
 use smash::lib::{L2CValue, L2CValueType};
 use smash::phx::Vector3f;
@@ -654,9 +654,9 @@ unsafe fn parse_args(lua_state: u64, flip: bool) -> Option<ParsedEffectArgs> {
         z: arg_num(&mut agent, 5 + off, 0.0),
     };
     let rot = Vector3f {
-        x: arg_num(&mut agent, 8 + off, 0.0), // xr
+        x: arg_num(&mut agent, 6 + off, 0.0), // xr
         y: arg_num(&mut agent, 7 + off, 0.0), // yr
-        z: arg_num(&mut agent, 6 + off, 0.0), // zr
+        z: arg_num(&mut agent, 8 + off, 0.0), // zr
     };
     let size = arg_num(&mut agent, 9 + off, 1.0);
     // Trailing args, defaulted to what the old hardcoded call used so a macro variant that

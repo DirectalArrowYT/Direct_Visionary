@@ -7834,8 +7834,8 @@ pub struct EffectCall {
     pub spawn_func: String,
     pub bone_name: String,
     pub offset: [f32; 3],
-    /// Euler rotation in editor order `[X, Y, Z]`; ACMD spawn arguments are `Z, Y, X` and are
-    /// converted at the parser/export boundaries.
+    /// Euler rotation `[X, Y, Z]` in degrees, the same order as the ACMD spawn arguments
+    /// (applied about fixed axes X, then Y, then Z, as the game does).
     pub rotation: [f32; 3],
     pub scale: f32,
     /// `true` when the effect follows the bone (EFFECT_FOLLOW variants).

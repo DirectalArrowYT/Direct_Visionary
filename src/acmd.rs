@@ -1039,13 +1039,12 @@ fn parse_excute_block_effects(lines: &[&str]) -> Vec<EffectMacro> {
                         spawn_func: name.to_string(),
                         bone_name,
                         offset: [num(3 + off, 0.0), num(4 + off, 0.0), num(5 + off, 0.0)],
-                        // The three rotation slots run zr, yr, xr — reversed from the
-                        // [x, y, z] the rest of the editor uses. This used to read them left
-                        // to right, silently swapping the X and Z angles of every script
-                        // loaded from source and disagreeing with the live-capture and
-                        // live-pin paths (app.rs) and the plugin (acmd_hooks.rs parse_args)
-                        // about the very same call.
-                        rotation: [num(8 + off, 0.0), num(7 + off, 0.0), num(6 + off, 0.0)],
+                        // The three rotation slots are X, Y, Z, left to right: the game's
+                        // emitter matrices put the first slot's angle about X and the last's
+                        // about Z (Rz * Ry * Rx), e.g. a vanilla up tilt's arc at (0, 15, 80).
+                        // They were once read as zr, yr, xr, which swapped X and Z on every
+                        // effect turned about more than one axis.
+                        rotation: [num(6 + off, 0.0), num(7 + off, 0.0), num(8 + off, 0.0)],
                         scale: num(9 + off, 1.0),
                         follows_bone,
                         extra_args: t[10 + off..].to_vec(),
@@ -4418,7 +4417,7 @@ fn emit_spawn_call(call: &crate::data::EffectCall, indent: &str) -> String {
     let bone = hash_arg(&call.bone_name.to_ascii_lowercase());
     let graphic = hash_arg(&call.effect_name);
     let [x, y, z] = call.offset;
-    // The macros take rotation as zr, yr, xr, not in [x, y, z] order.
+    // The macros take rotation as X, Y, Z, the editor's own order.
     let [rx, ry, rz] = call.rotation;
     // `EFFECT_FLW_POS_NO_STOP` is declared with whole-number parameters; a float literal will
     // not compile against it. A fractional value cannot be written there at all, so it falls
@@ -4437,9 +4436,9 @@ fn emit_spawn_call(call: &crate::data::EffectCall, indent: &str) -> String {
         fmt(x),
         fmt(y),
         fmt(z),
-        fmt(rz),
-        fmt(ry),
         fmt(rx),
+        fmt(ry),
+        fmt(rz),
         fmt(call.scale)
     );
 
@@ -7803,7 +7802,7 @@ unsafe extern "C" fn effect_attackairf(agent: &mut L2CAgentBase) {
         assert_eq!(call.effect_name, "sys_attack_arc_c");
         assert_eq!(call.bone_name, "top");
         assert_eq!(call.offset, [3.8, 3.0, 17.4]);
-        assert_eq!(call.rotation, [0.0, 90.0, 25.0]);
+        assert_eq!(call.rotation, [25.0, 90.0, 0.0]);
         assert_eq!(call.scale, 1.0);
         assert!(call.follows_bone);
         assert_eq!(call.tint, Some([1.0, 0.0, 0.0]));
@@ -9156,10 +9155,10 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
         );
     }
 
-    /// The macros take rotation as `zr, yr, xr`. Parsing them left to right into `[x, y, z]`
-    /// swapped two of the three angles against every other path in the editor.
+    /// The macros take rotation as X, Y, Z, left to right (the game's emitter matrices say so),
+    /// and an export puts each angle back in the slot it came from.
     #[test]
-    fn rotation_arguments_keep_their_zyx_slot_order() {
+    fn rotation_arguments_keep_their_xyz_slot_order() {
         let src = r#"
 unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
     frame(agent.lua_state_agent, 1.0);
@@ -9169,8 +9168,8 @@ unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
 }
 "#;
         let calls = parse_effect_script(src).to_effect_calls();
-        // zr=10, yr=20, xr=30 → the editor's [x, y, z].
-        assert_eq!(calls[0].rotation, [30.0, 20.0, 10.0]);
+        // x=10, y=20, z=30.
+        assert_eq!(calls[0].rotation, [10.0, 20.0, 30.0]);
 
         let (_, emitted) =
             emit_effect_move_fn(&calls, "test", &Default::default(), &Default::default());

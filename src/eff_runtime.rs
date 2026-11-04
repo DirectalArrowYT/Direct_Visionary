@@ -584,14 +584,12 @@ impl Default for QuadPlanes {
             // (0x356d7a0 in 13.0.3) turns the spawn's angles into a quaternion with the
             // helper at 0x3d7950 in mode 0, which run in an emulator gives Rz * Ry * Rx.
             //
-            // The quarter turn is the fighter's facing: the game's frame has the fighter
-            // looking down +X, the bone's has it looking down +Z. That one was found by eye
-            // against a moveset's jabs, and with it the game's order reproduces all three of them
-            // -- see `spawn_rotation_defaults_match_a_ring_jab_in_game`. Y, Z, X, the order
-            // first dialled in there, agrees with it on that ring's plane and nowhere else,
-            // which is why a ring looked right and an arc did not.
+            // No frame turn: the game's emitter matrices, with the fighter's position and
+            // facing taken out, are the call's offset and rotation straight on the bone --
+            // see `spawn_rotation_defaults_match_the_games_emitter_matrices`. The quarter turn
+            // once dialled in by eye was making up for reading the slots as zr, yr, xr.
             spawn_order: 0,
-            spawn_frame_turns: 1,
+            spawn_frame_turns: 0,
         }
     }
 }
@@ -962,6 +960,23 @@ pub fn build_particle_batches(
         // an effect points: taking only the position leaves every effect axis-aligned in world
         // space no matter how the limb it hangs off is turned.
         let (_, bone_rotation, _) = matrix.to_scale_rotation_translation();
+        // VISIONARY_EFFECT_PLACEMENT_LOG=1 (debugging): the call's placement on the `top` bone, in the replay's terms
+        // (eff_gpu's VISIONARY_REPLAY_FIGHTER line), to hold against the game's emitter matrices.
+        let placement_log = std::env::var_os("VISIONARY_EFFECT_PLACEMENT_LOG").is_some();
+        if placement_log {
+            let top = lookup_bone(bone_matrices, "top").unwrap_or(glam::Mat4::IDENTITY);
+            let placed = top.inverse()
+                * matrix
+                * glam::Mat4::from_translation(*call_offset)
+                * glam::Mat4::from_quat(spawn_rotation_in(*call_rotation, 0))
+                * glam::Mat4::from_scale(glam::Vec3::splat(*scale));
+            let (s, r, t) = placed.to_scale_rotation_translation();
+            let (rx, ry, rz) = r.to_euler(glam::EulerRot::ZYX);
+            eprintln!(
+                "[placement] {name} on {bone} age {age:.0} follows {follows}: t ({:.1} {:.1} {:.1}) r ({:.1} {:.1} {:.1}) s {:.2}",
+                t.x, t.y, t.z, rz.to_degrees(), ry.to_degrees(), rx.to_degrees(), s.x
+            );
+        }
 
         let file = resolved.file.clone();
         let Some(loaded) = resolver.loaded(&file) else {
@@ -1042,8 +1057,14 @@ pub fn build_particle_batches(
                         &file, loaded, part.set_idx, emitter_index, emitter, &slots, meshes, &place, particle_age, &history,
                     )
                     {
+                        if placement_log {
+                            eprintln!("[placement]   emitter {emitter_index} {}: game shaders", emitter.name);
+                        }
                         game_draws.push(draw);
                         continue;
+                    }
+                    if placement_log {
+                        eprintln!("[placement]   emitter {emitter_index} {}: batch fallback", emitter.name);
                     }
                 }
                 let Some(texture_index) = emitter.texture_index else {
@@ -3790,72 +3811,42 @@ SYS_ATTACK_ARC right axis {right_before:?} -> {right_after:?} ({swing:.1} degree
         assert!(spawn_rotation_in(degrees, 5).dot(intrinsic).abs() > 0.9999);
     }
 
-    /// The default spawn reading, matched by eye against a moveset's jabs in game. All three spawn
-    /// the same ring mesh -- flat in its XZ plane, normal on local Y -- on `top`, at
+    /// The default spawn reading against the game's own emitter matrices (a vanilla fighter's
+    /// tilts captured in the recomp, fighter position and facing taken out). The game put
     ///
-    ///   attack12  (0, 0, -30)     flat, on a `\` tilt
-    ///   attack13  (178, 180, 90)  a half moon top to bottom
-    ///   attack11  (178, 236, 90)  attack13's arc turned within its plane, peaking overhead
+    ///   up tilt arc    `top`, rot slots (0, 15, 80)     -> Rz(80) * Ry(15) * Rx(0)
+    ///   down tilt wind `top`, rot slots (-12, -42, 168) -> Rz(168) * Ry(-42) * Rx(-12)
     ///
-    /// In the viewer's side view, screen right is the bone's +Z, up is +Y and toward the camera
-    /// is -X. Each candidate was stepped through live with a quarter frame turn. The order is
-    /// now the game's own, X, Y, Z, read from the executable; this is the check that it
-    /// still agrees with everything that was seen.
+    /// so the slots are X, Y, Z left to right, applied about fixed axes X then Y then Z, in the
+    /// bone's own frame (the position offset came back in that same frame, unturned). Reading
+    /// the slots as zr, yr, xr, or adding a quarter turn, swung combined rotations like these
+    /// off by up to 90 degrees while single-axis ones still looked right.
     #[test]
-    fn spawn_rotation_defaults_match_a_ring_jab_in_game() {
+    fn spawn_rotation_defaults_match_the_games_emitter_matrices() {
         let planes = QuadPlanes::default();
         assert_eq!(SPAWN_ORDER_NAMES[planes.spawn_order], "X, Y, Z");
-        assert_eq!(planes.spawn_frame_turns, 1);
-        // The game's order as a product: Rz * Ry * Rx.
-        let degrees = glam::Vec3::new(20.0, 40.0, 60.0);
-        let product = glam::Quat::from_rotation_z(degrees.z.to_radians())
-            * glam::Quat::from_rotation_y(degrees.y.to_radians())
-            * glam::Quat::from_rotation_x(degrees.x.to_radians());
-        assert!(spawn_rotation_in(degrees, planes.spawn_order).dot(product).abs() > 0.9999);
-
-        // (right, up, toward camera) for a local axis of the ring.
-        let screen = |planes: &QuadPlanes, deg: [f32; 3], local: glam::Vec3| {
-            let v = planes.spawn_turn(glam::Vec3::from(deg)) * local;
-            glam::Vec3::new(v.z, v.y, -v.x)
+        assert_eq!(planes.spawn_frame_turns, 0);
+        let src = r#"
+unsafe extern "C" fn effect_test(agent: &mut L2CAgentBase) {
+    frame(agent.lua_state_agent, 1.0);
+    if macros::is_excute(agent) {
+        macros::EFFECT(agent, Hash40::new("sys_attack_arc"), Hash40::new("top"), -1, 14, -5, 0, 15, 80, 1.05, 0, 0, 0, 0, 0, 0, true);
+        macros::EFFECT(agent, Hash40::new("wind"), Hash40::new("top"), -7, 6, 8, -12, -42, 168, 1, 0, 0, 0, 0, 0, 0, true);
+    }
+}
+"#;
+        let calls = crate::acmd::parse_effect_script(src).to_effect_calls();
+        let game = |x: f32, y: f32, z: f32| {
+            glam::Quat::from_rotation_z(z.to_radians())
+                * glam::Quat::from_rotation_y(y.to_radians())
+                * glam::Quat::from_rotation_x(x.to_radians())
         };
-        let (jab11, jab12, jab13) = ([178.0, 236.0, 90.0], [0.0, 0.0, -30.0], [178.0, 180.0, 90.0]);
-
-        // attack12 tilts left/right, not toward the camera: the `\` needs its normal in the
-        // screen plane.
-        let n12 = screen(&planes, jab12, glam::Vec3::Y);
-        assert!(n12.y > 0.85 && n12.z.abs() < 0.01, "attack12 normal {n12:?}");
-
-        // attack11 shares attack13's plane and is turned 56 degrees within it -- the Y argument.
-        let (n11, n13) = (
-            screen(&planes, jab11, glam::Vec3::Y),
-            screen(&planes, jab13, glam::Vec3::Y),
-        );
-        assert!(n11.dot(n13).abs() > 0.99, "attack11 {n11:?} is off attack13's plane {n13:?}");
-        let roll = screen(&planes, jab11, glam::Vec3::X)
-            .angle_between(screen(&planes, jab13, glam::Vec3::X))
-            .to_degrees();
-        assert!((roll - 56.0).abs() < 1.0, "in-plane turn was {roll}");
-
-        // The near miss, X, Z, Y: attack12 and attack13 come out in the same planes, but the Y
-        // argument lands last as a turn about up, swinging attack11 out of the plane like an
-        // open door.
-        let door = QuadPlanes { spawn_order: 1, ..planes };
-        assert!(screen(&door, jab13, glam::Vec3::Y).dot(n13).abs() > 0.99);
-        assert!(screen(&door, jab11, glam::Vec3::Y).dot(n13).abs() < 0.7);
-
-        // Y, Z, X, the order first settled on, puts all three rings in these same planes. It
-        // differs in how each ring is turned within its plane, which a ring does not show and
-        // an arc does.
-        let first = QuadPlanes { spawn_order: 3, ..planes };
-        for jab in [jab11, jab12, jab13] {
-            let (was, now) = (
-                screen(&first, jab, glam::Vec3::Y),
-                screen(&planes, jab, glam::Vec3::Y),
-            );
-            assert!(was.dot(now).abs() > 0.99, "{jab:?}: {was:?} against {now:?}");
+        for (call, want) in calls.iter().zip([game(0.0, 15.0, 80.0), game(-12.0, -42.0, 168.0)]) {
+            let rotation = glam::Vec3::from(call.rotation);
+            for got in [planes.spawn_turn(rotation), spawn_rotation_in(rotation, 0)] {
+                assert!(got.dot(want).abs() > 0.9999, "{}: {got:?} against the game's {want:?}", call.effect_name);
+            }
         }
-        let turned = first.spawn_turn(glam::Vec3::from(jab11));
-        assert!(turned.dot(planes.spawn_turn(glam::Vec3::from(jab11))).abs() < 0.99);
     }
 
     /// The dialled-in orientation defaults. These came from comparing the viewport against the

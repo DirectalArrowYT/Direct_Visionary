@@ -3327,17 +3327,17 @@ fn transform_edits(
     site: &MacroSite,
     call: &crate::data::EffectCall,
 ) -> Vec<Replacement> {
-    // agent, graphic[, flipped graphic], joint, x, y, z, zr, yr, xr, size — the same layout
-    // the parser reads, including the reversed rotation slots.
+    // agent, graphic[, flipped graphic], joint, x, y, z, xr, yr, zr, size — the same layout
+    // the parser reads.
     let off = usize::from(call.effect_name_alt.is_some());
     let mut edits: Vec<Replacement> = Vec::new();
     let slots: [(usize, f32); 7] = [
         (3 + off, call.offset[0]),
         (4 + off, call.offset[1]),
         (5 + off, call.offset[2]),
-        (6 + off, call.rotation[2]),
+        (6 + off, call.rotation[0]),
         (7 + off, call.rotation[1]),
-        (8 + off, call.rotation[0]),
+        (8 + off, call.rotation[2]),
         (9 + off, call.scale),
     ];
     for (slot, value) in slots {

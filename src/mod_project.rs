@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::data::{EditRecord, EffectCallEdit};
 
 pub const PROJECT_FILE_NAME: &str = "modproject.json";
-pub const PROJECT_VERSION: u32 = 3;
+/// 4: effect-call rotations are stored X, Y, Z as the ACMD slots carry them (3 and older stored
+/// them reversed, from reading the slots as zr, yr, xr).
+pub const PROJECT_VERSION: u32 = 4;
 
 /// Versions this build can open. Every field added since v1 carries `#[serde(default)]`, so
 /// an older project loads with the new sections empty — which is exactly what was true when
@@ -227,6 +229,22 @@ impl ModProjectFile {
         }
         if self.version < OLDEST_SUPPORTED_VERSION {
             anyhow::bail!("unsupported project version {}", self.version);
+        }
+        if self.version < 4 {
+            // Saved with the X and Z angles in each other's place; the script text itself was
+            // always right, so only the stored calls turn round.
+            let swap = |call: &mut crate::data::EffectCall| call.rotation.swap(0, 2);
+            for fighter in self.fighters.values_mut() {
+                for edit in fighter.effect_calls.values_mut().flatten() {
+                    if let crate::data::EffectCallOp::Modify(call) | crate::data::EffectCallOp::Add(call) = &mut edit.op {
+                        swap(call);
+                    }
+                    if let Some(call) = edit.pristine.as_mut() {
+                        swap(call);
+                    }
+                }
+                fighter.effect_calls_full.values_mut().flatten().for_each(swap);
+            }
         }
         self.version = PROJECT_VERSION;
         Ok(())
@@ -1230,6 +1248,38 @@ unsafe extern "C" fn expression_fixture(agent: &mut L2CAgentBase) {
         assert!(fighter.acmd.contains_key("mixed"));
         assert_eq!(fighter.live_tweaks.len(), 1);
         assert_eq!(fighter.live_tweaks[0].effect_name, "SYS_SMASH_FLASH");
+    }
+
+    /// Version 3 and older stored effect-call rotations reversed; the script text was right, so
+    /// opening one turns every stored call round once and the export writes the same slots.
+    #[test]
+    fn an_older_project_has_its_stored_effect_rotations_put_in_slot_order() {
+        let mut call = fixture_effect_call("sys_attack_arc");
+        call.rotation = [80.0, 15.0, 0.0];
+        let mut fighter = FighterMod::default();
+        fighter.effect_calls.insert(
+            "attack_hi3".into(),
+            vec![EffectCallEdit { index: 0, op: EffectCallOp::Modify(call.clone()), pristine: Some(call.clone()) }],
+        );
+        fighter.effect_calls_full.insert("attack_hi3".into(), vec![call]);
+        let mut project = ModProjectFile {
+            version: 3,
+            name: "old".into(),
+            fighters: HashMap::from([("pit".to_string(), fighter)]),
+            roster: Default::default(),
+        };
+        project.migrate().unwrap();
+        let fighter = &project.fighters["pit"];
+        let edit = &fighter.effect_calls["attack_hi3"][0];
+        let EffectCallOp::Modify(modified) = &edit.op else { panic!() };
+        assert_eq!(modified.rotation, [0.0, 15.0, 80.0]);
+        assert_eq!(edit.pristine.as_ref().unwrap().rotation, [0.0, 15.0, 80.0]);
+        assert_eq!(fighter.effect_calls_full["attack_hi3"][0].rotation, [0.0, 15.0, 80.0]);
+
+        // Once is enough: a current project is left alone.
+        project.migrate().unwrap();
+        let EffectCallOp::Modify(again) = &project.fighters["pit"].effect_calls["attack_hi3"][0].op else { panic!() };
+        assert_eq!(again.rotation, [0.0, 15.0, 80.0]);
     }
 
     #[test]

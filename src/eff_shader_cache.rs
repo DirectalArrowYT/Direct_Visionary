@@ -201,6 +201,18 @@ mod tests {
         println!("{ok} of {all} stages translated in {:?}", started.elapsed());
     }
 
+    /// `VISIONARY_DUMP_EFF` = an .eff, `VISIONARY_DUMP_OUT` = a folder: its variations dumped and translated there, the
+    /// layout eff_gpu's replay reads (VISIONARY_SHADERS).
+    #[test]
+    fn dump_and_translate_an_eff() {
+        let (Ok(eff), Ok(out)) = (std::env::var("VISIONARY_DUMP_EFF"), std::env::var("VISIONARY_DUMP_OUT")) else { return };
+        let out = std::path::Path::new(&out);
+        std::fs::create_dir_all(out).unwrap();
+        let n = super::dump_variations(&std::fs::read(&eff).unwrap(), out).unwrap();
+        let (ok, all) = super::translate_dir(out).unwrap();
+        println!("{n} variations, {ok} of {all} stages translated");
+    }
+
     /// Every distinct shader stage of every .eff under a folder, once each: `<fnv of the code>_s<stage>.code` / `.ctl`.
     /// The corpus a shader translator has to cover.
     ///

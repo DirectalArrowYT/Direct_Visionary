@@ -876,6 +876,8 @@ mod replay {
     //! With grabs, each target is drawn over the game's own colour and depth from before its effect draws, and the
     //! result is compared with the game's colour after them: f<frame>_fbo<n>.png is game | replay | difference (x4).
     use super::*;
+    /// Where the fighter stood for the frame being compared, from the capture log (x, y, facing).
+    static REPLAY_FIGHTER: std::sync::Mutex<Option<Vec<f32>>> = std::sync::Mutex::new(None);
     use crate::eff_capture::{self, Draw, Program, Shot};
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
@@ -1222,6 +1224,7 @@ mod replay {
                 // stays in the game's "after" picture as a difference.
                 // the effect file whose shaders these are (a fighter's draws mix its own file's and ef_common's)
                 let Some(set) = sets.iter().position(|(r, _)| r.library.variation_for_programs(vs.bytes(), fs.bytes()).is_some()) else {
+                    println!("  draw {} {name}: shaders in none of the libraries (left out)", d.draw);
                     continue;
                 };
                 let (renderer, eff) = &mut sets[set];
@@ -1377,8 +1380,12 @@ mod replay {
                     // the spawn call's offset, rotation (degrees, X then Y then Z) and size on the top bone.
                     let (local, _) = crate::eff_game::emitter_local(stored);
                     let mut placement = dynamic.matrix * local.inverse();
-                    if let Ok(f) = std::env::var("VISIONARY_REPLAY_FIGHTER") {
-                        let v: Vec<f32> = f.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect();
+                    let fighter = REPLAY_FIGHTER.lock().unwrap().clone().or_else(|| {
+                        std::env::var("VISIONARY_REPLAY_FIGHTER")
+                            .ok()
+                            .map(|f| f.split(',').map(|x| x.trim().parse().unwrap_or(0.0)).collect::<Vec<f32>>())
+                    });
+                    if let Some(v) = fighter.filter(|v| v.len() >= 3) {
                         let top = glam::Mat4::from_translation(glam::Vec3::new(v[0], v[1], 0.0))
                             * glam::Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2 * v[2]);
                         placement = top.inverse() * placement;
@@ -1587,22 +1594,30 @@ mod replay {
         let want = std::env::var("VISIONARY_REPLAY_FRAME").unwrap_or_else(|_| "grabs".into());
 
         // eftcycle's "start <i> <name>" lines, placed by SSBU_FRAMELOG's frame marks: the entry shown at a frame.
-        let mut starts: Vec<(i64, String)> = Vec::new();
+        // movecap's lines also carry where the fighter stood: "start <i> <name> at <x> <y> lr <lr>".
+        let mut starts: Vec<(i64, String, Option<Vec<f32>>)> = Vec::new();
         if let Ok(log) = std::env::var("VISIONARY_REPLAY_LOG") {
             let mut mark = 0i64;
             for line in String::from_utf8_lossy(&std::fs::read(log).unwrap()).lines() {
                 if let Some(n) = line.strip_prefix("frame-mark: ") {
                     mark = n.trim().parse().unwrap_or(mark);
                 } else if let Some(at) = line.find("eftcycle: start ").or_else(|| line.find("movecap: start ")) {
-                    // "<plugin>: start <index> <name> ...": both plugin names are 8 characters
-                    let rest: Vec<&str> = line[at + 16..].split_whitespace().collect();
+                    // "<plugin>: start <index> <name> ..."
+                    let after = &line[at..];
+                    let rest: Vec<&str> = after[after.find("start ").unwrap() + 6..].split_whitespace().collect();
                     if rest.len() >= 2 {
-                        starts.push((mark, rest[1].to_string()));
+                        let at = (rest.len() >= 7 && rest[2] == "at" && rest[5] == "lr")
+                            .then(|| [rest[3], rest[4], rest[6]].iter().map(|x| x.parse().unwrap_or(0.0)).collect());
+                        starts.push((mark, rest[1].to_string(), at));
                     }
                 }
             }
         }
-        let entry_at = |frame: i64| starts.iter().rev().find(|(f, _)| *f <= frame).map(|(_, n)| n.clone()).unwrap_or_default();
+        let entry_at = |frame: i64| {
+            let start = starts.iter().rev().find(|(f, _, _)| *f <= frame);
+            *REPLAY_FIGHTER.lock().unwrap() = start.and_then(|(_, _, at)| at.clone());
+            start.map(|(_, n, _)| n.clone()).unwrap_or_default()
+        };
 
         let gpu = gpu();
         // VISIONARY_SHADERS / VISIONARY_EFF: one or more, separated by ';', in the same order

@@ -875,8 +875,7 @@ impl TimelineFilters {
     }
 }
 
-/// Effect rotations are stored in the editor's human-readable order. ACMD spawn macros carry
-/// the same values as `zr, yr, xr`, so the parser/exporter handles that wire-order conversion.
+/// Effect rotations are stored X, Y, Z, the same order the ACMD spawn macros carry them in.
 const EFFECT_ROTATION_AXIS_LABELS: [&str; 3] = ["X", "Y", "Z"];
 
 /// Convert a game-frame playhead to the zero-based frame index stored in `.nuanmb` animations.
@@ -2237,9 +2236,9 @@ fn build_effect_spawn_args(
     args.push(A::Num(call.offset[0]));
     args.push(A::Num(call.offset[1]));
     args.push(A::Num(call.offset[2]));
-    args.push(A::Num(call.rotation[2])); // ACMD zr
-    args.push(A::Num(call.rotation[1])); // ACMD yr
     args.push(A::Num(call.rotation[0])); // ACMD xr
+    args.push(A::Num(call.rotation[1])); // ACMD yr
+    args.push(A::Num(call.rotation[2])); // ACMD zr
     args.push(A::Num(call.scale));
     debug_assert_eq!(args.len(), 9 + target_offset);
 
@@ -21198,7 +21197,7 @@ If you step every basis for a                          type and NONE of them mat
         Some(wind.to_hitbox(Self::motion_to_script_frame(frame)))
     }
 
-    /// EFFECT-family capture → EffectCall (arc layout: gfx, joint, pos xyz, rot zr/yr/xr, size).
+    /// EFFECT-family capture → EffectCall (arc layout: gfx, joint, pos xyz, rot xyz, size).
     fn effect_call_from_capture(
         func: &str,
         args: &[crate::game_link::LuaArgWire],
@@ -21245,7 +21244,7 @@ If you step every basis for a                          type and NONE of them mat
                 .cloned()
                 .unwrap_or_else(|| format!("{bone_hash:#x}")),
             offset: [f32_at(2 + off), f32_at(3 + off), f32_at(4 + off)],
-            rotation: [f32_at(7 + off), f32_at(6 + off), f32_at(5 + off)],
+            rotation: [f32_at(5 + off), f32_at(6 + off), f32_at(7 + off)],
             scale: args.get(8 + off).and_then(|a| a.as_f32()).unwrap_or(1.0),
             follows_bone: follows,
             active_start: start,
