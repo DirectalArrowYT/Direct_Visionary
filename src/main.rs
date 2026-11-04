@@ -32,6 +32,7 @@ mod mod_export;
 mod mod_import;
 mod mod_project;
 mod move_kinds;
+mod mx;
 mod param_labels;
 mod plugin_deploy;
 mod project_hub;
