@@ -190,6 +190,11 @@ pub struct SampledTexture {
     pub srgb: bool,
 }
 
+/// The BNTX channel selector of a texture (0 zero, 1 one, 2..5 = R, G, B, A), as stored.
+pub fn channel_selector(pool: &[u8], index: usize) -> Result<[u8; 4]> {
+    Ok(le_u32(pool, brti_offset(pool, index)? + BRTI_COMP_SEL)?.to_le_bytes())
+}
+
 pub fn decode_for_sampling(pool: &[u8], index: usize, name: &str) -> Result<SampledTexture> {
     let desc = describe(pool, index, name)?;
     if !desc.convertible {

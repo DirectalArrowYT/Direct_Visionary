@@ -1113,8 +1113,40 @@ mod replay {
         gpu.queue.submit([encoder.finish()]);
     }
 
-    fn read_back(gpu: &Gpu, texture: &wgpu::Texture, w: u32, h: u32) -> Vec<[f32; 4]> {
-        let row = (w * 8).div_ceil(256) * 256;
+    /// The game's own colour targets are UNORM, so a blend clamps at 1 after every draw: the full-size scene is
+    /// 10 bits a channel (every captured value lies on k/1023) and the half-size target 8 (k/255).
+    /// VISIONARY_REPLAY_FLOAT draws into half floats instead, unclamped.
+    fn target_format(w: u32) -> wgpu::TextureFormat {
+        if std::env::var_os("VISIONARY_REPLAY_FLOAT").is_some() {
+            COLOR
+        } else if w >= 1280 {
+            wgpu::TextureFormat::Rgb10a2Unorm
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        }
+    }
+
+    /// A captured picture (RGBA half floats) in `format`'s bytes.
+    fn pack_halves(format: wgpu::TextureFormat, pixels: &[u8]) -> Vec<u8> {
+        let unorm = |v: f32, max: f32| (v.clamp(0.0, 1.0) * max).round() as u32;
+        let texels = pixels.chunks_exact(8).map(|p| -> [f32; 4] {
+            std::array::from_fn(|c| half_to_f32(u16::from_le_bytes([p[2 * c], p[2 * c + 1]])))
+        });
+        match format {
+            wgpu::TextureFormat::Rgb10a2Unorm => texels
+                .flat_map(|t| {
+                    (unorm(t[0], 1023.0) | unorm(t[1], 1023.0) << 10 | unorm(t[2], 1023.0) << 20 | unorm(t[3], 3.0) << 30)
+                        .to_le_bytes()
+                })
+                .collect(),
+            wgpu::TextureFormat::Rgba8Unorm => texels.flat_map(|t| t.map(|v| unorm(v, 255.0) as u8)).collect(),
+            _ => pixels.to_vec(),
+        }
+    }
+
+    fn read_back(gpu: &Gpu, texture: &wgpu::Texture, format: wgpu::TextureFormat, w: u32, h: u32) -> Vec<[f32; 4]> {
+        let bpp = format.block_copy_size(None).unwrap();
+        let row = (w * bpp).div_ceil(256) * 256;
         let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: row as u64 * h as u64,
@@ -1137,8 +1169,20 @@ mod replay {
         let mut out = Vec::with_capacity((w * h) as usize);
         for y in 0..h {
             for x in 0..w {
-                let at = (y * row + x * 8) as usize;
-                out.push(std::array::from_fn(|c| half_to_f32(u16::from_le_bytes([mapped[at + 2 * c], mapped[at + 2 * c + 1]]))));
+                let at = (y * row + x * bpp) as usize;
+                out.push(match format {
+                    wgpu::TextureFormat::Rgb10a2Unorm => {
+                        let v = u32::from_le_bytes(mapped[at..at + 4].try_into().unwrap());
+                        [
+                            (v & 1023) as f32 / 1023.0,
+                            (v >> 10 & 1023) as f32 / 1023.0,
+                            (v >> 20 & 1023) as f32 / 1023.0,
+                            (v >> 30) as f32 / 3.0,
+                        ]
+                    }
+                    wgpu::TextureFormat::Rgba8Unorm => std::array::from_fn(|c| mapped[at + c] as f32 / 255.0),
+                    _ => std::array::from_fn(|c| half_to_f32(u16::from_le_bytes([mapped[at + 2 * c], mapped[at + 2 * c + 1]]))),
+                });
             }
         }
         out
@@ -1305,6 +1349,17 @@ mod replay {
                         for (unit, sampler) in samplers.iter().enumerate() {
                             let Some(s) = sampler else { continue };
                             let Some(index) = eff.descriptors.iter().position(|t| t.id == s.texture_id) else { continue };
+                            if std::env::var("VISIONARY_REPLAY_TEXTURES").is_ok() {
+                                let t = &eff.descriptors[index];
+                                let desc = crate::texture_import::describe(&eff.pool, index, &t.name);
+                                let sampled = crate::texture_import::decode_for_sampling(&eff.pool, index, &t.name);
+                                let texels = sampled.as_ref().ok().map(|s| {
+                                    let l = &s.levels[0];
+                                    let (w, h) = l.dimensions();
+                                    [(w / 2, h / 2), (w / 4, h / 2), (w / 2, h / 4), (w / 3, h / 3)].map(|(x, y)| l.get_pixel(x, y).0)
+                                });
+                                println!("  draw {} {name}: sampler{unit} ours {} {:?} sel {:?} texels {:?}", d.draw, t.name, desc, crate::texture_import::channel_selector(&eff.pool, index), texels);
+                            }
                             if let Some(view) = eff.view(gpu, index) {
                                 views.push((unit as u32, view));
                             }
@@ -1316,6 +1371,11 @@ mod replay {
                 if let Some(depth) = &depth_image {
                     for t in d.textures.iter().filter(|t| t.stage == FRAGMENT && t.format == 53 && t.width as u32 == w && t.height as u32 == h) {
                         views.push((t.unit, depth.clone()));
+                    }
+                }
+                if std::env::var("VISIONARY_REPLAY_TEXTURES").is_ok() {
+                    for t in &d.textures {
+                        println!("  draw {} {name}: game unit {}/{} {:?}", d.draw, t.stage, t.unit, t);
                     }
                 }
                 let textures: Vec<TextureInput> = d
@@ -1561,7 +1621,7 @@ mod replay {
                     base_instance: if generated.is_some() { per_particle_base } else { d.base_instance },
                     textures,
                 };
-                match renderer.prepare(&gpu.device, &inputs, COLOR, Some(DEPTH)) {
+                match renderer.prepare(&gpu.device, &inputs, target_format(w), Some(DEPTH)) {
                     Ok(p) => {
                         prepared.push(p);
                         names.push(name);
@@ -1572,13 +1632,15 @@ mod replay {
             if prepared.is_empty() {
                 continue;
             }
+            let format = target_format(w);
+            let packed = before.map(|s| pack_halves(format, &s.pixels));
             let target = texture(
                 gpu,
                 w,
                 h,
-                COLOR,
+                format,
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                before.map(|s| s.pixels.as_slice()),
+                packed.as_deref(),
             );
             let depth_target = texture(gpu, w, h, DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT, None);
             let depth_view = depth_target.create_view(&Default::default());
@@ -1619,7 +1681,7 @@ mod replay {
                 }
             }
             gpu.queue.submit([encoder.finish()]);
-            let ours = read_back(gpu, &target, w, h);
+            let ours = read_back(gpu, &target, format, w, h);
             let game = after.map(|s| halves(&s.pixels));
             let base = before.map(|s| halves(&s.pixels));
             // game | replay | difference x4, at half size
@@ -1627,6 +1689,9 @@ mod replay {
             let (hw, hh) = (w / 2, h / 2);
             let mut png = image::RgbaImage::new(hw * panels, hh);
             let (mut changed, mut sum, mut off) = (0usize, 0f32, 0usize);
+            // VISIONARY_REPLAY_WORST: print the worst pixels' raw values (the PNG clips at 1).
+            let worst_wanted = std::env::var("VISIONARY_REPLAY_WORST").is_ok();
+            let mut worst: Vec<(f32, u32, u32, [f32; 4], [f32; 4], [f32; 4])> = Vec::new();
             let px = |p: [f32; 4]| image::Rgba([srgb8(p[0]), srgb8(p[1]), srgb8(p[2]), 255]);
             for y in 0..h {
                 for x in 0..w {
@@ -1642,6 +1707,9 @@ mod replay {
                             let e = (0..3).map(|c| (g[c] - r[c]).abs()).fold(0.0, f32::max);
                             sum += e;
                             off += (e > 0.05) as usize;
+                            if worst_wanted && e > 0.05 {
+                                worst.push((e, x, y, g, r, base[i]));
+                            }
                         }
                     }
                     if x % 2 == 0 && y % 2 == 0 && x / 2 < hw && y / 2 < hh {
@@ -1656,6 +1724,46 @@ mod replay {
                             None => png.put_pixel(x / 2, y / 2, px(r)),
                         }
                     }
+                }
+            }
+            // VISIONARY_REPLAY_QUANT: how much of the game's picture sits on a k/1023 or k/255 grid (a UNORM target).
+            if std::env::var("VISIONARY_REPLAY_QUANT").is_ok() {
+                if let Some(game) = &game {
+                    let on = |v: f32, n: f32| ((v * n).round() / n - v).abs() <= v / 2048.0 + 1e-7;
+                    let (mut all, mut q10, mut q8, mut above) = (0usize, 0usize, 0usize, 0usize);
+                    for p in game.iter().step_by(7) {
+                        for &v in &p[..3] {
+                            if v <= 0.0 || v >= 0.125 {
+                                above += (v > 1.0) as usize;
+                                continue;
+                            }
+                            all += 1;
+                            q10 += on(v, 1023.0) as usize;
+                            q8 += on(v, 255.0) as usize;
+                        }
+                    }
+                    println!(
+                        "  fbo {fbo} {w}x{h}: {all} values, on k/1023 {:.1}%, on k/255 {:.1}%, above 1: {above}",
+                        100.0 * q10 as f32 / all.max(1) as f32,
+                        100.0 * q8 as f32 / all.max(1) as f32
+                    );
+                }
+            }
+            if worst_wanted && !worst.is_empty() {
+                worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let n = worst.len();
+                let mean = |f: fn(&(f32, u32, u32, [f32; 4], [f32; 4], [f32; 4])) -> [f32; 4]| {
+                    let mut m = [0f32; 4];
+                    for w in &worst {
+                        for c in 0..4 {
+                            m[c] += f(w)[c] / n as f32;
+                        }
+                    }
+                    m
+                };
+                println!("  {n} pixels off: mean game {:?} ours {:?} before {:?}", mean(|w| w.3), mean(|w| w.4), mean(|w| w.5));
+                for (e, x, y, g, r, b) in worst.iter().step_by((n / 6).max(1)).take(6) {
+                    println!("    ({x},{y}) e {e:.3} game {g:?} ours {r:?} before {b:?}");
                 }
             }
             let path = out_dir.join(if batch == 0 { format!("f{}_fbo{fbo}.png", frame.number) } else { format!("f{}_fbo{fbo}_b{batch}.png", frame.number) });
