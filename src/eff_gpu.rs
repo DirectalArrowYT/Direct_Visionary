@@ -982,14 +982,45 @@ mod replay {
         /// emitters of that name the one whose stored data agrees most with the draw's emitter block wins: the block
         /// is the stored emitter data from byte 0 (name at +0x10), with the fields the runtime fills in changed.
         /// Returns the emitter, its score and the runner-up's.
-        fn emitter(&self, name: &str, block: Option<&[u8]>) -> Option<(&effect_library::Emitter, usize, usize)> {
+        /// The file's emitter of that name nearest the draw: the one whose first texture has the size the game
+        /// bound (`texture0`, width x height; same-named emitters of different sets often differ only there),
+        /// then the most bytes of the captured emitter block in common.
+        fn emitter(&self, name: &str, block: Option<&[u8]>, texture0: Option<(u32, u32)>) -> Option<(&effect_library::Emitter, usize, usize)> {
+            let texture_fits = |e: &effect_library::Emitter| -> bool {
+                let (Some(want), Some(s)) = (texture0, e.data.sampler0.as_ref()) else { return true };
+                let Some(index) = self.descriptors.iter().position(|t| t.id == s.texture_id) else { return true };
+                crate::texture_import::describe(&self.pool, index, &self.descriptors[index].name)
+                    .map_or(true, |d| (d.width, d.height) == want)
+            };
             let score = |e: &effect_library::Emitter| -> usize {
-                let (Some(block), Some(bin)) = (block, e.binary_data.as_ref().or(e.cached_binary.as_ref())) else {
-                    return 0;
+                let bytes = match (block, e.binary_data.as_ref().or(e.cached_binary.as_ref())) {
+                    (Some(block), Some(bin)) => block.iter().zip(bin).filter(|(a, b)| a == b).count(),
+                    _ => 0,
                 };
-                block.iter().zip(bin).filter(|(a, b)| a == b).count()
+                // a texture of the wrong size puts the emitter behind every one of the right size
+                bytes + if texture_fits(e) { 0x10000 } else { 0 }
             };
             let mut scored: Vec<_> = self.emitters.iter().filter(|e| e.data.display_name() == name).map(|e| (e, score(e))).collect();
+            if std::env::var("VISIONARY_REPLAY_CANDIDATES").is_ok() {
+                for (e, s) in &scored {
+                    let tex: Vec<String> = [&e.data.sampler0, &e.data.sampler1, &e.data.sampler2]
+                        .iter()
+                        .filter_map(|x| x.as_ref())
+                        .filter_map(|x| self.descriptors.iter().position(|t| t.id == x.texture_id))
+                        .map(|i| format!("{} {:?}", self.descriptors[i].name, crate::texture_import::describe(&self.pool, i, &self.descriptors[i].name).map(|d| (d.width, d.height, d.format))))
+                        .collect();
+                    println!("    candidate {name}: score {s:#x} textures {tex:?} (want {texture0:?})");
+                }
+                if let Some(want) = texture0 {
+                    let fits: Vec<String> = (0..self.descriptors.len())
+                        .filter_map(|i| {
+                            let d = crate::texture_import::describe(&self.pool, i, &self.descriptors[i].name).ok()?;
+                            ((d.width, d.height) == want).then(|| format!("{} {} {}", self.descriptors[i].name, d.format, d.mipmaps))
+                        })
+                        .collect();
+                    println!("    textures of that size: {fits:?}");
+                }
+            }
             scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
             let runner_up = scored.get(1).map(|(_, s)| *s).unwrap_or(0);
             scored.first().map(|&(e, s)| (e, s, runner_up))
@@ -1347,8 +1378,10 @@ mod replay {
                 let block = d.ubo.get(&(0, eff_capture::EMITTER_BLOCK_SLOT)).map(|b| b.as_slice());
                 let mut views: Vec<(u32, wgpu::TextureView)> = Vec::new();
                 let mut cull_side = 0u8;
-                match eff.emitter(&name, block) {
+                let texture0 = d.textures.iter().find(|t| t.stage == FRAGMENT && t.unit == 0 && t.width > 0).map(|t| (t.width as u32, t.height as u32));
+                match eff.emitter(&name, block, texture0) {
                     Some((e, score, runner_up)) => {
+                        let (score, runner_up) = (score & 0xffff, if runner_up >> 16 == score >> 16 { runner_up & 0xffff } else { 0 });
                         if score < runner_up + 0x40 {
                             println!("  draw {} {name}: emitter choice is close ({score:#x} vs {runner_up:#x} of 0x750 bytes)", d.draw);
                         }
