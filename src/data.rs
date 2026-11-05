@@ -7143,6 +7143,35 @@ pub fn resolve_costume_root_any(
     None
 }
 
+/// The mod root (never the game dump) that ships costume `slot` of fighter `name` — its own
+/// `model/body/cNN` or `motion/body/cNN` folder. `None` for a vanilla costume.
+pub fn costume_owner_root(
+    roots: &[PathBuf],
+    name: &str,
+    slot: u8,
+    data_root: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let dir = format!("c{slot:02}");
+    roots
+        .iter()
+        .filter(|root| Some(root.as_path()) != data_root)
+        .find(|root| {
+            let fighter = root.join("fighter").join(name);
+            fighter.join("model").join("body").join(&dir).is_dir()
+                || fighter.join("motion").join("body").join(&dir).is_dir()
+        })
+        .cloned()
+}
+
+/// The smashline project a packaged mod root was built from: the mod folder sits inside the
+/// project (`Project/(Moveset) X/`), so it is the parent folder when that holds `Cargo.toml`.
+/// Returns the project folder; its scripts are under `src/`.
+pub fn mod_source_project(mod_root: &std::path::Path) -> Option<PathBuf> {
+    let project = mod_root.parent()?;
+    (project.join("Cargo.toml").is_file() && project.join("src").is_dir())
+        .then(|| project.to_path_buf())
+}
+
 /// The costume slots that belong to the same slot-add mod as `slot`, for scoping an export.
 ///
 /// A moveset skinned onto a vanilla fighter's spare costumes is still that fighter as far as

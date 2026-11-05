@@ -3152,6 +3152,10 @@ pub struct VisionaryApp {
     /// The user's own smashline project, when linked. Scripts are read from here in
     /// preference to the dumped-script mirror — see `acmd_src`.
     acmd_src: Option<crate::acmd_src::SourceIndex>,
+    /// The source project the user linked by hand. `acmd_src` follows the previewed costume:
+    /// a mod costume whose packaged root sits inside its own smashline project uses that
+    /// project, and this link applies only to costumes no other project claims.
+    linked_acmd_root: Option<PathBuf>,
     show_acmd_src: bool,
     /// The script currently open in the source editor window.
     acmd_src_buffer: Option<SourceBuffer>,
@@ -3491,6 +3495,7 @@ impl VisionaryApp {
             move_search_opened: BTreeSet::new(),
             move_search_touched: BTreeSet::new(),
             acmd_src: None,
+            linked_acmd_root: None,
             show_acmd_src: false,
             acmd_src_buffer: None,
             acmd_src_view: SourceView::Source,
@@ -3554,6 +3559,7 @@ impl VisionaryApp {
         // Re-link the user's own ACMD source, quietly: a project that has moved or been
         // deleted since last session should not open with an error over an unrelated task.
         if let Some(root) = load_config_path(ACMD_SRC_CONFIG_KEY) {
+            app.linked_acmd_root = Some(root.clone());
             app.acmd_src = crate::acmd_src::SourceIndex::build(&root)
                 .ok()
                 .filter(|index| index.has_scripts());
@@ -4145,10 +4151,14 @@ impl VisionaryApp {
         self.acmd_error = None;
         self.current_anim_path = None;
 
-        let fighter = &self.state.fighters[idx];
         self.workspace_asset_slot = slot;
-        let requested = format!("c{slot:02}");
         let roots = self.all_roots();
+        let source_project = {
+            let name = self.state.fighters[idx].name.clone();
+            self.sync_acmd_source_for_costume(&roots, &name, slot)
+        };
+        let fighter = &self.state.fighters[idx];
+        let requested = format!("c{slot:02}");
         let name = fighter.name.clone();
         let all_slots = fighter.slots.clone();
 
@@ -4331,6 +4341,11 @@ impl VisionaryApp {
         // Build move list on a background thread — reads many .nuanmb files for frame counts
         let mut labels = self.state.labels.clone();
         let fighter_dir = motion_fighter_dir;
+        // A moveset project usually keeps the yml it compiles motion_list.bin from at its own
+        // root, not inside the packaged mod.
+        let project_yml = source_project
+            .as_deref()
+            .and_then(crate::motion_yml::find);
         let base_slot = resolved_motion_slot;
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
@@ -4341,7 +4356,7 @@ impl VisionaryApp {
             // `motion_list.yml` names a modded character's own motions. Its names are always
             // merged into the labels; it is the list itself only when there is no `.bin`
             // (the binary is what the game reads, so it stays authoritative when both exist).
-            let yml = crate::motion_yml::find(&motion_dir).and_then(|path| {
+            let yml = crate::motion_yml::find(&motion_dir).or(project_yml).and_then(|path| {
                 match crate::motion_yml::load(&path) {
                     Ok(yml) => {
                         println!(
@@ -4777,6 +4792,61 @@ impl VisionaryApp {
 
     // ── Linked ACMD source project ────────────────────────────────────────────
 
+    /// Point `acmd_src` at the source project that owns costume `slot` of `name`.
+    ///
+    /// Several movesets commonly share one vanilla fighter on different slots (two pit
+    /// costume mods), and the source index is keyed by fighter only, so a single global link
+    /// gave every costume of that fighter the linked mod's scripts. Each mod costume now uses
+    /// the smashline project its packaged root sits in; the manual link covers the rest,
+    /// unless it *is* one of those mod projects (then it belongs to that mod's slots only).
+    /// Returns the owning mod's project folder, if any.
+    fn sync_acmd_source_for_costume(
+        &mut self,
+        roots: &[PathBuf],
+        name: &str,
+        slot: u8,
+    ) -> Option<PathBuf> {
+        let data_root = self.state.data_root.clone();
+        let project = crate::data::costume_owner_root(roots, name, slot, data_root.as_deref())
+            .as_deref()
+            .and_then(crate::data::mod_source_project);
+        let same = |a: &std::path::Path, b: &std::path::Path| match (a.canonicalize(), b.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => a == b,
+        };
+        let desired = project.as_ref().map(|p| p.join("src")).or_else(|| {
+            let manual = self.linked_acmd_root.clone()?;
+            let owned_by_a_mod = roots
+                .iter()
+                .filter(|root| Some(root.as_path()) != data_root.as_deref())
+                .filter_map(|root| crate::data::mod_source_project(root))
+                .any(|p| same(&p.join("src"), &manual) || same(&p, &manual));
+            (!owned_by_a_mod).then_some(manual)
+        });
+        let current = self.acmd_src.as_ref().map(|index| index.root.clone());
+        let unchanged = match (&desired, &current) {
+            (Some(a), Some(b)) => same(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            self.acmd_src_buffer = None;
+            self.acmd_src = desired.as_ref().and_then(|root| {
+                crate::acmd_src::SourceIndex::build(root)
+                    .ok()
+                    .filter(|index| index.has_scripts())
+            });
+            println!(
+                "[acmd-src] {name} c{slot:02}: {}",
+                self.acmd_src
+                    .as_ref()
+                    .map(|index| index.root.display().to_string())
+                    .unwrap_or_else(|| "no linked source (game scripts)".into())
+            );
+        }
+        project
+    }
+
     /// Index `root` as the ACMD source project and remember it for next session.
     fn link_acmd_source(&mut self, root: PathBuf) {
         match crate::acmd_src::SourceIndex::build(&root) {
@@ -4815,6 +4885,7 @@ impl VisionaryApp {
                 );
                 self.acmd_src = Some(index);
                 save_config_path(ACMD_SRC_CONFIG_KEY, &root);
+                self.linked_acmd_root = Some(root.clone());
                 // The open move was loaded from the mirror; re-read it from source now.
                 self.reload_move_scripts();
             }
@@ -4886,6 +4957,7 @@ impl VisionaryApp {
     fn unlink_acmd_source(&mut self) {
         self.acmd_src = None;
         self.acmd_src_buffer = None;
+        self.linked_acmd_root = None;
         clear_config_path(ACMD_SRC_CONFIG_KEY);
         self.state.status = "Unlinked the ACMD source project — scripts come from the \
                              online archive again"
