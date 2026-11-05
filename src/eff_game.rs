@@ -74,7 +74,7 @@ pub const CUSTOM_BLOCK2: [f32; 24] = [
 
 /// Blend, depth and culling from the emitter's render_state, as the game set them (every captured draw):
 /// blend_type 0 alpha, 1 additive, 2 subtractive; is_depth_mask 0 = depth tested, not written, 1 = no depth test;
-/// display_side 1 / 2 culls. `prim` and `indexed` are the draw's own.
+/// display_side 1 front faces only, 2 back faces only. `prim` and `indexed` are the draw's own.
 pub fn draw_state(stored: &[u8], prim: u32, indexed: bool) -> DrawState {
     const SRC_ALPHA: u32 = 0x302;
     const ONE_MINUS_SRC_ALPHA: u32 = 0x303;
@@ -95,8 +95,12 @@ pub fn draw_state(stored: &[u8], prim: u32, indexed: bool) -> DrawState {
         blend: Some([SRC_ALPHA, dst, eq, 0, if half_resolution(stored) { dst } else { 0x304 }, ADD]),
         depth_test: (stored[0x89b] == 0).then_some(0x203),
         depth_write: false,
+        display_side: stored[DISPLAY_SIDE],
     }
 }
+
+/// render_state.display_side in the emitter block: 0 both sides, 1 / 2 one side (the game culls the other).
+pub const DISPLAY_SIDE: usize = 0x89f;
 
 /// Does the emitter draw into the half-resolution effect target (render_state draw_path 2, 11, 21 in every capture)?
 pub fn half_resolution(stored: &[u8]) -> bool {

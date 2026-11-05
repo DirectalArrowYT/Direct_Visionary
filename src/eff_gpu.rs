@@ -248,6 +248,8 @@ pub struct DrawState {
     pub blend: Option<[u32; 6]>,
     pub depth_test: Option<u32>,
     pub depth_write: bool,
+    /// render_state display_side: 0 both sides, 1 / 2 one side only (the other culled).
+    pub display_side: u8,
 }
 
 pub struct DrawInputs<'a> {
@@ -584,7 +586,13 @@ impl GameEffectRenderer {
                     primitive: wgpu::PrimitiveState {
                         topology,
                         strip_index_format: (state.indexed && topology.is_strip()).then_some(wgpu::IndexFormat::Uint32),
-                        cull_mode: None,
+                        // display_side 1 draws the front faces, 2 the back faces (front = counter-clockwise, as the
+                        // game's GL winding; checked against the captures, where a mesh emitter's other side showed).
+                        cull_mode: match state.display_side {
+                            1 => Some(wgpu::Face::Back),
+                            2 => Some(wgpu::Face::Front),
+                            _ => None,
+                        },
                         ..Default::default()
                     },
                     depth_stencil: depth.map(|format| wgpu::DepthStencilState {
@@ -842,6 +850,8 @@ impl DrawState {
             blend: draw.blend.then_some([draw.src_rgb, draw.dst_rgb, draw.eq_rgb, draw.src_a, draw.dst_a, draw.eq_a]),
             depth_test: draw.depth_test.then_some(draw.depth_func),
             depth_write: draw.depth_mask,
+            // which side is the emitter's (display_side); the capture only says whether one is culled
+            display_side: 0,
         }
     }
 }
@@ -1299,6 +1309,14 @@ mod replay {
                 let what = if before.is_none() { "no usable 'before' picture" } else { "pictures" };
                 println!("  fbo {fbo} batch {batch} ({w}x{h}), draws {range:?}: {what}; shots of it: {have:?}");
             }
+            if std::env::var("VISIONARY_REPLAY_TEXTURES").is_ok() {
+                if let Some(s) = &before_depth {
+                    let v: &[f32] = bytemuck::cast_slice(&s.pixels);
+                    let (mn, mx) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                    let ones = v.iter().filter(|&&x| x >= 1.0).count();
+                    println!("  fbo {fbo} depth {}x{} ({} values, {} bytes) min {mn} max {mx}, {ones} at 1", s.width, s.height, v.len(), s.pixels.len());
+                }
+            }
             let depth_image = before_depth.map(|s| {
                 texture(gpu, w, h, wgpu::TextureFormat::R32Float, wgpu::TextureUsages::TEXTURE_BINDING, Some(&s.pixels))
                     .create_view(&Default::default())
@@ -1307,6 +1325,10 @@ mod replay {
             let mut names = Vec::new();
             for d in frame.draws[range.clone()].iter().filter(|d| d.fbo == fbo) {
                 let name = d.emitter_name().unwrap_or_default();
+                // VISIONARY_REPLAY_SKIP=<names,..>: leave these emitters' draws out (which one a difference comes from)
+                if std::env::var("VISIONARY_REPLAY_SKIP").is_ok_and(|l| l.split(',').any(|n| n.trim() == name)) {
+                    continue;
+                }
                 let (Some(vs), Some(fs)) = (programs.get(&(d.vs, 0)), programs.get(&(d.fs, 1))) else {
                     println!("  draw {} {name}: program {}/{} not captured", d.draw, d.vs, d.fs);
                     continue;
@@ -1324,6 +1346,7 @@ mod replay {
                 };
                 let block = d.ubo.get(&(0, eff_capture::EMITTER_BLOCK_SLOT)).map(|b| b.as_slice());
                 let mut views: Vec<(u32, wgpu::TextureView)> = Vec::new();
+                let mut cull_side = 0u8;
                 match eff.emitter(&name, block) {
                     Some((e, score, runner_up)) => {
                         if score < runner_up + 0x40 {
@@ -1345,6 +1368,10 @@ mod replay {
                             let text: Vec<String> = ranges.iter().map(|(a, b)| format!("{a:#x}-{b:#x}")).collect();
                             println!("  draw {} {name}: block differs at {}", d.draw, text.join(" "));
                         }
+                        if d.cull {
+                            let bin = e.binary_data.as_ref().or(e.cached_binary.as_ref());
+                            cull_side = bin.and_then(|b| b.get(crate::eff_game::DISPLAY_SIDE).copied()).unwrap_or(0);
+                        }
                         let samplers = [e.data.sampler0.clone(), e.data.sampler1.clone(), e.data.sampler2.clone()];
                         for (unit, sampler) in samplers.iter().enumerate() {
                             let Some(s) = sampler else { continue };
@@ -1359,6 +1386,16 @@ mod replay {
                                     [(w / 2, h / 2), (w / 4, h / 2), (w / 2, h / 4), (w / 3, h / 3)].map(|(x, y)| l.get_pixel(x, y).0)
                                 });
                                 println!("  draw {} {name}: sampler{unit} ours {} {:?} sel {:?} texels {:?}", d.draw, t.name, desc, crate::texture_import::channel_selector(&eff.pool, index), texels);
+                                if let (Ok(s), Ok(dir)) = (&sampled, std::env::var("VISIONARY_REPLAY_OUT")) {
+                                    let l = &s.levels[0];
+                                    let (w, h) = l.dimensions();
+                                    let mut both = image::RgbaImage::new(w * 2, h);
+                                    for (x, y, p) in l.enumerate_pixels() {
+                                        both.put_pixel(x, y, image::Rgba([p[0], p[1], p[2], 255]));
+                                        both.put_pixel(w + x, y, image::Rgba([p[3], p[3], p[3], 255]));
+                                    }
+                                    let _ = both.save(std::path::Path::new(&dir).join(format!("tex_{}.png", t.name)));
+                                }
                             }
                             if let Some(view) = eff.view(gpu, index) {
                                 views.push((unit as u32, view));
@@ -1374,6 +1411,7 @@ mod replay {
                     }
                 }
                 if std::env::var("VISIONARY_REPLAY_TEXTURES").is_ok() {
+                    println!("  draw {} {name}: variation {variation} state {:?} prim {} instances {} base {} count {} depth image {}", d.draw, DrawState::from_capture(d), d.prim, d.instances, d.base_instance, d.count, depth_image.is_some());
                     for t in &d.textures {
                         println!("  draw {} {name}: game unit {}/{} {:?}", d.draw, t.stage, t.unit, t);
                     }
@@ -1387,6 +1425,20 @@ mod replay {
                     })
                     .collect();
                 let (vertices, problems) = vertex_inputs_from_capture(d);
+                if std::env::var("VISIONARY_REPLAY_TEXTURES").is_ok() {
+                    for a in &d.attrs {
+                        let st = d.streams.get(&a.stream);
+                        println!("  draw {} {name}: attr loc {} fmt {:#x} off {} stream {} stride {:?} divisor {:?} bytes {:?}", d.draw, a.location, a.format, a.offset, a.stream, st.map(|s| s.stride), st.map(|s| s.divisor), st.map(|s| s.bytes.len()));
+                    }
+                    let idx = indices_from_capture(d).unwrap_or_default();
+                    println!("  draw {} {name}: indices {} max {:?} first {:?}", d.draw, idx.len(), idx.iter().max(), &idx[..idx.len().min(12)]);
+                    for v in &vertices {
+                        let mut mn = [f32::MAX; 4];
+                        let mut mx = [f32::MIN; 4];
+                        for p in &v.data { for c in 0..4 { mn[c] = mn[c].min(p[c]); mx[c] = mx[c].max(p[c]); } }
+                        println!("  draw {} {name}: loc {} n {} inst {} min {mn:.3?} max {mx:.3?} first {:.3?}", d.draw, v.location, v.data.len(), v.per_instance, v.data.first());
+                    }
+                }
                 for p in problems {
                     println!("  draw {} {name}: {p}", d.draw);
                 }
@@ -1399,7 +1451,7 @@ mod replay {
                         _ => (stage, slot + 3, bytes.as_slice()),
                     })
                     .collect();
-                let (mut variation, mut vertices, mut state, mut instances) = (variation, vertices, DrawState::from_capture(d), d.instances);
+                let (mut variation, mut vertices, mut state, mut instances) = (variation, vertices, DrawState { display_side: cull_side, ..DrawState::from_capture(d) }, d.instances);
                 let mut per_particle_base = 0u32;
                 // VISIONARY_REPLAY_GENERATE: the draw rebuilt from Visionary's own data (eff_game). Kept from the
                 // capture: the camera, and the effect instance's placement, clock, colour and particle scale (c10's
