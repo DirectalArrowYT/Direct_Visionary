@@ -403,6 +403,20 @@ impl RosterWindow {
         self.css.clear_order_drafts();
     }
 
+    /// Import mod folders that aren't in the library yet (a linked source workspace's packaged
+    /// movesets). Returns one note per folder imported or refused.
+    pub fn adopt_roots(&mut self, roots: &[PathBuf]) -> Vec<String> {
+        if !self.initialized {
+            self.initialized = true;
+            self.library = library::load();
+        }
+        let notes = library::adopt_legacy_roots(&mut self.library, roots);
+        if !notes.is_empty() {
+            self.commit_library_change();
+        }
+        notes
+    }
+
     /// Enabled mod roots in load order — what the fighter scan consumes.
     pub fn enabled_roots(&self) -> Vec<PathBuf> {
         self.library.enabled_roots()

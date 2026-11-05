@@ -3560,8 +3560,10 @@ impl VisionaryApp {
         // deleted since last session should not open with an error over an unrelated task.
         if let Some(root) = load_config_path(ACMD_SRC_CONFIG_KEY) {
             app.linked_acmd_root = Some(root.clone());
-            app.acmd_src = crate::acmd_src::SourceIndex::build(&root)
-                .ok()
+            // A workspace link is resolved per costume when a fighter is selected.
+            app.acmd_src = (!crate::data::is_source_workspace(&root))
+                .then(|| crate::acmd_src::SourceIndex::build(&root))
+                .and_then(Result::ok)
                 .filter(|index| index.has_scripts());
         }
 
@@ -4816,6 +4818,10 @@ impl VisionaryApp {
         };
         let desired = project.as_ref().map(|p| p.join("src")).or_else(|| {
             let manual = self.linked_acmd_root.clone()?;
+            if crate::data::is_source_workspace(&manual) {
+                // Only its projects' own costumes have sources; the rest use game scripts.
+                return None;
+            }
             let owned_by_a_mod = roots
                 .iter()
                 .filter(|root| Some(root.as_path()) != data_root.as_deref())
@@ -4847,8 +4853,49 @@ impl VisionaryApp {
         project
     }
 
+    /// Link a folder of moveset projects: each project's packaged mod joins the mod library,
+    /// and each mod costume then reads its scripts from its own project.
+    fn link_acmd_workspace(&mut self, root: PathBuf) {
+        let projects = crate::data::discover_moveset_projects(&root);
+        let mods: Vec<PathBuf> = projects
+            .iter()
+            .flat_map(|project| crate::data::packaged_mod_folders(project))
+            .collect();
+        let notes = self.roster.adopt_roots(&mods);
+        save_config_path(ACMD_SRC_CONFIG_KEY, &root);
+        self.linked_acmd_root = Some(root.clone());
+        let names: Vec<String> = projects
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
+            .collect();
+        self.state.status = format!(
+            "Linked {} moveset project{} from {}: {}{}",
+            projects.len(),
+            if projects.len() == 1 { "" } else { "s" },
+            root.display(),
+            names.join(", "),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", notes.join("; "))
+            }
+        );
+        // Re-point the open costume now; newly imported mods appear after the reindex.
+        if let Some(idx) = self.state.selected_fighter {
+            let roots = self.all_roots();
+            let name = self.state.fighters[idx].name.clone();
+            self.acmd_src = None;
+            self.sync_acmd_source_for_costume(&roots, &name, self.selected_costume_slot);
+            self.reload_move_scripts();
+        }
+    }
+
     /// Index `root` as the ACMD source project and remember it for next session.
     fn link_acmd_source(&mut self, root: PathBuf) {
+        if crate::data::is_source_workspace(&root) {
+            self.link_acmd_workspace(root);
+            return;
+        }
         match crate::acmd_src::SourceIndex::build(&root) {
             Ok(index) => {
                 let scripts = index.script_count();

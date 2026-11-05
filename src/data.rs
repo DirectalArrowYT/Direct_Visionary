@@ -7172,6 +7172,58 @@ pub fn mod_source_project(mod_root: &std::path::Path) -> Option<PathBuf> {
         .then(|| project.to_path_buf())
 }
 
+/// Packaged mod folders inside a moveset project: child folders that hold a `fighter/` tree
+/// (`Project/(Moveset) X/fighter/...`).
+pub fn packaged_mod_folders(project: &std::path::Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(project) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let skip = matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("target" | "src" | ".git")
+            );
+            !skip && path.join("fighter").is_dir()
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A smashline moveset project: `Cargo.toml`, `src/`, and at least one packaged mod folder.
+pub fn is_moveset_project(dir: &std::path::Path) -> bool {
+    dir.join("Cargo.toml").is_file()
+        && dir.join("src").is_dir()
+        && !packaged_mod_folders(dir).is_empty()
+}
+
+/// The moveset projects a linked folder covers: the folder itself when it is one, otherwise
+/// each child folder that is (a studio folder holding one project per moveset).
+pub fn discover_moveset_projects(root: &std::path::Path) -> Vec<PathBuf> {
+    if is_moveset_project(root) {
+        return vec![root.to_path_buf()];
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && is_moveset_project(path))
+        .collect();
+    out.sort();
+    out
+}
+
+/// A linked folder that is a workspace of moveset projects rather than one source tree:
+/// it is never indexed itself (that would scan every project's `target/`), only its projects.
+pub fn is_source_workspace(root: &std::path::Path) -> bool {
+    !root.join("Cargo.toml").is_file() && !discover_moveset_projects(root).is_empty()
+}
+
 /// The costume slots that belong to the same slot-add mod as `slot`, for scoping an export.
 ///
 /// A moveset skinned onto a vanilla fighter's spare costumes is still that fighter as far as
@@ -10243,5 +10295,36 @@ mod tests {
             files > 0,
             "VISIONARY_DATA_ROOT contained no parameter files"
         );
+    }
+}
+
+#[cfg(test)]
+mod moveset_workspace_tests {
+    use super::*;
+
+    fn project(root: &std::path::Path, name: &str, with_mod: bool) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        if with_mod {
+            std::fs::create_dir_all(dir.join(format!("(Moveset) {name}/fighter/pit"))).unwrap();
+            std::fs::create_dir_all(dir.join("target/release/fighter")).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_studio_folder_links_each_moveset_project_but_not_other_crates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = project(tmp.path(), "Alpha", true);
+        let b = project(tmp.path(), "Beta", true);
+        project(tmp.path(), "Tool", false);
+        assert!(is_source_workspace(tmp.path()));
+        assert_eq!(discover_moveset_projects(tmp.path()), vec![a.clone(), b]);
+        assert_eq!(packaged_mod_folders(&a), vec![a.join("(Moveset) Alpha")]);
+        // A single project links as itself, and is not a workspace.
+        assert_eq!(discover_moveset_projects(&a), vec![a.clone()]);
+        assert!(!is_source_workspace(&a));
+        assert_eq!(mod_source_project(&a.join("(Moveset) Alpha")), Some(a));
     }
 }
