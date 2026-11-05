@@ -2970,7 +2970,10 @@ pub struct VisionaryApp {
     pending_model_load: Option<PathBuf>,
     last_frame_time: std::time::Instant,
     // Background move list loading
-    move_list_receiver: Option<std::sync::mpsc::Receiver<Vec<MoveEntry>>>,
+    /// Background move-list result: the moves, plus names a `motion_list.yml` spelled out
+    /// (merged into the label table so custom motions and their scripts resolve by name).
+    move_list_receiver:
+        Option<std::sync::mpsc::Receiver<(Vec<MoveEntry>, std::collections::HashMap<u64, String>)>>,
     /// A project resume first loads its fighter, then waits for that fighter's asynchronous
     /// motion list before selecting the saved move through the normal interactive path.
     pending_project_move_selection: Option<(String, String)>,
@@ -4180,12 +4183,18 @@ impl VisionaryApp {
                 slot,
             )
         });
-        let (motion_dir, resolved_motion_slot) = crate::data::resolve_costume_root(
+        // A modded moveset may ship `motion_list.yml` (named motions) instead of, or beside,
+        // the binary list; either one marks the costume's motion folder.
+        let (motion_dir, resolved_motion_slot) = crate::data::resolve_costume_root_any(
             &roots,
             &name,
             "motion",
             "body",
-            "motion_list.bin",
+            &[
+                "motion_list.bin",
+                crate::motion_yml::FILE_NAMES[0],
+                crate::motion_yml::FILE_NAMES[1],
+            ],
             slot,
             &all_slots,
         )
@@ -4320,7 +4329,7 @@ impl VisionaryApp {
         self.effect_resolver.set_search_path(eff_path, transplants, common);
 
         // Build move list on a background thread — reads many .nuanmb files for frame counts
-        let labels = self.state.labels.clone();
+        let mut labels = self.state.labels.clone();
         let fighter_dir = motion_fighter_dir;
         let base_slot = resolved_motion_slot;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4329,9 +4338,34 @@ impl VisionaryApp {
 
         std::thread::spawn(move || {
             let motion_list_path = motion_dir.join("motion_list.bin");
-            let Ok(mlist) = motion_lib::open(&motion_list_path) else {
-                return;
+            // `motion_list.yml` names a modded character's own motions. Its names are always
+            // merged into the labels; it is the list itself only when there is no `.bin`
+            // (the binary is what the game reads, so it stays authoritative when both exist).
+            let yml = crate::motion_yml::find(&motion_dir).and_then(|path| {
+                match crate::motion_yml::load(&path) {
+                    Ok(yml) => {
+                        println!(
+                            "[moves] {}: {} motions, {} names",
+                            path.display(),
+                            yml.list.list.len(),
+                            yml.labels.len()
+                        );
+                        Some(yml)
+                    }
+                    Err(e) => {
+                        eprintln!("[moves] motion_list.yml ignored: {e}");
+                        None
+                    }
+                }
+            });
+            let (mlist, mut yml_labels) = match (motion_lib::open(&motion_list_path), yml) {
+                (Ok(mlist), yml) => (mlist, yml.map(|y| y.labels).unwrap_or_default()),
+                (Err(_), Some(yml)) => (yml.list, yml.labels),
+                (Err(_), None) => return,
             };
+            for (hash, label) in &yml_labels {
+                labels.insert(*hash, label.clone());
+            }
 
             let anim_index = index_nuanmb(&motion_dir);
             // Kirby's body motion list points at copy-ability animations stored in sibling
@@ -4340,6 +4374,45 @@ impl VisionaryApp {
             // Other fighters use the same layout for weapon and helper parts, so this is a
             // fighter-data rule rather than a Kirby special case.
             let animation_files = index_fighter_nuanmb(&fighter_dir, base_slot);
+
+            // A modded `.bin` carries only hashes. Recover what names we can from each
+            // motion's animation filename (see `motion_guess`) so custom moves get real names,
+            // land in the right section, and their ACMD scripts resolve by name.
+            let mut guessed = 0usize;
+            for (kind, motion) in &mlist.list {
+                let stems: Vec<String> = motion
+                    .animations
+                    .iter()
+                    .filter_map(|anim| animation_files.get(&anim.name.0))
+                    .filter_map(|path| path.file_name()?.to_str())
+                    .filter_map(crate::motion_guess::anim_stem)
+                    .collect();
+                if stems.is_empty() {
+                    continue;
+                }
+                if !labels.contains_key(&kind.0) {
+                    if let Some(name) = crate::motion_guess::guess_kind(&stems, kind.0) {
+                        labels.insert(kind.0, name.clone());
+                        yml_labels.insert(kind.0, name);
+                        guessed += 1;
+                    }
+                }
+                let kind_name = labels.get(&kind.0).cloned();
+                for script in std::iter::once(&motion.game_script).chain(&motion.scripts) {
+                    if script.0 == 0 || labels.contains_key(&script.0) {
+                        continue;
+                    }
+                    if let Some(name) =
+                        crate::motion_guess::guess_script(&stems, kind_name.as_deref(), script.0)
+                    {
+                        labels.insert(script.0, name.clone());
+                        yml_labels.insert(script.0, name);
+                    }
+                }
+            }
+            if guessed > 0 {
+                println!("[moves] recovered {guessed} motion name(s) from animation files");
+            }
             let mut moves: Vec<MoveEntry> = mlist
                 .list
                 .iter()
@@ -4389,7 +4462,7 @@ impl VisionaryApp {
                 .collect();
 
             moves.sort_by(|a, b| a.name.cmp(&b.name));
-            let _ = tx.send(moves);
+            let _ = tx.send((moves, yml_labels));
         });
     }
 
@@ -9007,7 +9080,7 @@ impl VisionaryApp {
                             .to_lowercase()
                             .contains(&move_query)
                 }) {
-                    let g = crate::move_kinds::group_of(&m.name);
+                    let g = m.group();
                     let idx = order
                         .iter()
                         .position(|o| *o == g)
@@ -9019,7 +9092,7 @@ impl VisionaryApp {
                     .state
                     .selected_move
                     .as_ref()
-                    .map(|m| crate::move_kinds::group_of(&m.name));
+                    .map(|m| m.group());
                 let mut center_selected_move = false;
                 if move_searching {
                     if self.move_expansion_before_search.is_none() {
@@ -32964,8 +33037,9 @@ impl eframe::App for VisionaryApp {
         }
         // Poll background move list loader
         if let Some(rx) = &self.move_list_receiver {
-            if let Ok(moves) = rx.try_recv() {
+            if let Ok((moves, yml_labels)) = rx.try_recv() {
                 let count = moves.len();
+                self.state.labels.extend(yml_labels);
                 if let Some(kind) = self.current_fighter_kind() {
                     self.capture_motion_names.extend(
                         moves

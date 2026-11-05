@@ -31,6 +31,8 @@ mod game_link;
 mod mod_export;
 mod mod_import;
 mod mod_project;
+mod motion_guess;
+mod motion_yml;
 mod move_kinds;
 mod mx;
 mod param_labels;

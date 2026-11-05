@@ -6904,6 +6904,22 @@ pub struct MoveEntry {
     pub anim_path: Option<PathBuf>,
 }
 
+impl MoveEntry {
+    /// The move-list section for this move: from its name, or — for a modded motion whose hash
+    /// no label resolves — from its animation file's prefix (`c03…` smash, `d0x…` special).
+    pub fn group(&self) -> crate::move_kinds::MoveGroup {
+        let group = crate::move_kinds::group_of(&self.name);
+        if group != crate::move_kinds::MoveGroup::Other {
+            return group;
+        }
+        self.anim_path
+            .as_deref()
+            .and_then(|path| path.file_name()?.to_str())
+            .and_then(crate::motion_guess::group_from_anim)
+            .unwrap_or(group)
+    }
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self {
@@ -7091,6 +7107,20 @@ pub fn resolve_costume_root(
     requested: u8,
     all_slots: &[u8],
 ) -> Option<(PathBuf, u8)> {
+    resolve_costume_root_any(roots, name, category, part, &[marker], requested, all_slots)
+}
+
+/// [`resolve_costume_root`] where any one of `markers` marks a usable folder — e.g. a modded
+/// moveset's motion folder ships `motion_list.yml` instead of `motion_list.bin`.
+pub fn resolve_costume_root_any(
+    roots: &[PathBuf],
+    name: &str,
+    category: &str,
+    part: &str,
+    markers: &[&str],
+    requested: u8,
+    all_slots: &[u8],
+) -> Option<(PathBuf, u8)> {
     let mut below: Vec<u8> = all_slots.iter().copied().filter(|s| *s < requested).collect();
     below.sort_unstable_by(|a, b| b.cmp(a));
     let mut above: Vec<u8> = all_slots.iter().copied().filter(|s| *s > requested).collect();
@@ -7104,9 +7134,8 @@ pub fn resolve_costume_root(
                 .join(name)
                 .join(category)
                 .join(part)
-                .join(&slot_dir)
-                .join(marker);
-            if path.exists() {
+                .join(&slot_dir);
+            if markers.iter().any(|marker| path.join(marker).exists()) {
                 return Some((root.clone(), slot));
             }
         }
