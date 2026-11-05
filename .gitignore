@@ -45,6 +45,7 @@
 *.szs
 *.prc
 *.bin
+!vendor/ssbh_wgpu/ssbh_wgpu/src/resources/*.bin
 *.nso
 *.nca
 *.nsp
