@@ -4193,33 +4193,7 @@ impl VisionaryApp {
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let mut toggle = |ui: &mut Ui, hide: &mut bool, label: &str, tip: &str, key: &str| {
-                            let mut show = !*hide;
-                            if ui.checkbox(&mut show, label).on_hover_text(tip).changed() {
-                                *hide = !show;
-                                save_config_flag(key, *hide);
-                            }
-                        };
-                        toggle(ui, &mut self.hide_effects, "Effects", "Draw the effects' particles.", "viewport_hide_effects");
-                        toggle(
-                            ui,
-                            &mut self.hide_effect_markers,
-                            "Markers",
-                            "The blue circles where effects are spawned, with their names.",
-                            "viewport_hide_effect_markers",
-                        );
-                        toggle(ui, &mut self.hide_hitboxes, "Hitboxes", "Attack, grab and wind volumes.", "viewport_hide_hitboxes");
-                        let available = self
-                            .hurtbox_volumes
-                            .iter()
-                            .any(|volume| matches!(volume.shape, crate::data::HurtboxShape::Capsule));
-                        if ui
-                            .add_enabled(available, egui::Checkbox::new(&mut self.show_hurtboxes, "Hurtboxes"))
-                            .on_hover_text("The fighter's hurtbox capsules (from its parameters).")
-                            .changed()
-                        {
-                            save_hurtbox_visibility(self.show_hurtboxes);
-                        }
+                        self.visibility_checkboxes(ui);
                         if hidden > 0 {
                             ui.separator();
                             let names: Vec<&str> = self.hidden_effect_names.iter().map(String::as_str).collect();
@@ -4239,6 +4213,336 @@ impl VisionaryApp {
                 });
             });
         self.viewport_bar_rect = Some(area.response.rect);
+    }
+
+    /// What the viewport draws: shared by its corner bar and the View menu. Saved as changed.
+    fn visibility_checkboxes(&mut self, ui: &mut Ui) {
+        let toggle = |ui: &mut Ui, hide: &mut bool, label: &str, tip: &str, key: &str| {
+            let mut show = !*hide;
+            if ui.checkbox(&mut show, label).on_hover_text(tip).changed() {
+                *hide = !show;
+                save_config_flag(key, *hide);
+            }
+        };
+        toggle(ui, &mut self.hide_effects, "Effects", "Draw the effects' particles.", "viewport_hide_effects");
+        toggle(
+            ui,
+            &mut self.hide_effect_markers,
+            "Markers",
+            "The blue circles where effects are spawned, with their names.",
+            "viewport_hide_effect_markers",
+        );
+        toggle(ui, &mut self.hide_hitboxes, "Hitboxes", "Attack, grab and wind volumes.", "viewport_hide_hitboxes");
+        let available = self
+            .hurtbox_volumes
+            .iter()
+            .any(|volume| matches!(volume.shape, crate::data::HurtboxShape::Capsule));
+        if ui
+            .add_enabled(available, egui::Checkbox::new(&mut self.show_hurtboxes, "Hurtboxes"))
+            .on_hover_text("The fighter's hurtbox capsules (from its parameters).")
+            .changed()
+        {
+            save_hurtbox_visibility(self.show_hurtboxes);
+        }
+    }
+
+    /// The menu bar: File / Project / Game / View / Options, the two most-used actions as
+    /// buttons, and the game link on the right.
+    fn top_bar(&mut self, ui: &mut Ui) {
+        // Menus contain persistent controls such as the project-name field. The default menu
+        // policy closes on every click, which steals focus from text edits before a character
+        // can be typed. Commands close themselves explicitly.
+        let config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        egui::MenuBar::new().config(config).ui(ui, |ui| {
+            ui.menu_button("File", |ui| self.file_menu(ui));
+            ui.menu_button("Project", |ui| self.project_menu(ui));
+            ui.menu_button("Game", |ui| self.game_menu(ui));
+            ui.menu_button("View", |ui| self.view_menu(ui));
+            ui.menu_button("Options", |ui| self.options_menu(ui));
+            ui.separator();
+            // the two things done most, one click away
+            if ui
+                .button("Send to game")
+                .on_hover_text(
+                    "Rebuild the live carrier with this fighter's transplants and authored edits \
+                     baked in, and hand it to the running game. Re-trigger the move to see it on a \
+                     fresh spawn.",
+                )
+                .clicked()
+            {
+                self.sync_eff_mods_from_editor();
+                self.push_effect_aliases();
+            }
+            if ui
+                .add_enabled(self.export_build.is_none(), egui::Button::new("Export mod…"))
+                .on_hover_text(
+                    "Export one complete ARCropolis mod folder, including effects and a built ACMD \
+                     plugin at plugin.nro",
+                )
+                .clicked()
+            {
+                self.export_full_mod();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                crate::ui::game_connection(ui, self.game_link.status());
+                ui.separator();
+                if self.project_autosave_error.is_some() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "\u{25CF} not saved")
+                        .on_hover_text(self.project_autosave_error.clone().unwrap_or_default());
+                } else if self.project_autosave_pending_since.is_some() {
+                    ui.colored_label(ui.visuals().warn_fg_color, "\u{25CF} saving soon");
+                }
+                let name = if self.project_name.trim().is_empty() {
+                    "Untitled project"
+                } else {
+                    self.project_name.trim()
+                };
+                let where_ = self
+                    .project_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "In memory: File → Save As… to autosave".into());
+                ui.label(RichText::new(name).strong()).on_hover_text(where_);
+            });
+        });
+    }
+
+    fn file_menu(&mut self, ui: &mut Ui) {
+        if ui.button("Project Hub…").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
+            self.project_hub.show = true;
+            ui.close();
+        }
+        if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there and autosaves").clicked() {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                self.request_hub_action(crate::project_hub::HubAction::New(folder));
+            }
+            ui.close();
+        }
+        if ui.button("Open Project…").clicked() {
+            self.load_project();
+            ui.close();
+        }
+        if ui.button("Import Mod as Project…").on_hover_text("Adopt a compiled mod folder as an editable project").clicked() {
+            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                self.request_hub_action(crate::project_hub::HubAction::ImportMod(folder));
+            }
+            ui.close();
+        }
+        if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
+            self.save_project_as();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Open Effect File…")
+            .on_hover_text("Load any .eff from disk (even outside the game data root) into the preview and donor pool")
+            .clicked()
+        {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Effect file", &["eff"])
+                .set_title("Open effect (.eff)")
+                .pick_file()
+            {
+                self.open_external_eff(path);
+            }
+            ui.close();
+        }
+        let recents = self.recent_effs.clone();
+        ui.add_enabled_ui(!recents.is_empty(), |ui| {
+            ui.menu_button("Recent Effect Files", |ui| {
+                for p in recents {
+                    let label = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_else(|| p.to_str().unwrap_or("eff"));
+                    if ui.button(label).on_hover_text(p.to_string_lossy()).clicked() {
+                        self.open_external_eff(p.clone());
+                        ui.close();
+                    }
+                }
+            });
+        });
+        ui.separator();
+        ui.menu_button("Export", |ui| {
+            if ui
+                .add_enabled(self.export_build.is_none(), egui::Button::new("Mod Folder…"))
+                .on_hover_text("Export one complete ARCropolis mod folder, including effects and a built ACMD plugin at plugin.nro")
+                .clicked()
+            {
+                self.export_full_mod();
+                ui.close();
+            }
+            if ui.button("Developer Files…")
+                .on_hover_text("Export rebuilt effect files and editable ACMD Rust source in separate folders")
+                .clicked()
+            {
+                self.export_developer_files();
+                ui.close();
+            }
+            if ui.button("Project…")
+                .on_hover_text("Export an editable modproject.json and its assets separately from installable mod and developer files")
+                .clicked()
+            {
+                self.export_project();
+                ui.close();
+            }
+        });
+    }
+
+    fn project_menu(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(160.0));
+        });
+        let file = match &self.project_path {
+            Some(path) => format!("File: {}", path.display()),
+            None => "File: in memory (File → Save As… for autosave)".to_string(),
+        };
+        ui.label(RichText::new(file).small().weak());
+        ui.separator();
+        if ui.button("Project Files…").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
+            self.show_workspace = true;
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .add_enabled(self.acmd_src.is_some(), egui::Button::new("Sync Edits Into Source"))
+            .on_hover_text(
+                "Write this move's edited hitbox/effect values and bounded, isolated effect timing \
+                 blocks back into your own linked ACMD project. Branches, loops, collisions, and \
+                 ambiguous stop pairings are reported instead of guessed. Link a project in \
+                 View → ACMD Source.",
+            )
+            .clicked()
+        {
+            self.sync_edits_to_source();
+            ui.close();
+        }
+        if ui
+            .add_enabled(self.acmd_src.is_some(), egui::Button::new("Save Generated Into Source"))
+            .on_hover_text(
+                "Replace this move's functions in your linked project with the generated code, so \
+                 added or removed calls land too — the edits Sync reports instead of writing. \
+                 Within those functions the generated code REPLACES what is there, comments and \
+                 formatting included; nothing else in the file is touched.",
+            )
+            .clicked()
+        {
+            self.write_generated_into_source();
+            ui.close();
+        }
+    }
+
+    fn game_menu(&mut self, ui: &mut Ui) {
+        // Was "Deploy live eff to Eden", which rebuilt the FIGHTER's own eff and asked the
+        // plugin to reparse it. That path is a dead end: the reparse rebuilds from the resident
+        // buffer and never re-requests the file, so the edited bytes were never read
+        // (`cb_game=0`) — and it could hang the game. Both routes now go through the carrier.
+        if ui.button("Send Edits to Game")
+            .on_hover_text("Rebuild the live carrier with this fighter's transplants and authored edits baked in, and hand it to the running game. Re-trigger the move to see it on a fresh spawn.")
+            .clicked()
+        {
+            self.sync_eff_mods_from_editor();
+            self.push_effect_aliases();
+            ui.close();
+        }
+        if ui.button("Clear All Game Edits")
+            .on_hover_text("Wipe the game's saved pins (which survive restarts) + all live spawn/hitbox rules — use when old edits keep re-appearing")
+            .clicked()
+        {
+            self.clear_all_game_edits();
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Base Game Folder…").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                self.set_data_root(path);
+            }
+            ui.close();
+        }
+        if ui
+            .button("Mod Library…")
+            .on_hover_text(
+                "Import compiled mods — folders or .zip/.7z archives, many at once — and set which \
+                 one wins when two provide the same file. Added-character mods appear in the \
+                 fighter list; slot-add mods extend an existing fighter's skin list.",
+            )
+            .clicked()
+        {
+            self.roster.open = true;
+            ui.close();
+        }
+        if ui
+            .button("Rescan Skins")
+            .on_hover_text("Re-read every fighter's costume slots from disk (after installing a new skin)")
+            .clicked()
+        {
+            self.rescan_costume_slots();
+            self.state.status = "Rescanned costume slots.".into();
+            ui.close();
+        }
+    }
+
+    fn view_menu(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Viewport").small().weak());
+        self.visibility_checkboxes(ui);
+        if !self.hidden_effect_calls.is_empty() || !self.hidden_effect_names.is_empty() {
+            if ui.button("Show Hidden Effects").on_hover_text("Unhide every effect hidden one by one or by name").clicked() {
+                self.hidden_effect_calls.clear();
+                self.hidden_effect_names.clear();
+            }
+        }
+        ui.separator();
+        ui.label(RichText::new("Windows").small().weak());
+        ui.checkbox(&mut self.roster.open, "Roster").on_hover_text(
+            "Mod library, character select screen, new characters, and fighter-wide trait values (separate window)",
+        );
+        let eff_toggle = ui
+            .checkbox(&mut self.eff_editor.open, "Effect Editor  Ctrl+Shift+E")
+            .on_hover_text("Edit .eff authored values with in-game live preview (separate window)");
+        if eff_toggle.changed() && self.eff_editor.open {
+            // Opening the window always shows the selected fighter's eff (a queued load may
+            // have been consumed by an earlier open, or a different file loaded manually since).
+            if let Some(p) = self.current_eff_path.clone() {
+                self.eff_editor.queue_load(&p);
+            }
+        }
+        ui.checkbox(&mut self.show_transplant, "Transplant Effects").on_hover_text(
+            "Transplant any effect from another EFF into the current fighter's EFF and redirect its uses",
+        );
+        ui.checkbox(&mut self.show_acmd_src, "ACMD Source").on_hover_text(
+            "Read and edit ACMD scripts from your own smashline project, instead of the online archive of vanilla scripts",
+        );
+        ui.checkbox(&mut self.show_workspace, "Project Files").on_hover_text(
+            "Where every edit lives: what Visionary models vs the manual romfs overlay for models, animations, and other unsupported files",
+        );
+        let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
+        ui.add_enabled_ui(has_log, |ui| {
+            ui.checkbox(&mut self.show_edit_log, "Edit Log").on_hover_text("View and manage all saved edits");
+        });
+        ui.separator();
+        ui.menu_button("Developer", |ui| {
+            ui.checkbox(&mut self.show_debug, "Debug");
+            ui.checkbox(&mut self.show_capture_debug, "Capture Debug")
+                .on_hover_text("Show attempted, successful, and failed live captures by character");
+        });
+    }
+
+    fn options_menu(&mut self, ui: &mut Ui) {
+        ui.menu_button("Theme", |ui| {
+            for theme in crate::theme::Theme::ALL {
+                if ui.radio(self.ui_theme == theme, theme.name()).clicked() {
+                    self.ui_theme = theme;
+                    theme.apply(ui.ctx());
+                    theme.save();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Credits").on_hover_text("The people who helped make Visionary possible").clicked() {
+            self.credits.open = true;
+            ui.close();
+        }
     }
 
     /// Whether effect call `i` of the current move is hidden in the viewport, on its own or by
@@ -34278,282 +34582,9 @@ impl eframe::App for VisionaryApp {
 
         self.credits.show(&ctx);
 
-        // Top menu bar: File / Windows / Project + status
+        // Top menu bar: File / Project / Game / View / Options + quick actions
         let t_menu = self.perf.start();
-        egui::Panel::top("menu").show_inside(ui, |ui| {
-            ui.horizontal(|ui| {
-                // Menus contain persistent controls such as the project-name field. The default
-                // menu policy closes on every click, which steals focus from text edits before
-                // a character can be typed. Commands still close themselves explicitly below.
-                let menu_config = egui::containers::menu::MenuConfig::new()
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-                ui.label(egui::RichText::new("Visionary").size(16.0).color(egui::Color32::WHITE));
-                ui.separator();
-
-                egui::containers::menu::MenuButton::new("File")
-                    .config(menu_config.clone())
-                    .ui(ui, |ui| {
-                    if ui.button("Project Hub…").on_hover_text("Resume / New / Open / Import mod / Recent / Browse without project").clicked() {
-                        self.project_hub.show = true;
-                        ui.close();
-                    }
-                    if ui.button("Save As…").on_hover_text("Relocate the current project to a new modproject.json (edits otherwise autosave)").clicked() {
-                        self.save_project_as();
-                        ui.close();
-                    }
-                    if ui.button("Open Project…").clicked() {
-                        self.load_project();
-                        ui.close();
-                    }
-                    if ui.button("New Project…").on_hover_text("Pick a workspace folder — every edit lives there and autosaves").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.request_hub_action(crate::project_hub::HubAction::New(folder));
-                        }
-                        ui.close();
-                    }
-                    if ui.button("Import Mod as Project…").on_hover_text("Adopt a compiled mod folder as an editable project").clicked() {
-                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
-                            self.request_hub_action(crate::project_hub::HubAction::ImportMod(folder));
-                        }
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Choose base game folder…").on_hover_text("Select the extracted game folder containing fighter/, effect/, and ui/").clicked() {
-                        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                            self.set_data_root(path);
-                        }
-                        ui.close();
-                    }
-                    // ── Modded characters + extra skins ──────────────────────────────
-                    if ui
-                        .button("Mod Library…")
-                        .on_hover_text(
-                            "Import compiled mods — folders or .zip/.7z archives, many at \
-                             once — and set which one wins when two provide the same file. \
-                             Added-character mods appear in the fighter list; slot-add mods \
-                             extend an existing fighter's skin list.",
-                        )
-                        .clicked()
-                    {
-                        self.roster.open = true;
-                        ui.close();
-                    }
-                    if ui
-                        .button("Rescan skins")
-                        .on_hover_text(
-                            "Re-read every fighter's costume slots from disk (after \
-                             installing a new skin)",
-                        )
-                        .clicked()
-                    {
-                        self.rescan_costume_slots();
-                        self.state.status = "Rescanned costume slots.".into();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("Open Effect File…")
-                        .on_hover_text("Load any .eff from disk (even outside the game data root) into the preview and donor pool")
-                        .clicked()
-                    {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Effect file", &["eff"])
-                            .set_title("Open effect (.eff)")
-                            .pick_file()
-                        {
-                            self.open_external_eff(path);
-                        }
-                        ui.close();
-                    }
-                    if !self.recent_effs.is_empty() {
-                        ui.menu_button("Recent Effect Files", |ui| {
-                            let recents = self.recent_effs.clone();
-                            for p in recents {
-                                let label = p
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or_else(|| p.to_str().unwrap_or("eff"));
-                                if ui.button(label).on_hover_text(p.to_string_lossy()).clicked() {
-                                    self.open_external_eff(p.clone());
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                });
-
-                egui::containers::menu::MenuButton::new("Windows")
-                    .config(menu_config.clone())
-                    .ui(ui, |ui| {
-                    ui.checkbox(&mut self.roster.open, "Roster")
-                        .on_hover_text(
-                            "Mod library, character select screen, new characters, and \
-                             fighter-wide trait values (separate window)",
-                        );
-                    let eff_toggle = ui
-                        .checkbox(&mut self.eff_editor.open, "Effect Editor  Ctrl+Shift+E")
-                        .on_hover_text("Edit .eff authored values with in-game live preview (separate window)");
-                    if eff_toggle.changed() && self.eff_editor.open {
-                        // Opening the window always shows the selected fighter's eff (a
-                        // queued load may have been consumed by an earlier open, or a
-                        // different file loaded manually since).
-                        if let Some(p) = self.current_eff_path.clone() {
-                            self.eff_editor.queue_load(&p);
-                        }
-                    }
-                    ui.checkbox(&mut self.show_transplant, "Transplant Effects")
-                        .on_hover_text(
-                            "Transplant any effect from another EFF into the current fighter's \
-                             EFF and redirect its uses",
-                        );
-                    let has_log = !self.state.edit_log.is_empty() || self.roster.has_edits() || self.show_edit_log;
-                    ui.add_enabled_ui(has_log, |ui| {
-                        ui.checkbox(&mut self.show_edit_log, "Edit Log")
-                            .on_hover_text("View and manage all saved edits");
-                    });
-                    ui.checkbox(&mut self.show_acmd_src, "ACMD Source")
-                        .on_hover_text(
-                            "Read and edit ACMD scripts from your own smashline project, \
-                             instead of the online archive of vanilla scripts",
-                        );
-                    ui.checkbox(&mut self.show_workspace, "Project Files")
-                        .on_hover_text(
-                            "Where every edit lives: what Visionary models vs the manual \
-                             romfs overlay for models, animations, and other unsupported files",
-                        );
-                    ui.checkbox(&mut self.show_debug, "Debug");
-                    ui.checkbox(&mut self.show_capture_debug, "Capture Debug")
-                        .on_hover_text(
-                            "Show attempted, successful, and failed live captures by character",
-                        );
-                    ui.checkbox(&mut self.credits.open, "Credits")
-                        .on_hover_text("The people who helped make Visionary possible");
-                    ui.separator();
-                    ui.menu_button("Theme", |ui| {
-                        for theme in crate::theme::Theme::ALL {
-                            if ui.radio(self.ui_theme == theme, theme.name()).clicked() {
-                                self.ui_theme = theme;
-                                theme.apply(ui.ctx());
-                                theme.save();
-                            }
-                        }
-                    });
-                });
-
-                egui::containers::menu::MenuButton::new("Project")
-                    .config(menu_config)
-                    .ui(ui, |ui| {
-                    if ui.button("Project files…").on_hover_text("Browse project files and copy base game assets for editing").clicked() {
-                        self.show_workspace = true;
-                        ui.close();
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("name:");
-                        ui.add(egui::TextEdit::singleline(&mut self.project_name).desired_width(140.0));
-                    });
-                    if let Some(path) = &self.project_path {
-                        ui.label(
-                            egui::RichText::new(format!("file: {}", path.display()))
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    } else {
-                        ui.label(
-                            egui::RichText::new("file: in memory (use File → Save As… for autosave)")
-                                .small()
-                                .color(egui::Color32::GRAY),
-                        );
-                    }
-                    ui.separator();
-                    if ui.button("Export Project…")
-                        .on_hover_text("Export an editable modproject.json and its assets separately from installable mod and developer files")
-                        .clicked()
-                    {
-                        self.export_project();
-                        ui.close();
-                    }
-                    ui.separator();
-                    // Was "Deploy live eff to Eden", which rebuilt the FIGHTER's own eff and
-                    // asked the plugin to reparse it. That path is a dead end: the reparse
-                    // rebuilds from the resident buffer and never re-requests the file, so the
-                    // edited bytes were never read (`cb_game=0`) — and it could hang the game.
-                    // Both routes now go through the live carrier.
-                    if ui.button("Send edits to game")
-                        .on_hover_text("Rebuild the live carrier with this fighter's transplants and authored edits baked in, and hand it to the running game. Re-trigger the move to see it on a fresh spawn.")
-                        .clicked()
-                    {
-                        self.sync_eff_mods_from_editor();
-                        self.push_effect_aliases();
-                        ui.close();
-                    }
-                    if ui.button("Clear all game edits")
-                        .on_hover_text("Wipe the game's saved pins (which survive restarts) + all live spawn/hitbox rules — use when old edits keep re-appearing")
-                        .clicked()
-                    {
-                        self.clear_all_game_edits();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.export_build.is_none(),
-                            egui::Button::new("Export Mod Folder…"),
-                        )
-                        .on_hover_text("Export one complete ARCropolis mod folder, including effects and a built ACMD plugin at plugin.nro")
-                        .clicked()
-                    {
-                        self.export_full_mod();
-                        ui.close();
-                    }
-                    if ui.button("Export Developer Files…")
-                        .on_hover_text("Export rebuilt effect files and editable ACMD Rust source in separate folders")
-                        .clicked()
-                    {
-                        self.export_developer_files();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.acmd_src.is_some(),
-                            egui::Button::new("Sync Edits Into Source"),
-                        )
-                        .on_hover_text(
-                            "Write this move's edited hitbox/effect values and bounded, isolated \
-                             effect timing blocks back into your own linked ACMD project. Branches, \
-                             loops, collisions, and ambiguous stop pairings are reported instead \
-                             of guessed. Link a project in Windows → ACMD Source.",
-                        )
-                        .clicked()
-                    {
-                        self.sync_edits_to_source();
-                        ui.close();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.acmd_src.is_some(),
-                            egui::Button::new("Save Generated Into Source"),
-                        )
-                        .on_hover_text(
-                            "Replace this move's functions in your linked project with the \
-                             generated code, so added or removed calls land too — the edits \
-                             Sync reports instead of writing. Within those functions the \
-                             generated code REPLACES what is there, comments and formatting \
-                             included; nothing else in the file is touched.",
-                        )
-                        .clicked()
-                    {
-                        self.write_generated_into_source();
-                        ui.close();
-                    }
-                });
-
-                ui.separator();
-                // Game-link status — same widget language as the Eff Editor header.
-                crate::ui::game_connection(ui, self.game_link.status());
-                ui.separator();
-            });
-        });
+        egui::Panel::top("menu").show_inside(ui, |ui| self.top_bar(ui));
         self.perf.end("menu_bar", t_menu);
 
         // Keep transient fetch/export/live-link messages out of the command row.  The narrow
