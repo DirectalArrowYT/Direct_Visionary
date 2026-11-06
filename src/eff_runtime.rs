@@ -3643,6 +3643,114 @@ SYS_TURN_SMOKE: {} particles spanning {span:.2} units around the bone",
         }
     }
 
+    /// A named effect on a bone swinging in a circle (radius 10, a quarter turn every 8 frames): how far apart each
+    /// emitter's particles end up. An emitter whose particles stay where they were born (follow_type 1) leaves a trail
+    /// whose spread is the circle's size; one that follows keeps them bunched at the hand.
+    /// `VISIONARY_EFF_ROOT`, `VISIONARY_EFF_FILE` (the fighter eff), `VISIONARY_EFF_NAME`; `VISIONARY_TRAIL_GAME=1`
+    /// waits for the file's shaders so the game-shader path is the one measured.
+    #[test]
+    fn a_swinging_effect_leaves_a_trail() {
+        let (Some(root), Ok(name)) = (root(), std::env::var("VISIONARY_EFF_NAME")) else { return };
+        let fighter = std::env::var_os("VISIONARY_EFF_FILE").map(PathBuf::from);
+        let mut resolver = EffectResolver::default();
+        resolver.set_search_path(fighter.clone(), Vec::new(), Some(EffectResolver::common_eff_path(&root)));
+        let file = resolver.resolve(&name).expect("effect resolves").file.clone();
+        if std::env::var_os("VISIONARY_TRAIL_GAME").is_some() {
+            while matches!(crate::eff_shader_cache::global().lock().unwrap().get(&file), crate::eff_shader_cache::State::Building) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            println!("shaders: {:?}", crate::eff_shader_cache::ready(&file));
+        } else {
+            crate::eff_shader_cache::ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        let now = 30.0f32;
+        let hand = |frame: f32| {
+            let a = frame * std::f32::consts::FRAC_PI_2 / 8.0;
+            glam::Mat4::from_translation(glam::Vec3::new(10.0 * a.cos(), 10.0 * a.sin() + 10.0, 0.0))
+        };
+        let pose = |frame: f32| {
+            let mut bones = std::collections::HashMap::new();
+            bones.insert("Top".to_string(), hand(frame));
+            bones
+        };
+        let live = vec![LiveEffect {
+            name: name.clone(),
+            bone: "top".into(),
+            tint: [1.0; 3],
+            alpha: 1.0,
+            age: now,
+            scale: 1.0,
+            offset: glam::Vec3::ZERO,
+            rotation: glam::Vec3::ZERO,
+            follows: true,
+            stopped: None,
+        }];
+        let mut meshes = crate::eff_mesh::MeshLibrary::default();
+        let (effects, _) = build_particle_batches(
+            &mut resolver, &|_| false, &|_| false, &|_| false, &mut meshes, QuadPlanes::default(), &pose(now),
+            &|back| pose(now - back), &live,
+        );
+        let spread = |points: &[glam::Vec3]| {
+            points.iter().flat_map(|a| points.iter().map(move |b| a.distance(*b))).fold(0.0f32, f32::max)
+        };
+        let library = crate::eff_shader_cache::ready(&file).and_then(|dir| crate::eff_gpu::ShaderLibrary::open(&dir).ok());
+        for draw in &effects.game_draws {
+            if let Some(library) = &library {
+                let reflection = library.stage(draw.emitter.shader_index, crate::eff_gpu::VERTEX).map(|s| &s.reflection);
+                println!(
+                    "      variation {} reads birth matrices: {:?}  follow byte {}  flags2 {:#x}",
+                    draw.emitter.shader_index,
+                    reflection.map(|r| r.input("sysEmtMat0Attr").is_some()),
+                    draw.emitter.stored[0x753],
+                    u32::from_le_bytes(draw.emitter.block[0x54..0x58].try_into().unwrap()),
+                );
+            }
+            let points: Vec<glam::Vec3> = draw
+                .spawns
+                .iter()
+                .enumerate()
+                .map(|(i, s)| draw.births.get(i).unwrap_or(&draw.dynamic.matrix).transform_point3(s.position))
+                .collect();
+            println!("game  {:>3} particles  spread {:6.2}  births {}", points.len(), spread(&points), draw.births.len());
+        }
+        for batch in &effects.batches {
+            let points: Vec<glam::Vec3> = batch.instances.iter().map(|i| glam::Vec3::from_array(i.position)).collect();
+            println!("batch {:>3} particles  spread {:6.2}  (texture {})", points.len(), spread(&points), batch.texture.index);
+        }
+    }
+
+    /// Per follow type, how many emitters of a file use a vertex shader that reads the particles' birth matrices
+    /// (sysEmtMat0Attr). `VISIONARY_FOLLOW_FILES` = ';'-separated .eff paths.
+    #[test]
+    fn which_shaders_carry_the_birth_matrix() {
+        let Ok(files) = std::env::var("VISIONARY_FOLLOW_FILES") else { return };
+        for path in files.split(';').map(PathBuf::from) {
+            let mut resolver = EffectResolver::default();
+            resolver.set_search_path(Some(path.clone()), Vec::new(), None);
+            let eff = std::fs::read(&path).unwrap();
+            let dir = crate::eff_shader_cache::cache_dir(&path, &eff);
+            if !dir.join("wgsl").join("index.json").exists() {
+                crate::eff_shader_cache::dump_variations(&eff, &dir).unwrap();
+            }
+            let reads = |v: u32| {
+                std::fs::read_to_string(dir.join(format!("v{v:04}_s0.reflect.json")))
+                    .map(|s| s.contains("sysEmtMat0Attr"))
+                    .unwrap_or(false)
+            };
+            let loaded = resolver.loaded(&path).expect("loads");
+            let mut counts: std::collections::BTreeMap<(u8, bool), usize> = Default::default();
+            for set in loaded.game.iter() {
+                for game in set.iter().flatten() {
+                    *counts.entry((game.stored[0x753], reads(game.shader_index))).or_default() += 1;
+                }
+            }
+            println!("{}", path.display());
+            for ((follow, reads), n) in counts {
+                println!("  follow_type {follow}  shader reads birth matrix {reads:5}  {n} emitters");
+            }
+        }
+    }
+
     /// A script's aim must reach the particles. This is how an effect points along a punch
     /// rather than sitting at whatever angle its emitter happens to carry.
     #[test]
