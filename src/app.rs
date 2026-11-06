@@ -3179,6 +3179,7 @@ pub struct VisionaryApp {
     effect_pick_available_only: bool,
     /// Viewport visibility (view only: nothing here reaches the script or the export).
     /// Particles of every effect.
+    ui_theme: crate::theme::Theme,
     hide_effects: bool,
     /// The blue spawn markers and their names.
     hide_effect_markers: bool,
@@ -3443,8 +3444,9 @@ impl FrameProfiler {
 
 impl VisionaryApp {
     pub fn new(cc: &eframe::CreationContext) -> Self {
-        // Set dark theme with visible text
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // The saved UI theme (Windows > Theme)
+        let ui_theme = crate::theme::Theme::load();
+        ui_theme.apply(&cc.egui_ctx);
         // Install image loaders — this also ensures font atlas is properly initialized
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
@@ -3597,6 +3599,7 @@ impl VisionaryApp {
             effect_pick_search: String::new(),
             effect_pick_open: false,
             effect_pick_available_only: true,
+            ui_theme,
             hide_effects: load_config_flag("viewport_hide_effects"),
             hide_effect_markers: load_config_flag("viewport_hide_effect_markers"),
             hide_hitboxes: load_config_flag("viewport_hide_hitboxes"),
@@ -34424,6 +34427,16 @@ impl eframe::App for VisionaryApp {
                         );
                     ui.checkbox(&mut self.credits.open, "Credits")
                         .on_hover_text("The people who helped make Visionary possible");
+                    ui.separator();
+                    ui.menu_button("Theme", |ui| {
+                        for theme in crate::theme::Theme::ALL {
+                            if ui.radio(self.ui_theme == theme, theme.name()).clicked() {
+                                self.ui_theme = theme;
+                                theme.apply(ui.ctx());
+                                theme.save();
+                            }
+                        }
+                    });
                 });
 
                 egui::containers::menu::MenuButton::new("Project")
