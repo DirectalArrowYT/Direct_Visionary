@@ -3023,6 +3023,9 @@ pub struct VisionaryApp {
     /// Game frames advanced by playback since startup, for the measured playback rate.
     playback_frames: u32,
     fps_meter: FpsMeter,
+    /// Play the move's sound_ script calls during playback (off by default).
+    sound_enabled: bool,
+    sound_player: crate::sound_bank::SoundPlayer,
     // Background move list loading
     /// Background move-list result: the moves, plus names a `motion_list.yml` spelled out
     /// (merged into the label table so custom motions and their scripts resolve by name).
@@ -3509,6 +3512,8 @@ impl VisionaryApp {
             playback_speed: 1.0,
             playback_frames: 0,
             fps_meter: FpsMeter::default(),
+            sound_enabled: load_config_flag("timeline_sound"),
+            sound_player: crate::sound_bank::SoundPlayer::default(),
             move_list_receiver: None,
             pending_project_move_selection: None,
             acmd_receiver: None,
@@ -10650,6 +10655,7 @@ impl VisionaryApp {
         // overlap the event list it was derived from — the hurtbox section's reason exactly.
         let mut edit: Option<(usize, ExcuteStmt)> = None;
         let mut structural: Option<StructuralAction> = None;
+        let mut audition: Option<String> = None;
 
         for event in &self.state.sounds {
             let active = event.frame == self.state.current_frame;
@@ -10669,6 +10675,11 @@ impl VisionaryApp {
                         };
                         ui.colored_label(color, if active { "◆" } else { "◇" });
                         ui.label(format!("[{}] {}", event.frame, event.call.func));
+                        if !event.call.func.starts_with("STOP")
+                            && ui.small_button("▶").on_hover_text("Play this sound").clicked()
+                        {
+                            audition = event.call.sounds.first().cloned();
+                        }
 
                         let mut call = event.call.clone();
                         let mut changed = false;
@@ -10732,6 +10743,13 @@ impl VisionaryApp {
             }
         });
 
+        if let Some(label) = audition {
+            self.sync_sound_context();
+            self.state.status = match self.sound_player.play(&label) {
+                Ok(tone) => format!("Playing {tone}"),
+                Err(e) => format!("Sound: {e}"),
+            };
+        }
         if let Some((site, replacement)) = edit {
             if let Some(stmt) = self.state.sound_script.sound_stmt_mut(site) {
                 *stmt = replacement;
@@ -30446,6 +30464,34 @@ If you step every basis for a                          type and NONE of them mat
         idx
     }
 
+    /// Point the sound player at the selected costume's banks (mod roots before the dump).
+    fn sync_sound_context(&mut self) {
+        let mut roots = self.all_roots();
+        roots.reverse();
+        let slot = format!("c{:02}", self.selected_costume_slot);
+        self.sound_player.set_context(&roots, Some(slot));
+    }
+
+    /// Play every sound_ script call that fires on one of `frames`.
+    fn play_sounds_on(&mut self, frames: &[u32]) {
+        let labels: Vec<String> = self
+            .state
+            .sounds
+            .iter()
+            .filter(|e| frames.contains(&e.frame) && e.call.func.starts_with("PLAY_"))
+            .filter_map(|e| e.call.sounds.first().cloned())
+            .collect();
+        if labels.is_empty() {
+            return;
+        }
+        self.sync_sound_context();
+        for label in labels {
+            if let Err(e) = self.sound_player.play(&label) {
+                eprintln!("[sound] {e}");
+            }
+        }
+    }
+
     /// The timeline multi-selection for the open move, with stale indices dropped.
     fn timeline_multi_current(&mut self) -> Vec<TimelineSelection> {
         if self.timeline_multi_move != self.current_move_key() {
@@ -32265,6 +32311,9 @@ If you step every basis for a                          type and NONE of them mat
             let play_label = if self.state.playing { "Pause" } else { "Play" };
             if ui.button(play_label).clicked() {
                 self.state.playing = !self.state.playing;
+                if self.state.playing && self.sound_enabled {
+                    self.play_sounds_on(&[current]);
+                }
             }
             if ui.button("Start").clicked() {
                 self.state.current_frame = FIRST_GAME_FRAME;
@@ -32288,6 +32337,17 @@ If you step every basis for a                          type and NONE of them mat
                 // egui only redraws on input while paused, so a rate there means nothing.
                 "fps: play to measure".to_string()
             };
+            if ui
+                .checkbox(&mut self.sound_enabled, "Sound")
+                .on_hover_text(
+                    "Play the move's sound_ script calls (PLAY_SE, voices, …) during playback, \
+                     from this costume's banks: the mod's se_/vc_<fighter>_cNN, then the \
+                     base banks and se_common.",
+                )
+                .changed()
+            {
+                save_config_flag("timeline_sound", self.sound_enabled);
+            }
             ui.weak(fps_text).on_hover_text(
                 "Editor redraws per second, and while playing, game frames advanced per second \
                  (60 = game speed at 1x). Redraws below 60 skip game frames to keep real time.",
@@ -33891,6 +33951,7 @@ impl eframe::App for VisionaryApp {
             if elapsed >= step {
                 // After a pause or a long hitch, resume from here instead of jumping ahead.
                 let frames = if elapsed > 0.25 { 1 } else { (elapsed / step) as u32 };
+                let mut advanced: Vec<u32> = Vec::with_capacity(frames as usize);
                 for _ in 0..frames {
                     if self.state.total_frames > 0 {
                         self.state.current_frame =
@@ -33903,8 +33964,12 @@ impl eframe::App for VisionaryApp {
                         // Keep the timeline moving even when only live capture data is loaded.
                         self.state.current_frame = (self.state.current_frame + 1).min(9999);
                     }
+                    advanced.push(self.state.current_frame);
                 }
                 self.playback_frames += frames;
+                if self.sound_enabled {
+                    self.play_sounds_on(&advanced);
+                }
                 self.last_frame_time = if elapsed > 0.25 {
                     now
                 } else {
@@ -33920,7 +33985,7 @@ impl eframe::App for VisionaryApp {
         // main-window editor, the Visual effects tab included.
         // Timeline copy / paste / multi-delete while no text field has focus. egui turns
         // Ctrl+C / Ctrl+V into Copy / Paste events rather than key presses.
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let (copy, paste, delete, escape) = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
@@ -37950,6 +38015,21 @@ fn run_export(
 }
 
 // ── Persistent config ─────────────────────────────────────────────────────────
+
+fn load_config_flag(key: &str) -> bool {
+    config_path(key)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|s| s.trim() == "1")
+}
+
+fn save_config_flag(key: &str, value: bool) {
+    if let Some(dest) = config_path(key) {
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(dest, if value { "1" } else { "0" });
+    }
+}
 
 fn save_timeline_filters(filters: TimelineFilters) {
     let Some(dest) = config_path("editor_timeline_filters") else {
