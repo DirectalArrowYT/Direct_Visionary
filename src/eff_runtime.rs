@@ -111,6 +111,11 @@ impl EffectResolver {
         }
     }
 
+    /// Every file the current costume's spawns resolve against, in search order.
+    pub fn search_files(&self) -> impl Iterator<Item = &Path> {
+        self.search.iter().map(|(_, path)| path.as_path())
+    }
+
     /// Donor effect files a mod transplants from, for one fighter, across every root.
     ///
     /// Layout is ARCropolis's: `effect/fighter/<name>/transplant/<donor>/ef_<donor>.eff`. The

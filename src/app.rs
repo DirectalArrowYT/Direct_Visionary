@@ -3160,6 +3160,9 @@ pub struct VisionaryApp {
     effect_pick_search: String,
     /// Whether the inline effect-name picker (next to the effect field) is expanded.
     effect_pick_open: bool,
+    /// Effect picker: list only names the current costume can resolve (its effect file,
+    /// transplant donors, ef_common).
+    effect_pick_available_only: bool,
     /// Selected donor: (file rel, entry name).
     transplant_sel: Option<(String, String)>,
     transplant_new_name: String,
@@ -3563,6 +3566,7 @@ impl VisionaryApp {
             transplant_search_touched: BTreeSet::new(),
             effect_pick_search: String::new(),
             effect_pick_open: false,
+            effect_pick_available_only: true,
             transplant_sel: None,
             transplant_new_name: String::new(),
             transplant_target: None,
@@ -16349,10 +16353,28 @@ If you step every basis for a                          type and NONE of them mat
         let mut mine: Vec<(String, String)> = Vec::new();
         let mut system: Vec<(String, String)> = Vec::new();
         let mut elsewhere: Vec<(String, Vec<(String, String)>)> = Vec::new();
+        // The files this costume's spawns actually resolve against. A pool entry is keyed by
+        // its path relative to a root (extra roots prefixed with their folder name), so it
+        // belongs to one of them when that file's full path ends with it.
+        let available: Vec<String> = self
+            .effect_resolver
+            .search_files()
+            .map(|p| p.to_string_lossy().replace('\\', "/").to_lowercase())
+            .collect();
+        let available_only = self.effect_pick_available_only && !available.is_empty();
+        let is_available = |rel: &str| {
+            let rel = rel.replace('\\', "/").to_lowercase();
+            available
+                .iter()
+                .any(|path| path.ends_with(&rel) && path[..path.len() - rel.len()].ends_with('/'))
+        };
         if let Some(pool) = self.effect_pool.as_ref() {
             for group in pool.search_grouped(&self.effect_pick_search) {
                 let mut rest: Vec<(String, String)> = Vec::new();
                 for (rel, name) in group.entries {
+                    if available_only && !is_available(&rel) {
+                        continue;
+                    }
                     match crate::effect_pool::origin_of(&rel, &name, fighter.as_deref()) {
                         crate::effect_pool::EffectOrigin::Fighter => mine.push((name, rel)),
                         crate::effect_pool::EffectOrigin::System => system.push((name, rel)),
@@ -16381,11 +16403,19 @@ If you step every basis for a                          type and NONE of them mat
                     self.effect_pick_open = false;
                 }
             });
-            ui.add(
-                egui::TextEdit::singleline(&mut self.effect_pick_search)
-                    .hint_text("filter by name")
-                    .desired_width(220.0),
-            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.effect_pick_search)
+                        .hint_text("filter by name")
+                        .desired_width(220.0),
+                );
+                ui.checkbox(&mut self.effect_pick_available_only, "Available only")
+                    .on_hover_text(format!(
+                        "Only effects this costume can spawn: the effect file it loads, any \
+                         transplant donors, and ef_common.\n{}",
+                        available.join("\n")
+                    ));
+            });
 
             let (done, total) = self
                 .effect_pool
