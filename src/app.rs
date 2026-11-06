@@ -2,7 +2,7 @@ use crate::data::{fighter_display_name, AppState, Hitbox, MoveEntry};
 use crate::renderer::{HitboxRenderState, ViewportCallback};
 use egui::{Color32, RichText, ScrollArea, Ui};
 /// Main egui application for Visionary.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 /// VISIONARY_PREVIEW_TEST_MOVE: frames waited for the selected move's effects (0 = not waiting)
 static PREVIEW_TEST_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -2491,6 +2491,17 @@ fn call_sig(c: &crate::data::EffectCall) -> (u64, u64, u64, u32, u64) {
 /// the source/effect IR and remains a visible, source-backed row, but it has no viewport marker
 /// because drawing one would fabricate geometry. A flip with a real alternate graphic is still a
 /// meaningful visual spawn and therefore is not treated as a sentinel.
+/// What a click in the effects list does to viewport visibility.
+#[derive(Clone, Copy)]
+enum EffectHideAction {
+    /// Flip this one call
+    Toggle,
+    /// Hide (true) or show (false) every call of this effect name
+    Name(bool),
+    /// Hide every other call of the move
+    Solo,
+}
+
 fn is_null_effect_sentinel(call: &crate::data::EffectCall) -> bool {
     call.control.is_none()
         && call.color.is_none()
@@ -3166,6 +3177,20 @@ pub struct VisionaryApp {
     /// Effect picker: list only names the current costume can resolve (its effect file,
     /// transplant donors, ef_common).
     effect_pick_available_only: bool,
+    /// Viewport visibility (view only: nothing here reaches the script or the export).
+    /// Particles of every effect.
+    hide_effects: bool,
+    /// The blue spawn markers and their names.
+    hide_effect_markers: bool,
+    /// Collision volumes (attacks, grabs, wind areas).
+    hide_hitboxes: bool,
+    /// Single effect calls hidden: (move, index, effect name). The name guards against the
+    /// index now naming a different call after the list was rebuilt.
+    hidden_effect_calls: HashSet<(String, usize, String)>,
+    /// Effect names hidden wherever they are spawned, in every move.
+    hidden_effect_names: BTreeSet<String>,
+    /// Where the viewport's visibility bar was drawn last frame: clicks there are not picks.
+    viewport_bar_rect: Option<egui::Rect>,
     /// Selected donor: (file rel, entry name).
     transplant_sel: Option<(String, String)>,
     transplant_new_name: String,
@@ -3572,6 +3597,12 @@ impl VisionaryApp {
             effect_pick_search: String::new(),
             effect_pick_open: false,
             effect_pick_available_only: true,
+            hide_effects: load_config_flag("viewport_hide_effects"),
+            hide_effect_markers: load_config_flag("viewport_hide_effect_markers"),
+            hide_hitboxes: load_config_flag("viewport_hide_hitboxes"),
+            hidden_effect_calls: HashSet::new(),
+            hidden_effect_names: BTreeSet::new(),
+            viewport_bar_rect: None,
             transplant_sel: None,
             transplant_new_name: String::new(),
             transplant_target: None,
@@ -4148,6 +4179,114 @@ impl VisionaryApp {
         }
     }
 
+    /// The viewport's show/hide toggles, over its bottom-left corner: effects, their markers,
+    /// hitboxes and hurtboxes, and how many single effects are hidden.
+    fn draw_viewport_visibility(&mut self, ui: &mut Ui, rect: egui::Rect) {
+        let hidden = self.hidden_effect_calls.len() + self.hidden_effect_names.len();
+        let area = egui::Area::new(ui.id().with("viewport_visibility"))
+            .order(egui::Order::Foreground)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(rect.left_bottom() + egui::vec2(8.0, -8.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).inner_margin(egui::Margin::symmetric(6, 3)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut toggle = |ui: &mut Ui, hide: &mut bool, label: &str, tip: &str, key: &str| {
+                            let mut show = !*hide;
+                            if ui.checkbox(&mut show, label).on_hover_text(tip).changed() {
+                                *hide = !show;
+                                save_config_flag(key, *hide);
+                            }
+                        };
+                        toggle(ui, &mut self.hide_effects, "Effects", "Draw the effects' particles.", "viewport_hide_effects");
+                        toggle(
+                            ui,
+                            &mut self.hide_effect_markers,
+                            "Markers",
+                            "The blue circles where effects are spawned, with their names.",
+                            "viewport_hide_effect_markers",
+                        );
+                        toggle(ui, &mut self.hide_hitboxes, "Hitboxes", "Attack, grab and wind volumes.", "viewport_hide_hitboxes");
+                        let available = self
+                            .hurtbox_volumes
+                            .iter()
+                            .any(|volume| matches!(volume.shape, crate::data::HurtboxShape::Capsule));
+                        if ui
+                            .add_enabled(available, egui::Checkbox::new(&mut self.show_hurtboxes, "Hurtboxes"))
+                            .on_hover_text("The fighter's hurtbox capsules (from its parameters).")
+                            .changed()
+                        {
+                            save_hurtbox_visibility(self.show_hurtboxes);
+                        }
+                        if hidden > 0 {
+                            ui.separator();
+                            let names: Vec<&str> = self.hidden_effect_names.iter().map(String::as_str).collect();
+                            let tip = if names.is_empty() {
+                                "Effect calls hidden one by one (Effects list, or H on the timeline).".to_string()
+                            } else {
+                                format!("Hidden everywhere by name: {}", names.join(", "))
+                            };
+                            ui.label(RichText::new(format!("{hidden} hidden")).small().color(Color32::GRAY))
+                                .on_hover_text(tip);
+                            if ui.small_button("Show all").clicked() {
+                                self.hidden_effect_calls.clear();
+                                self.hidden_effect_names.clear();
+                            }
+                        }
+                    });
+                });
+            });
+        self.viewport_bar_rect = Some(area.response.rect);
+    }
+
+    /// Whether effect call `i` of the current move is hidden in the viewport, on its own or by
+    /// its name. View only: a hidden call still plays in the game and is still exported.
+    fn effect_call_hidden(&self, i: usize) -> bool {
+        let Some(call) = self.state.effects.get(i) else { return false };
+        if self.hidden_effect_names.contains(&call.effect_name) {
+            return true;
+        }
+        self.current_move_key()
+            .is_some_and(|mv| self.hidden_effect_calls.contains(&(mv, i, call.effect_name.clone())))
+    }
+
+    /// Hide or show effect call `i` on its own.
+    fn set_effect_call_hidden(&mut self, i: usize, hidden: bool) {
+        let (Some(mv), Some(call)) = (self.current_move_key(), self.state.effects.get(i)) else { return };
+        let key = (mv, i, call.effect_name.clone());
+        if hidden {
+            self.hidden_effect_calls.insert(key);
+        } else {
+            self.hidden_effect_calls.remove(&key);
+            // shown on its own means shown: a name-wide hide would otherwise keep it hidden
+            self.hidden_effect_names.remove(&call.effect_name);
+        }
+    }
+
+    /// Hide or show every effect selected on the timeline (or the one selected in the list),
+    /// all together: shown when any of them is hidden, hidden otherwise.
+    fn toggle_hide_selected_effects(&mut self) {
+        let targets: Vec<usize> = self
+            .timeline_targets()
+            .into_iter()
+            .filter_map(|t| match t {
+                TimelineSelection::Effect(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let hide = !targets.iter().any(|&i| self.effect_call_hidden(i));
+        for &i in &targets {
+            self.set_effect_call_hidden(i, hide);
+        }
+        self.state.status = format!(
+            "{} {} effect call(s) in the viewport (H toggles).",
+            if hide { "Hid" } else { "Showing" },
+            targets.len()
+        );
+    }
+
     /// Effects the timeline has live on the current frame, as the runtime wants them:
     /// (effect name, bone, tint, alpha).
     ///
@@ -4156,10 +4295,16 @@ impl VisionaryApp {
     /// calls and the `null` placeholder are skipped — the placeholder exists precisely because
     /// the script spawns nothing there, so drawing something would invent a graphic.
     fn live_effect_spawns(&self) -> Vec<crate::eff_runtime::LiveEffect> {
+        if self.hide_effects {
+            return Vec::new();
+        }
         let frame = self.state.current_frame;
         self.state
             .effects
             .iter()
+            .enumerate()
+            .filter(|(i, _)| !self.effect_call_hidden(*i))
+            .map(|(_, call)| call)
             .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
             .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
             // EFFECT_OFF_KIND without fading ends it on its frame; with fading (and for one that does not follow, which
@@ -14754,9 +14899,36 @@ If you step every basis for a                          type and NONE of them mat
                     .id_salt("effects_list")
                     .max_height(180.0)
                     .show(ui, |ui| {
+                        // (call, what to do): applied after the list, which borrows the calls
+                        let mut hide_action: Option<(usize, EffectHideAction)> = None;
                         for &i in &visible {
+                            let hidden = self.effect_call_hidden(i);
+                            let name_hidden = self
+                                .hidden_effect_names
+                                .contains(&self.state.effects[i].effect_name);
                             let effect = &self.state.effects[i];
+                            let graphic = effect.color.is_none()
+                                && effect.control.is_none()
+                                && !is_null_effect_sentinel(effect);
                             ui.horizontal(|ui| {
+                                if graphic {
+                                    let eye = if hidden {
+                                        RichText::new("◌").color(Color32::DARK_GRAY)
+                                    } else {
+                                        RichText::new("👁").color(Color32::LIGHT_GRAY)
+                                    };
+                                    if ui
+                                        .add(egui::Button::new(eye).small().frame(false))
+                                        .on_hover_text(if hidden {
+                                            "Hidden in the viewport: click to show (still plays and exports)"
+                                        } else {
+                                            "Shown in the viewport: click to hide this call (right-click the name for more)"
+                                        })
+                                        .clicked()
+                                    {
+                                        hide_action = Some((i, EffectHideAction::Toggle));
+                                    }
+                                }
                                 // Orange = follows bone, yellow = one-shot, gray = disabled
                                 let dot_color = if is_null_effect_sentinel(effect) {
                                     egui::Color32::from_gray(125)
@@ -14775,9 +14947,33 @@ If you step every basis for a                          type and NONE of them mat
                                 let mut text = egui::RichText::new(display_name).monospace();
                                 if effect.disabled {
                                     text = text.strikethrough().color(egui::Color32::DARK_GRAY);
+                                } else if hidden {
+                                    text = text.italics().color(egui::Color32::GRAY);
                                 }
-                                if ui
-                                    .selectable_label(selected, text)
+                                let label = ui.selectable_label(selected, text);
+                                if graphic {
+                                    let name = effect.effect_name.clone();
+                                    label.context_menu(|ui| {
+                                        if ui.button(if hidden { "Show this call" } else { "Hide this call" }).clicked() {
+                                            hide_action = Some((i, EffectHideAction::Toggle));
+                                            ui.close();
+                                        }
+                                        let by_name = if name_hidden {
+                                            format!("Show every {name}")
+                                        } else {
+                                            format!("Hide every {name} (all moves)")
+                                        };
+                                        if ui.button(by_name).clicked() {
+                                            hide_action = Some((i, EffectHideAction::Name(!name_hidden)));
+                                            ui.close();
+                                        }
+                                        if ui.button("Show only this effect").on_hover_text("Hide every other effect call of this move").clicked() {
+                                            hide_action = Some((i, EffectHideAction::Solo));
+                                            ui.close();
+                                        }
+                                    });
+                                }
+                                if label
                                     .on_hover_text(if is_null_effect_sentinel(effect) {
                                         format!(
                                             "{} · explicit null no-op retained from source; it has no graphic to render",
@@ -14818,6 +15014,28 @@ If you step every basis for a                          type and NONE of them mat
                                     self.primary_tab = PrimaryEditorTab::Effects;
                                 }
                             });
+                        }
+                        match hide_action {
+                            Some((i, EffectHideAction::Toggle)) => {
+                                let hidden = self.effect_call_hidden(i);
+                                self.set_effect_call_hidden(i, !hidden);
+                            }
+                            Some((i, EffectHideAction::Name(hide))) => {
+                                let name = self.state.effects[i].effect_name.clone();
+                                if hide {
+                                    self.hidden_effect_names.insert(name);
+                                } else {
+                                    self.hidden_effect_names.remove(&name);
+                                    let mv = self.current_move_key();
+                                    self.hidden_effect_calls.retain(|(m, _, n)| !(Some(m) == mv.as_ref() && n == &name));
+                                }
+                            }
+                            Some((i, EffectHideAction::Solo)) => {
+                                for j in 0..self.state.effects.len() {
+                                    self.set_effect_call_hidden(j, j != i);
+                                }
+                            }
+                            None => {}
                         }
                     });
             }
@@ -14905,7 +15123,7 @@ If you step every basis for a                          type and NONE of them mat
                 let button = ui
                     .small_button(format!("⧉ Duplicate to frame {current}"))
                     .on_hover_text(
-                        "Copy the selected effect event to the playhead frame, keeping its                          length (Ctrl+D). Move the playhead first to place it elsewhere.",
+                        "Copy the selected effect event to the playhead frame, keeping its length (Ctrl+D). Move the playhead first to place it elsewhere.",
                     )
                     .clicked();
                 if button || shortcut {
@@ -30774,6 +30992,15 @@ If you step every basis for a                          type and NONE of them mat
         let is_added = i >= self.state.effects_pristine.len();
         if is_added {
             self.state.effects.remove(i);
+            // hidden calls after this one move down with it
+            self.hidden_effect_calls = std::mem::take(&mut self.hidden_effect_calls)
+                .into_iter()
+                .filter(|(m, at, _)| !(m == &mv && *at == i))
+                .map(|(m, at, name)| {
+                    let at = if m == mv && at > i { at - 1 } else { at };
+                    (m, at, name)
+                })
+                .collect();
             let edits = self.state.effect_call_edits.entry(mv.clone()).or_default();
             edits.retain(|e| e.index != i);
             for e in edits.iter_mut() {
@@ -34006,6 +34233,10 @@ impl eframe::App for VisionaryApp {
             if escape && self.timeline_drag.is_none() {
                 self.timeline_multi.clear();
             }
+            // H hides / shows the selected effect calls in the viewport (view only)
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+                self.toggle_hide_selected_effects();
+            }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
             self.timeline_drag = None;
@@ -35276,7 +35507,11 @@ impl eframe::App for VisionaryApp {
                             }
                         }
 
+                        let hide_hitboxes = self.hide_hitboxes;
                         for (hitbox_index, hb) in self.state.hitboxes.iter().enumerate() {
+                            if hide_hitboxes {
+                                break;
+                            }
                             // `ATTACK_ABS` has no volume and no bone to hang one on. Its size
                             // and offsets are zero because the call has no such arguments, so
                             // drawing it would put a dot at the model's origin that looks like
@@ -35479,9 +35714,10 @@ impl eframe::App for VisionaryApp {
                             i.pointer
                                 .interact_pos()
                                 .filter(|p| i.pointer.primary_clicked() && rect.contains(*p))
+                                .filter(|p| !self.viewport_bar_rect.is_some_and(|bar| bar.contains(*p)))
                         });
                         let mut best_hitbox_pick: Option<(usize, f32)> = None;
-                        if let Some(cp) = click_pos {
+                        if let Some(cp) = click_pos.filter(|_| !self.hide_hitboxes) {
                             for (i, hb) in self.state.hitboxes.iter().enumerate() {
                                 if hb.category == crate::data::CAT_ABS
                                     || hb.category == crate::data::CAT_ATTACK_FP
@@ -35612,6 +35848,9 @@ impl eframe::App for VisionaryApp {
                         // Effect spawn markers: blue circles at bone position + script offset.
                         let mut best_pick: Option<(usize, f32)> = None;
                         for (i, ec) in self.state.effects.iter().enumerate() {
+                            if self.hide_effect_markers || self.effect_call_hidden(i) {
+                                continue;
+                            }
                             if is_null_effect_sentinel(ec) {
                                 continue;
                             }
@@ -35698,6 +35937,7 @@ impl eframe::App for VisionaryApp {
                         }
                     }
                 }
+                self.draw_viewport_visibility(ui, rect);
             } else {
                 ui.painter()
                     .rect_filled(rect, 0.0, Color32::from_rgb(17, 17, 34));
