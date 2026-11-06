@@ -25,7 +25,7 @@ impl Drop for Shared {
         }
     }
 }
-#[skyline::from_offset(0x39c20c0)]
+#[skyline::from_offset(crate::slight::ver::o(0x39c20c0))]
 fn release_weak(control: usize);
 unsafe extern "C" fn release_native_weak(control: usize) {
     release_weak(control);
@@ -36,9 +36,9 @@ unsafe extern "C" fn release_native_weak(control: usize) {
 struct ResidentFile {
     index: u32,
 }
-#[skyline::from_offset(0x3540450)]
+#[skyline::from_offset(crate::slight::ver::o(0x3540450))]
 fn retain_file(filesystem: usize, index: u32);
-#[skyline::from_offset(0x3540560)]
+#[skyline::from_offset(crate::slight::ver::o(0x3540560))]
 fn release_file(filesystem: usize, index: u32);
 impl ResidentFile {
     unsafe fn pin(path: &str) -> Result<Self, String> {
@@ -48,7 +48,7 @@ impl ResidentFile {
             return Err(format!("model support file is not resident: {path}"));
         }
         retain_file(
-            *((text_base() + 0x5331f20) as *const usize),
+            *((text_base() + crate::slight::ver::o(0x5331f20)) as *const usize),
             state.filepath_index,
         );
         Ok(Self {
@@ -59,7 +59,7 @@ impl ResidentFile {
 impl Drop for ResidentFile {
     fn drop(&mut self) {
         unsafe {
-            release_file(*((text_base() + 0x5331f20) as *const usize), self.index);
+            release_file(*((text_base() + crate::slight::ver::o(0x5331f20)) as *const usize), self.index);
         }
     }
 }
@@ -72,13 +72,13 @@ struct MotionResource {
     folder: Option<u32>,
     support: Vec<ResidentFile>,
 }
-#[skyline::from_offset(0x496210)]
+#[skyline::from_offset(crate::slight::ver::o(0x496210))]
 fn unregister_motion(cache: usize, handle: *mut Shared) -> u32;
 impl Drop for MotionResource {
     fn drop(&mut self) {
         if self.cached && self.handle.valid() {
             unsafe {
-                let cache = *((text_base() + 0x52b7a30) as *const usize);
+                let cache = *((text_base() + crate::slight::ver::o(0x52b7a30)) as *const usize);
                 unregister_motion(cache, &mut self.handle);
             }
         }
@@ -109,13 +109,13 @@ unsafe fn fighter_model_path(host: *mut BattleObjectModuleAccessor) -> Option<St
 
 // Native render queue helpers used by ModelModule::start_module/end_module. Shared
 // ownership keeps a model alive but does not keep it registered after its owner retires.
-#[skyline::from_offset(0x3559220)]
+#[skyline::from_offset(crate::slight::ver::o(0x3559220))]
 fn register_render_model(handle: *const Shared);
-#[skyline::from_offset(0x35c22e0)]
+#[skyline::from_offset(crate::slight::ver::o(0x35c22e0))]
 fn create_render_model(handle: *mut Shared, path: *const u32, render_mode: u32);
-#[skyline::from_offset(0x35d6f40)]
+#[skyline::from_offset(crate::slight::ver::o(0x35d6f40))]
 fn create_mesh_visibility_buffer(model: usize);
-#[skyline::from_offset(0x3559340)]
+#[skyline::from_offset(crate::slight::ver::o(0x3559340))]
 fn unregister_render_model(handle: *const Shared);
 
 struct Pending {
@@ -186,7 +186,7 @@ unsafe fn validate(host: *mut BattleObjectModuleAccessor) -> Result<(), String> 
         (0x80, 0x40, 0x4a6110),   // PhysicsModule: detach old physics controllers
     ] {
         let m = module(host, field);
-        if m == 0 || *(m as *const usize) == 0 || method(m, slot) != text_base() + expected {
+        if m == 0 || *(m as *const usize) == 0 || method(m, slot) != text_base() + crate::slight::ver::o(expected) {
             return Err(format!("fighter resource binding is unsupported by this native module ({field:#x}/{slot:#x})"));
         }
     }
@@ -220,10 +220,10 @@ pub unsafe fn capture(
         return Err("carrier model resources are not ready".into());
     }
     let original_model = *((module(host, 0x78) + 0x10) as *const usize);
-    if method(original_model, 0x240) != text_base() + 0x35d4800
-        || method(original_model, 0x1b0) != text_base() + 0x35d44d0
-        || method(original_model, 0x188) != text_base() + 0x35d4300
-        || method(original_model, 0x180) != text_base() + 0x35d3fd0
+    if method(original_model, 0x240) != text_base() + crate::slight::ver::o(0x35d4800)
+        || method(original_model, 0x1b0) != text_base() + crate::slight::ver::o(0x35d44d0)
+        || method(original_model, 0x188) != text_base() + crate::slight::ver::o(0x35d4300)
+        || method(original_model, 0x180) != text_base() + crate::slight::ver::o(0x35d3fd0)
     {
         return Err("fighter render-model layout is unsupported".into());
     }
@@ -237,7 +237,7 @@ pub unsafe fn capture(
     let render_mode = *((original_model + 0x9c) as *const u32);
     let mut model = Shared::default();
     create_render_model(&mut model, &model_path, render_mode);
-    if !model.valid() || method(model.0.object, 0x180) != text_base() + 0x35d3fd0 {
+    if !model.valid() || method(model.0.object, 0x180) != text_base() + crate::slight::ver::o(0x35d3fd0) {
         return Err("carrier render-model visibility layout is unsupported".into());
     }
     // The regular render initializer only allocates this buffer when the model has
@@ -333,7 +333,7 @@ unsafe fn mesh_visibility(model: usize) -> Vec<(u64, bool)> {
 // override separately: otherwise an animation-visible, render-hidden alternate
 // becomes visible when a fresh render instance replaces the fighter's model.
 unsafe fn mesh_render_flags(model: usize) -> Vec<(u64, u8)> {
-    if method(model, 0x1b8) != text_base() + 0x35d44e0 {
+    if method(model, 0x1b8) != text_base() + crate::slight::ver::o(0x35d44e0) {
         return Vec::new();
     }
     let descriptor = *((model + 0x438) as *const usize);
@@ -381,7 +381,7 @@ unsafe fn mesh_render_flags(model: usize) -> Vec<(u64, u8)> {
 }
 
 // Native hash-based setter updates every submesh while preserving animation bits.
-#[skyline::from_offset(0x35e23b0)]
+#[skyline::from_offset(crate::slight::ver::o(0x35e23b0))]
 fn set_mesh_render_override(model: usize, name: u64, state: u8) -> bool;
 
 unsafe fn restore_mesh_visibility(model: usize, state: &[(u64, bool)]) {
@@ -393,10 +393,10 @@ unsafe fn restore_mesh_visibility(model: usize, state: &[(u64, bool)]) {
     }
 }
 
-#[skyline::from_offset(0x4e3960)]
+#[skyline::from_offset(crate::slight::ver::o(0x4e3960))]
 fn refresh_visibility_groups(module: usize, force: bool);
 
-#[skyline::from_offset(0x3680960)]
+#[skyline::from_offset(crate::slight::ver::o(0x3680960))]
 fn bind_visibility_output(controller: usize, config: *const [usize; 4]) -> bool;
 
 unsafe fn visibility_controller(motion: usize) -> usize {
@@ -433,9 +433,9 @@ pub unsafe fn trace_visibility(host: *mut BattleObjectModuleAccessor, phase: &st
     let model_module = module(host, 0x78);
     let model = *((model_module + 0x10) as *const usize);
     if model == 0
-        || method(model, 0x188) != text_base() + 0x35d4300
-        || method(model, 0x1b0) != text_base() + 0x35d44d0
-        || method(motion, 0x4f0) != text_base() + 0x49f650
+        || method(model, 0x188) != text_base() + crate::slight::ver::o(0x35d4300)
+        || method(model, 0x1b0) != text_base() + crate::slight::ver::o(0x35d44d0)
+        || method(motion, 0x4f0) != text_base() + crate::slight::ver::o(0x49f650)
     {
         return;
     }
@@ -728,7 +728,7 @@ unsafe fn bind(
     // This native config contains a weak model handle and an optional default-mask
     // array. The callee locks the handle; ownership stays in ModelModule.
     let visibility_output = visibility_controller(motion_module);
-    if visibility_output != 0 && *(visibility_output as *const usize) == text_base() + 0x5238590 {
+    if visibility_output != 0 && *(visibility_output as *const usize) == text_base() + crate::slight::ver::o(0x5238590) {
         let handle = &*((model_module + 0x10) as *const Shared);
         let names = mesh_visibility(handle.0.object);
         let defaults = super::fighter_visibility::remap_defaults(
@@ -946,7 +946,7 @@ unsafe fn helper_controller(motion: usize) -> usize {
         return 0;
     }
     let helper = *((controller + 0x68) as *const usize);
-    if helper != 0 && *(helper as *const usize) == text_base() + 0x5238fa8 {
+    if helper != 0 && *(helper as *const usize) == text_base() + crate::slight::ver::o(0x5238fa8) {
         helper
     } else {
         0
@@ -997,7 +997,7 @@ pub unsafe fn observe(host: *mut BattleObjectModuleAccessor) {
         masks.iter().filter(|(_, mask)| *mask == 1).count(),
         *((visibility + 0x48) as *const u32),
     ));
-    if helper != 0 && *(helper as *const usize) == text_base() + 0x5238fa8 {
+    if helper != 0 && *(helper as *const usize) == text_base() + crate::slight::ver::o(0x5238fa8) {
         let stage = *((helper + 0x58) as *const usize);
         joints.push_str(&format!(
             " helper_file={:#x} helper_data={:#x} helper_enabled={}",

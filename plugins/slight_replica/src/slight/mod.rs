@@ -15,3 +15,4 @@ pub mod sd_poll;
 pub mod slight_consts;
 pub mod smash_utils;
 pub mod systems;
+pub mod ver;

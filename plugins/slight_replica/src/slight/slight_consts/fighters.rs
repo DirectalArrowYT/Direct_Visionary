@@ -215,7 +215,7 @@ pub fn game_kind_name(kind: i32) -> Option<&'static str> {
         if text == 0 {
             return None;
         }
-        let ptr = *((text + FIGHTER_NAMES_OFFSET + 8 * kind as usize) as *const *const u8);
+        let ptr = *((text + crate::slight::ver::o(FIGHTER_NAMES_OFFSET) + 8 * kind as usize) as *const *const u8);
         if ptr.is_null() {
             return None;
         }

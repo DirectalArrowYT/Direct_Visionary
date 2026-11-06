@@ -94,7 +94,7 @@ fn filesystem_info() -> Option<&'static FilesystemInfo> {
     let text =
         unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as *const u8 };
     let fs_info_ptr = unsafe {
-        text.add(FILESYSTEM_INFO_PTR_OFFSET)
+        text.add(crate::slight::ver::o(FILESYSTEM_INFO_PTR_OFFSET))
             .cast::<*const FilesystemInfo>()
     };
     let fs_info = unsafe { *fs_info_ptr };
@@ -127,7 +127,7 @@ pub struct ResidentDirectoryState {
 /// The game's directory-release routine. It recursively decrements the directory tree's
 /// ownership counts and queues every group whose count reaches zero for the resource worker.
 /// Its callers hold `FilesystemInfo::_mutex`; this wrapper does the same.
-#[skyline::from_offset(0x353eff0)]
+#[skyline::from_offset(crate::slight::ver::o(0x353eff0))]
 fn queue_directory_release(filesystem: *mut FilesystemInfo, directory: *mut LoadedDirectory);
 
 pub fn loaded_arc() -> Option<&'static smash_arc::LoadedArc> {

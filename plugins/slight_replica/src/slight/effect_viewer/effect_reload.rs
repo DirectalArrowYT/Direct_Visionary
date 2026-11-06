@@ -37,10 +37,10 @@ struct EffectSlot {
     result: u32,
 }
 
-#[skyline::from_offset(LOAD_EFFECTS_OFFSET)]
+#[skyline::from_offset(crate::slight::ver::o(LOAD_EFFECTS_OFFSET))]
 fn load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32;
 
-#[skyline::from_offset(UNLOAD_EFFECTS_OFFSET)]
+#[skyline::from_offset(crate::slight::ver::o(UNLOAD_EFFECTS_OFFSET))]
 fn unload_effects(manager: *mut u64, handle: u32);
 
 /// The RESIDENCY WRAPPER (game fn @ ~0x3563470) — same signature as load_effects, but it first
@@ -58,7 +58,7 @@ fn load_effects_resident_entry() -> usize {
         return cached;
     }
     let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as usize };
-    let interior = text + 0x3563488;
+    let interior = text + crate::slight::ver::o(0x3563488);
     let mut found = 0usize;
     for i in 1..=10 {
         let a = interior - i * 4;
@@ -91,7 +91,7 @@ unsafe fn load_effects_resident(manager: *mut u64, handle: u32, idx: &u32) -> u3
 /// so the reads never complete → +0x540 stays zero → invisible. Driving the drain ourselves,
 /// on the object the game passes it, completes the load in-context. THIS is the render push.
 const DRAIN_QUEUE_OFFSET: usize = 0x354a120;
-#[skyline::from_offset(DRAIN_QUEUE_OFFSET)]
+#[skyline::from_offset(crate::slight::ver::o(DRAIN_QUEUE_OFFSET))]
 fn drain_load_queue(obj: *mut u64);
 
 /// The queue object the game passes to the drain — captured LIVE from the hook (it's a
@@ -102,7 +102,7 @@ static DRAIN_FIRES: AtomicU64 = AtomicU64::new(0);
 /// the a4d90 call it makes as the working reference to diff our co-load against.
 static GAME_ALUCARD_LOADING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-#[skyline::hook(offset = DRAIN_QUEUE_OFFSET)]
+#[skyline::hook(offset = crate::slight::ver::o(DRAIN_QUEUE_OFFSET))]
 fn hook_drain_queue(obj: *mut u64) {
     // Capture the queue object the game drains so our pump can drive the same one.
     DRAIN_QUEUE_OBJ.store(obj as usize, Ordering::Relaxed);
@@ -131,16 +131,16 @@ fn hook_drain_queue(obj: *mut u64) {
 
 // Effect-manager mutex (mgr+0x19498). load_effects/unload_effects lock this at entry; a hang
 // there = the mutex is already held (deadlock). Probe = can WE acquire it right now?
-#[skyline::from_offset(0x39c1410)]
+#[skyline::from_offset(crate::slight::ver::o(0x39c1410))]
 fn mgr_mutex_lock(mutex: *mut u8);
-#[skyline::from_offset(0x39c1420)]
+#[skyline::from_offset(crate::slight::ver::o(0x39c1420))]
 fn mgr_mutex_unlock(mutex: *mut u8);
 
 // The effect-set BUILDER (`func_0xa4d90`): destroys the old set object at mgr[+0x98][slot] and
 // rebuilds it from the effect-data section of the buffer. This is the GPU/resource-heavy part
 // of load_effects, WITHOUT its folder/res/name-table machinery — so calling it directly
 // isolates which half freezes mid-match.
-#[skyline::from_offset(0xa4d90)]
+#[skyline::from_offset(crate::slight::ver::o(0xa4d90))]
 fn build_effect_set(
     p1: u64,
     p2: *mut u8,
@@ -151,7 +151,7 @@ fn build_effect_set(
 ) -> u64;
 
 /// Observe emitter-set construction for the donor co-load diagnostics.
-#[skyline::hook(offset = 0xa4d90)]
+#[skyline::hook(offset = crate::slight::ver::o(0xa4d90))]
 fn hook_build_effect_set(
     p1: u64,
     p2: *mut u8,
@@ -191,14 +191,14 @@ fn hook_build_effect_set(
 /// buffer for GPU access in place — plugin heap isn't GPU-visible).
 /// The game's general allocator used by load_effects for kind-map nodes
 /// (`func_0x0392dce0(align, size)` — seen allocating the 0x20-byte name-map nodes).
-#[skyline::from_offset(0x392dce0)]
+#[skyline::from_offset(crate::slight::ver::o(0x392dce0))]
 fn game_malloc(align: u64, size: u64) -> *mut u8;
 
 /// The REAL kind resolver `req()` calls (FUN_02601110). Takes (effect_manager, kind_hash40),
 /// returns a pointer to the resolved entry (`slot_entry_table + entry_index*0x10`) or 0.
 /// Calling it directly is the ground truth for "is this kind registered + reachable" — unlike
 /// the get_last_handle heuristic, which only says whether an effect instance got created.
-#[skyline::from_offset(0x2601110)]
+#[skyline::from_offset(crate::slight::ver::o(0x2601110))]
 fn resolve_kind(manager: *mut u64, kind_hash: u64) -> *const u8;
 
 /// HOOK on the resolver: we can't safely call it ourselves (build t froze), but the game
@@ -222,7 +222,7 @@ fn resolve_kind(manager: *mut u64, kind_hash: u64) -> *const u8;
 /// texture processing for the freshly co-loaded eff actually runs.
 pub static TEX_FORCE_BUDGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-#[skyline::hook(offset = 0x93f10)]
+#[skyline::hook(offset = crate::slight::ver::o(0x93f10))]
 fn hook_tex_guard(param_1: *mut u8) -> bool {
     // Force DISABLED: overriding a running effect's state byte froze the game. Observe the
     // carrier only; reaching this hook proves the manager scheduled its texture-upload pass.
@@ -245,7 +245,7 @@ fn hook_tex_guard(param_1: *mut u8) -> bool {
     result
 }
 
-#[skyline::hook(offset = 0x44de70)]
+#[skyline::hook(offset = crate::slight::ver::o(0x44de70))]
 fn hook_req_impl(param_1: *mut u64) {
     static CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if CAP.fetch_add(1, Ordering::Relaxed) < 3 {
@@ -295,7 +295,7 @@ fn hook_req_impl(param_1: *mut u64) {
     original!()(param_1)
 }
 
-#[skyline::hook(offset = 0x2601110)]
+#[skyline::hook(offset = crate::slight::ver::o(0x2601110))]
 fn hook_resolve_kind(mgr: *mut u64, kind_hash: u64) -> *const u8 {
     let r = original!()(mgr, kind_hash);
     use std::sync::atomic::AtomicBool;
@@ -666,7 +666,7 @@ const FILESYSTEM_INFO_OFFSET: usize = 0x5331f20;
 // load (marks the entry loading + enqueues its files to the res loading thread). This is
 // what makes an ABSENT donor character's effect folder resident — `add_to_res_service`
 // (0x3540450) only refcounts an already-loaded file, so it never triggered a read.
-#[skyline::from_offset(ENSURE_DIR_LOADED_OFFSET)]
+#[skyline::from_offset(crate::slight::ver::o(ENSURE_DIR_LOADED_OFFSET))]
 fn ensure_dir_loaded(filesystem: *mut u64, dir_index: u32) -> u64;
 
 /// OBSERVE the game's OWN dir-load requests. When something loads mid-match successfully (an
@@ -691,7 +691,7 @@ fn tlog(s: &str) {
     }
 }
 
-#[skyline::hook(offset = ENSURE_DIR_LOADED_OFFSET)]
+#[skyline::hook(offset = crate::slight::ver::o(ENSURE_DIR_LOADED_OFFSET))]
 fn hook_ensure_dir_loaded(filesystem: *mut u64, dir_index: u32) -> u64 {
     // SPAWN-CHAIN CAPTURE (build bc): when the alucard assist is summoned it requests its effect
     // dirs (4801 + deps) from the SPAWN context — a backtrace here reveals the object-spawn call
@@ -756,7 +756,7 @@ fn hook_ensure_dir_loaded(filesystem: *mut u64, dir_index: u32) -> u64 {
 /// (fix = satisfy readiness); if it NEVER fires, the set is never ticked (fix = activate the slot
 /// in the manager's per-frame list). Either way the handle `+0x18` values pinpoint the stuck
 /// resource. Observe-only — we call original and never alter the result.
-#[skyline::hook(offset = 0x987f0)]
+#[skyline::hook(offset = crate::slight::ver::o(0x987f0))]
 fn hook_readiness(
     out: *mut i32,
     set: *mut u64,
@@ -817,7 +817,7 @@ fn hook_readiness(
 
 fn filesystem() -> *mut u64 {
     let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as *mut u8 };
-    unsafe { *text.add(FILESYSTEM_INFO_OFFSET).cast::<*mut u64>() }
+    unsafe { *text.add(crate::slight::ver::o(FILESYSTEM_INFO_OFFSET)).cast::<*mut u64>() }
 }
 
 /// Request an effect FOLDER (by path hash) be made resident via the game's own directory
@@ -959,7 +959,7 @@ fn effect_manager() -> *mut u64 {
     // constructs the manager. Deref in two guarded steps — a combined `**` here crashed
     // the game at BOOT when reload ran with a manifest present.
     unsafe {
-        let holder = *text.add(EFFECT_MANAGER_OFFSET).cast::<*mut *mut u64>();
+        let holder = *text.add(crate::slight::ver::o(EFFECT_MANAGER_OFFSET)).cast::<*mut *mut u64>();
         if holder.is_null() {
             return std::ptr::null_mut();
         }
@@ -977,7 +977,7 @@ fn item_manager() -> *mut smash::app::ItemManager {
     let text = unsafe { skyline::hooks::getRegionAddress(skyline::hooks::Region::Text) as *mut u8 };
     unsafe {
         *text
-            .add(ITEM_MANAGER_OFFSET)
+            .add(crate::slight::ver::o(ITEM_MANAGER_OFFSET))
             .cast::<*mut smash::app::ItemManager>()
     }
 }
@@ -1044,7 +1044,7 @@ unsafe fn capture_backtrace() -> Vec<usize> {
     out
 }
 
-#[skyline::hook(offset = LOAD_EFFECTS_OFFSET)]
+#[skyline::hook(offset = crate::slight::ver::o(LOAD_EFFECTS_OFFSET))]
 fn hook_load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32 {
     LOAD_HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
     // This hook runs on the game's LOADING thread. Everything below that writes to the SD card
@@ -1139,7 +1139,7 @@ fn hook_load_effects(manager: *mut u64, handle: u32, search_index: &u32) -> u32 
     result
 }
 
-#[skyline::hook(offset = UNLOAD_EFFECTS_OFFSET)]
+#[skyline::hook(offset = crate::slight::ver::o(UNLOAD_EFFECTS_OFFSET))]
 fn hook_unload_effects(manager: *mut u64, handle: u32) {
     // A retiring carrier's effect unload is what a swap has to wait for. It removes every entry
     // name this folder registered, so a replacement created before it lands gets its own
@@ -1715,6 +1715,7 @@ pub fn dump_text_windows() {
         (0x3540450, 0x10, 0x140),                // fn_3540450 res-service refcount INCREMENT
         (0x3540560, 0x10, 0x120),                // res_dec DECREMENT
     ] {
+        let off = crate::slight::ver::o(off);
         let start = off.saturating_sub(before);
         let end = off + after;
         let _ = writeln!(f, "\n=== WINDOW off={off:#x} [{start:#x}..{end:#x}] ===");
@@ -2335,7 +2336,7 @@ unsafe fn asset_carrier_boma_for_id(
 // Native sv_item::create_item_init_normal_safe_pos (13.0.4). Its implementation
 // returns the ItemManager-created BattleObject pointer and does not attach HAVE.
 // Use 16-byte positions because the native wrapper loads a full vector register.
-#[skyline::from_offset(0x2284310)]
+#[skyline::from_offset(crate::slight::ver::o(0x2284310))]
 fn create_unheld_asset_item(
     kind: i32,
     variation: i32,
