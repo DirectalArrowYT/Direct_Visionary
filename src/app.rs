@@ -14783,6 +14783,27 @@ If you step every basis for a                          type and NONE of them mat
                 self.push_effect_rules();
             }
 
+            // Duplicate the selected event onto the playhead (Ctrl+D): the quickest way to
+            // reuse a spawn at another frame without retyping its bone, offset and scale.
+            let duplicate_source = self
+                .state
+                .selected_effect_call
+                .filter(|i| *i < self.state.effects.len());
+            if let Some(source) = duplicate_source {
+                let typing = ui.memory(|m| m.focused().is_some());
+                let shortcut = !typing
+                    && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D));
+                let button = ui
+                    .small_button(format!("⧉ Duplicate to frame {current}"))
+                    .on_hover_text(
+                        "Copy the selected effect event to the playhead frame, keeping its                          length (Ctrl+D). Move the playhead first to place it elsewhere.",
+                    )
+                    .clicked();
+                if button || shortcut {
+                    self.duplicate_effect_call(source, current);
+                }
+            }
+
             if ui.small_button("＋ Add effect call").clicked() {
                 self.pending_capture = None;
                 let call = crate::data::EffectCall {
@@ -30245,6 +30266,47 @@ If you step every basis for a                          type and NONE of them mat
         self.state
             .effect_call_full
             .insert(mv, self.state.effects.clone());
+    }
+
+    /// Add a copy of effect event `i` starting at `frame`, keeping its length, and select it.
+    fn duplicate_effect_call(&mut self, i: usize, frame: u32) {
+        let Some(mut call) = self.state.effects.get(i).cloned() else {
+            return;
+        };
+        self.pending_capture = None;
+        let start = call.active_start;
+        call.active_start = frame;
+        if call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME {
+            call.active_end = if frame >= start {
+                call.active_end.saturating_add(frame - start)
+            } else {
+                call.active_end.saturating_sub(start - frame)
+            }
+            .max(frame);
+        }
+        call.disabled = false;
+        // Unmodelled neighbour lines belong to the original's frame block, not to the copy.
+        call.leading.clear();
+        call.trailing.clear();
+        self.state.effects.push(call.clone());
+        let idx = self.state.effects.len() - 1;
+        if let Some(mv) = self.current_move_key() {
+            self.state
+                .effect_call_edits
+                .entry(mv.clone())
+                .or_default()
+                .push(crate::data::EffectCallEdit {
+                    index: idx,
+                    op: crate::data::EffectCallOp::Add(call.clone()),
+                    pristine: None,
+                });
+            self.state
+                .effect_call_full
+                .insert(mv, self.state.effects.clone());
+        }
+        self.state.selected_effect_call = Some(idx);
+        self.push_effect_rules();
+        self.state.status = format!("Duplicated {} to frame {frame}", call.effect_name);
     }
 
     /// Delete effect spawn `i` from the current move. An ADDED spawn is removed outright
