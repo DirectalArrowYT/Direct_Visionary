@@ -842,6 +842,48 @@ struct TimelineRow {
     color: Color32,
 }
 
+impl TimelineSelection {
+    /// Collision boxes and effect events own their frames directly; script commands are
+    /// re-derived from the parsed source and can't be dragged.
+    fn is_editable(&self) -> bool {
+        matches!(self, Self::Hitbox(_) | Self::Effect(_))
+    }
+}
+
+/// What a timeline bar drag changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimelineDragMode {
+    Move,
+    Start,
+    End,
+}
+
+/// One bar's frames when the drag began; every drag step is applied to these, so moving back
+/// and forth never accumulates rounding or clamping.
+#[derive(Debug, Clone)]
+struct TimelineDragItem {
+    selection: TimelineSelection,
+    start: u32,
+    /// The end as drawn (an open-ended follow effect draws to the last frame).
+    end: u32,
+    /// A follow effect that plays to the end of the move (no EFFECT_OFF_KIND).
+    open_ended: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TimelineDrag {
+    mode: TimelineDragMode,
+    anchor_frame: u32,
+    items: Vec<TimelineDragItem>,
+}
+
+/// A copied timeline item, kept independent of the move it came from so it pastes anywhere.
+#[derive(Debug, Clone)]
+enum TimelineClip {
+    Hitbox(Hitbox),
+    Effect(crate::data::EffectCall),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TimelineFilters {
     collisions: bool,
@@ -2945,6 +2987,13 @@ pub struct VisionaryApp {
     /// beside the others rather than a second panel competing for the same width.
     primary_tab: PrimaryEditorTab,
     timeline_filters: TimelineFilters,
+    /// Timeline multi-selection (Ctrl/Shift-click) and the move it belongs to; indices are
+    /// only meaningful for that move.
+    timeline_multi: Vec<TimelineSelection>,
+    timeline_multi_move: Option<String>,
+    timeline_drag: Option<TimelineDrag>,
+    /// Copied items with their frame offset from the earliest copied item.
+    timeline_clipboard: Vec<(u32, TimelineClip)>,
     /// The selected source command for the non-collision tabs.  The command site is stable for a
     /// source statement, including loop repetitions; the current frame still identifies which
     /// occurrence the user navigated to.
@@ -2969,6 +3018,11 @@ pub struct VisionaryApp {
     // Pending model load (set when fighter selected, consumed in update)
     pending_model_load: Option<PathBuf>,
     last_frame_time: std::time::Instant,
+    /// Playback speed multiplier (1 = the game's 60 frames per second).
+    playback_speed: f32,
+    /// Game frames advanced by playback since startup, for the measured playback rate.
+    playback_frames: u32,
+    fps_meter: FpsMeter,
     // Background move list loading
     /// Background move-list result: the moves, plus names a `motion_list.yml` spelled out
     /// (merged into the label table so custom motions and their scripts resolve by name).
@@ -3233,6 +3287,32 @@ pub struct FrameProfiler {
     current: Vec<(&'static str, f64)>,
 }
 
+/// Editor redraw rate and playback rate (game frames per second), averaged over half a second.
+#[derive(Default)]
+struct FpsMeter {
+    window_start: Option<std::time::Instant>,
+    redraws: u32,
+    playback_at_start: u32,
+    ui_fps: f32,
+    playback_fps: f32,
+}
+
+impl FpsMeter {
+    fn tick(&mut self, playback_frames: u32) {
+        let now = std::time::Instant::now();
+        let start = *self.window_start.get_or_insert(now);
+        self.redraws += 1;
+        let secs = now.duration_since(start).as_secs_f32();
+        if secs >= 0.5 {
+            self.ui_fps = self.redraws as f32 / secs;
+            self.playback_fps = playback_frames.wrapping_sub(self.playback_at_start) as f32 / secs;
+            self.window_start = Some(now);
+            self.redraws = 0;
+            self.playback_at_start = playback_frames;
+        }
+    }
+}
+
 /// A frame slower than this is a visible stutter rather than normal jitter, and gets its own
 /// immediate breakdown — sustained averages hide exactly the hitches users notice.
 const HITCH_MS: f64 = 12.0;
@@ -3407,6 +3487,10 @@ impl VisionaryApp {
             hurtbox_condition_edit_value: "0".into(),
             primary_tab: PrimaryEditorTab::Collisions,
             timeline_filters: load_timeline_filters(),
+            timeline_multi: Vec::new(),
+            timeline_multi_move: None,
+            timeline_drag: None,
+            timeline_clipboard: Vec::new(),
             selected_command: None,
             show_effect_advanced: false,
             edit_history: HashMap::new(),
@@ -3419,6 +3503,9 @@ impl VisionaryApp {
             current_skel_path: None,
             pending_model_load: None,
             last_frame_time: std::time::Instant::now(),
+            playback_speed: 1.0,
+            playback_frames: 0,
+            fps_meter: FpsMeter::default(),
             move_list_receiver: None,
             pending_project_move_selection: None,
             acmd_receiver: None,
@@ -17183,12 +17270,21 @@ If you step every basis for a                          type and NONE of them mat
     }
 
     fn begin_history_frame(&mut self) {
+        // A timeline drag spans many frames; keep the snapshot from before it started so the
+        // whole drag is one undo step.
+        if self.timeline_drag.is_some() && self.history_before_frame.is_some() {
+            return;
+        }
         self.history_before_frame = self.current_edit_snapshot();
     }
 
     fn finish_history_frame(&mut self) {
         if let Some(action) = self.pending_history_action.take() {
             self.apply_history_action(action);
+        }
+        if self.timeline_drag.is_some() {
+            self.history_suppress_frame = false;
+            return;
         }
         let Some((before_key, before)) = self.history_before_frame.take() else {
             self.history_suppress_frame = false;
@@ -30270,10 +30366,23 @@ If you step every basis for a                          type and NONE of them mat
 
     /// Add a copy of effect event `i` starting at `frame`, keeping its length, and select it.
     fn duplicate_effect_call(&mut self, i: usize, frame: u32) {
-        let Some(mut call) = self.state.effects.get(i).cloned() else {
+        let Some(call) = self.state.effects.get(i).cloned() else {
             return;
         };
+        let idx = self.add_effect_call_at(call, frame);
+        self.state.selected_effect_call = Some(idx);
+        self.push_effect_rules();
+        self.state.status = format!(
+            "Duplicated {} to frame {frame}",
+            self.state.effects[idx].effect_name
+        );
+    }
+
+    /// Append `call` as a new (added) effect event starting at `frame`, keeping its length.
+    /// Returns its index; the caller pushes the rules once it has added everything.
+    fn add_effect_call_at(&mut self, mut call: crate::data::EffectCall, frame: u32) -> usize {
         self.pending_capture = None;
+        let frame = frame.max(FIRST_GAME_FRAME);
         let start = call.active_start;
         call.active_start = frame;
         if call.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME {
@@ -30304,9 +30413,274 @@ If you step every basis for a                          type and NONE of them mat
                 .effect_call_full
                 .insert(mv, self.state.effects.clone());
         }
-        self.state.selected_effect_call = Some(idx);
-        self.push_effect_rules();
-        self.state.status = format!("Duplicated {} to frame {frame}", call.effect_name);
+        idx
+    }
+
+    /// The timeline multi-selection for the open move, with stale indices dropped.
+    fn timeline_multi_current(&mut self) -> Vec<TimelineSelection> {
+        if self.timeline_multi_move != self.current_move_key() {
+            self.timeline_multi.clear();
+            self.timeline_multi_move = self.current_move_key();
+        }
+        let (hitboxes, effects) = (self.state.hitboxes.len(), self.state.effects.len());
+        self.timeline_multi.retain(|sel| match sel {
+            TimelineSelection::Hitbox(i) => *i < hitboxes,
+            TimelineSelection::Effect(i) => *i < effects,
+            TimelineSelection::Command { .. } => false,
+        });
+        self.timeline_multi.clone()
+    }
+
+    fn set_timeline_multi(&mut self, items: Vec<TimelineSelection>) {
+        self.timeline_multi = items;
+        self.timeline_multi_move = self.current_move_key();
+    }
+
+    /// What the timeline's edit commands act on: the multi-selection, else the single
+    /// selected collision box or effect.
+    fn timeline_targets(&mut self) -> Vec<TimelineSelection> {
+        let multi = self.timeline_multi_current();
+        if !multi.is_empty() {
+            return multi;
+        }
+        if let Some(i) = self
+            .state
+            .selected_effect_call
+            .filter(|i| *i < self.state.effects.len())
+        {
+            return vec![TimelineSelection::Effect(i)];
+        }
+        if let Some(i) = self
+            .selected_hitbox
+            .filter(|i| *i < self.state.hitboxes.len())
+        {
+            return vec![TimelineSelection::Hitbox(i)];
+        }
+        Vec::new()
+    }
+
+    fn timeline_drag_item(&self, sel: &TimelineSelection, total: u32) -> Option<TimelineDragItem> {
+        match sel {
+            TimelineSelection::Hitbox(i) => self.state.hitboxes.get(*i).map(|hb| TimelineDragItem {
+                selection: sel.clone(),
+                start: hb.active_start,
+                end: hb.active_end.max(hb.active_start),
+                open_ended: false,
+            }),
+            TimelineSelection::Effect(i) => self.state.effects.get(*i).map(|ec| {
+                let open_ended =
+                    ec.follows_bone && ec.active_end == crate::data::OPEN_ENDED_EFFECT_FRAME;
+                TimelineDragItem {
+                    selection: sel.clone(),
+                    start: ec.active_start,
+                    end: if open_ended {
+                        total.max(ec.active_start)
+                    } else {
+                        ec.active_end.max(ec.active_start)
+                    },
+                    open_ended,
+                }
+            }),
+            TimelineSelection::Command { .. } => None,
+        }
+    }
+
+    fn begin_timeline_drag(
+        &mut self,
+        mode: TimelineDragMode,
+        anchor_frame: u32,
+        targets: &[TimelineSelection],
+        total: u32,
+    ) {
+        let items: Vec<TimelineDragItem> = targets
+            .iter()
+            .filter_map(|sel| self.timeline_drag_item(sel, total))
+            .collect();
+        if !items.is_empty() {
+            self.timeline_drag = Some(TimelineDrag {
+                mode,
+                anchor_frame,
+                items,
+            });
+        }
+    }
+
+    /// Re-apply the active drag for the pointer now at `frame`.
+    fn apply_timeline_drag(&mut self, frame: u32) {
+        let Some(drag) = self.timeline_drag.clone() else {
+            return;
+        };
+        let first = FIRST_GAME_FRAME as i64;
+        let mut delta = frame as i64 - drag.anchor_frame as i64;
+        if drag.mode == TimelineDragMode::Move {
+            // Move the group rigidly: the earliest bar stops at the first frame.
+            let min_start = drag.items.iter().map(|it| it.start).min().unwrap_or(1) as i64;
+            delta = delta.max(first - min_start);
+        }
+        let shift = |v: u32| (v as i64 + delta).max(first) as u32;
+        for item in &drag.items {
+            match &item.selection {
+                TimelineSelection::Hitbox(i) => {
+                    let Some(hb) = self.state.hitboxes.get_mut(*i) else {
+                        continue;
+                    };
+                    let (s, e) = match drag.mode {
+                        TimelineDragMode::Move => (shift(item.start), shift(item.end)),
+                        TimelineDragMode::Start => (shift(item.start).min(item.end), item.end),
+                        TimelineDragMode::End => (item.start, shift(item.end).max(item.start)),
+                    };
+                    hb.active_start = s;
+                    hb.active_end = e;
+                }
+                TimelineSelection::Effect(i) => {
+                    let Some(ec) = self.state.effects.get_mut(*i) else {
+                        continue;
+                    };
+                    let finite_follow = ec.follows_bone && !item.open_ended;
+                    match drag.mode {
+                        TimelineDragMode::Move => {
+                            ec.active_start = shift(item.start);
+                            if finite_follow {
+                                ec.active_end = shift(item.end);
+                            }
+                        }
+                        TimelineDragMode::Start => {
+                            ec.active_start = if finite_follow {
+                                shift(item.start).min(item.end)
+                            } else {
+                                shift(item.start)
+                            };
+                        }
+                        TimelineDragMode::End => {
+                            // Only a follow effect has an end of its own; dragging it makes
+                            // the end explicit (EFFECT_OFF_KIND).
+                            if ec.follows_bone {
+                                ec.active_end = shift(item.end).max(item.start);
+                            }
+                        }
+                    }
+                    ec.normalize_timing();
+                }
+                TimelineSelection::Command { .. } => {}
+            }
+        }
+    }
+
+    fn finish_timeline_drag(&mut self) {
+        let Some(drag) = self.timeline_drag.take() else {
+            return;
+        };
+        let mut effects_changed = false;
+        for item in &drag.items {
+            if let TimelineSelection::Effect(i) = item.selection {
+                let moved = self.state.effects.get(i).is_some_and(|ec| {
+                    ec.active_start != item.start
+                        || (!item.open_ended && ec.follows_bone && ec.active_end != item.end)
+                        || (item.open_ended && ec.active_end != crate::data::OPEN_ENDED_EFFECT_FRAME)
+                });
+                if moved {
+                    self.record_effect_call_edit(i);
+                    effects_changed = true;
+                }
+            }
+        }
+        if effects_changed {
+            self.push_effect_rules();
+        }
+    }
+
+    fn copy_timeline_selection(&mut self, ctx: &egui::Context) {
+        let targets = self.timeline_targets();
+        let mut clips: Vec<(u32, TimelineClip)> = targets
+            .iter()
+            .filter_map(|sel| match sel {
+                TimelineSelection::Hitbox(i) => self
+                    .state
+                    .hitboxes
+                    .get(*i)
+                    .map(|hb| (hb.active_start, TimelineClip::Hitbox(hb.clone()))),
+                TimelineSelection::Effect(i) => self
+                    .state
+                    .effects
+                    .get(*i)
+                    .map(|ec| (ec.active_start, TimelineClip::Effect(ec.clone()))),
+                TimelineSelection::Command { .. } => None,
+            })
+            .collect();
+        if clips.is_empty() {
+            return;
+        }
+        let first = clips.iter().map(|(f, _)| *f).min().unwrap_or(0);
+        for (f, _) in &mut clips {
+            *f -= first;
+        }
+        clips.sort_by_key(|(f, _)| *f);
+        let n = clips.len();
+        self.timeline_clipboard = clips;
+        // egui only reports Ctrl+V as a paste when the system clipboard holds text.
+        ctx.copy_text(format!("Visionary timeline: {n} item(s)"));
+        self.state.status = format!("Copied {n} timeline item(s). Ctrl+V pastes at the playhead.");
+    }
+
+    fn paste_timeline_clipboard(&mut self) {
+        if self.timeline_clipboard.is_empty() || self.current_move_key().is_none() {
+            return;
+        }
+        let at = self.state.current_frame.max(FIRST_GAME_FRAME);
+        let mut pasted = Vec::new();
+        let mut any_effect = false;
+        for (offset, clip) in self.timeline_clipboard.clone() {
+            let frame = at + offset;
+            match clip {
+                TimelineClip::Hitbox(mut hb) => {
+                    let len = hb.active_end.saturating_sub(hb.active_start);
+                    hb.active_start = frame;
+                    hb.active_end = frame + len;
+                    self.state.hitboxes.push(hb);
+                    pasted.push(TimelineSelection::Hitbox(self.state.hitboxes.len() - 1));
+                }
+                TimelineClip::Effect(call) => {
+                    let idx = self.add_effect_call_at(call, frame);
+                    pasted.push(TimelineSelection::Effect(idx));
+                    any_effect = true;
+                }
+            }
+        }
+        if any_effect {
+            self.push_effect_rules();
+        }
+        let n = pasted.len();
+        self.set_timeline_multi(pasted);
+        self.state.status = format!("Pasted {n} timeline item(s) at frame {at}.");
+    }
+
+    /// Delete every multi-selected item (effects through the normal remove path, so script
+    /// spawns become recorded removals).
+    fn delete_timeline_selection(&mut self) {
+        let targets = self.timeline_multi_current();
+        let mut hitboxes: Vec<usize> = Vec::new();
+        let mut effects: Vec<usize> = Vec::new();
+        for sel in &targets {
+            match sel {
+                TimelineSelection::Hitbox(i) => hitboxes.push(*i),
+                TimelineSelection::Effect(i) => effects.push(*i),
+                TimelineSelection::Command { .. } => {}
+            }
+        }
+        hitboxes.sort_unstable_by(|a, b| b.cmp(a));
+        effects.sort_unstable_by(|a, b| b.cmp(a));
+        for i in &hitboxes {
+            self.state.hitboxes.remove(*i);
+        }
+        for i in &effects {
+            self.delete_effect_call(*i);
+        }
+        if !hitboxes.is_empty() {
+            self.selected_hitbox = None;
+        }
+        self.state.selected_effect_call = None;
+        self.timeline_multi.clear();
+        self.state.status = format!("Deleted {} timeline item(s).", hitboxes.len() + effects.len());
     }
 
     /// Delete effect spawn `i` from the current move. An ADDED spawn is removed outright
@@ -31867,6 +32241,27 @@ If you step every basis for a                          type and NONE of them mat
                 self.state.playing = false;
             }
             ui.label(format!("Frame {current} / {total}"));
+            egui::ComboBox::from_id_salt("playback_speed")
+                .width(58.0)
+                .selected_text(format!("{}x", self.playback_speed))
+                .show_ui(ui, |ui| {
+                    for speed in [1.0, 0.5, 0.25, 0.1] {
+                        ui.selectable_value(&mut self.playback_speed, speed, format!("{speed}x"));
+                    }
+                })
+                .response
+                .on_hover_text("Playback speed. 1x is the game's 60 frames per second.");
+            let fps = &self.fps_meter;
+            let fps_text = if self.state.playing {
+                format!("{:.0} fps · playing {:.0}/s", fps.ui_fps, fps.playback_fps)
+            } else {
+                // egui only redraws on input while paused, so a rate there means nothing.
+                "fps: play to measure".to_string()
+            };
+            ui.weak(fps_text).on_hover_text(
+                "Editor redraws per second, and while playing, game frames advanced per second \
+                 (60 = game speed at 1x). Redraws below 60 skip game frames to keep real time.",
+            );
             ui.separator();
             for category in [
                 TimelineCategory::Collisions,
@@ -31961,6 +32356,8 @@ If you step every basis for a                          type and NONE of them mat
                         );
                     }
                 }
+                let multi = self.timeline_multi_current();
+                let mut bars: Vec<egui::Rect> = Vec::with_capacity(rows.len());
                 for (index, row) in rows.iter().enumerate() {
                     let y = rect.top() + 22.0 + index as f32 * row_height;
                     if index % 2 == 0 {
@@ -31987,7 +32384,7 @@ If you step every basis for a                          type and NONE of them mat
                         );
                     let start = frame_x(row.start.min(total));
                     let end = frame_end_x(row.end.max(row.start).min(total)).max(start + 3.0);
-                    let selected = match &row.selection {
+                    let selected = multi.contains(&row.selection) || match &row.selection {
                         TimelineSelection::Hitbox(i) => {
                             hitbox_is_selected(self.selected_hitbox, *i)
                         }
@@ -32003,6 +32400,7 @@ If you step every basis for a                          type and NONE of them mat
                         egui::pos2(start, y + 3.0),
                         egui::pos2(end.min(rect.right()), y + row_height - 3.0),
                     );
+                    bars.push(bar);
                     painter.rect_filled(
                         bar,
                         2.0,
@@ -32030,21 +32428,125 @@ If you step every basis for a                          type and NONE of them mat
                     ],
                     egui::Stroke::new(2.0, Color32::WHITE),
                 );
-                if response.dragged() || response.clicked() {
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let row_hit = if response.clicked() && pos.y >= rect.top() + 22.0 {
-                            let index = ((pos.y - rect.top() - 22.0) / row_height) as usize;
-                            rows.get(index).cloned()
+
+                let frame_at = |x: f32| {
+                    let fraction = ((x - grid_left) / grid_width).clamp(0.0, 1.0);
+                    timeline_frame_at_fraction(fraction, total)
+                };
+                // The editable bar under a point, and which part of it (edges resize).
+                let bar_hit = |pos: egui::Pos2| -> Option<(usize, TimelineDragMode)> {
+                    if pos.y < rect.top() + 22.0 || pos.x < grid_left {
+                        return None;
+                    }
+                    let index = ((pos.y - rect.top() - 22.0) / row_height) as usize;
+                    let row = rows.get(index)?;
+                    if !row.selection.is_editable() {
+                        return None;
+                    }
+                    let bar = bars.get(index)?.expand2(egui::vec2(3.0, 0.0));
+                    if !bar.contains(pos) {
+                        return None;
+                    }
+                    const EDGE: f32 = 5.0;
+                    let mode = if bar.width() < 3.0 * EDGE {
+                        TimelineDragMode::Move
+                    } else if pos.x <= bar.left() + EDGE {
+                        TimelineDragMode::Start
+                    } else if pos.x >= bar.right() - EDGE {
+                        TimelineDragMode::End
+                    } else {
+                        TimelineDragMode::Move
+                    };
+                    Some((index, mode))
+                };
+
+                // Cursor feedback.
+                let hover_mode = self
+                    .timeline_drag
+                    .as_ref()
+                    .map(|d| d.mode)
+                    .or_else(|| response.hover_pos().and_then(bar_hit).map(|(_, m)| m));
+                match hover_mode {
+                    Some(TimelineDragMode::Start | TimelineDragMode::End) => {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal)
+                    }
+                    Some(TimelineDragMode::Move) => ui.ctx().set_cursor_icon(
+                        if self.timeline_drag.is_some() {
+                            egui::CursorIcon::Grabbing
                         } else {
-                            None
-                        };
-                        if let Some(row) = row_hit {
+                            egui::CursorIcon::Grab
+                        },
+                    ),
+                    None => {}
+                }
+
+                let modifiers = ui.input(|i| i.modifiers);
+                if response.drag_started() {
+                    let origin = ui.input(|i| i.pointer.press_origin());
+                    if let Some((index, mode)) = origin.and_then(bar_hit) {
+                        let row = rows[index].clone();
+                        let mut targets = self.timeline_multi_current();
+                        if !targets.contains(&row.selection) {
+                            // Dragging an unselected bar drags just that bar.
+                            let keep = self.state.current_frame;
                             self.select_timeline_row(&row);
-                        } else {
-                            let fraction = ((pos.x - grid_left) / grid_width).clamp(0.0, 1.0);
-                            self.state.current_frame = timeline_frame_at_fraction(fraction, total);
-                            self.state.playing = false;
+                            self.state.current_frame = keep;
+                            targets = vec![row.selection.clone()];
+                            self.set_timeline_multi(Vec::new());
                         }
+                        let anchor = frame_at(origin.map(|p| p.x).unwrap_or(grid_left));
+                        self.begin_timeline_drag(mode, anchor, &targets, total);
+                        self.state.playing = false;
+                    }
+                }
+                if self.timeline_drag.is_some() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        self.apply_timeline_drag(frame_at(pos.x));
+                    }
+                    if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
+                        self.finish_timeline_drag();
+                    }
+                } else if response.clicked() {
+                    let pos = response.interact_pointer_pos();
+                    let row_hit = pos.filter(|p| p.y >= rect.top() + 22.0).and_then(|p| {
+                        let index = ((p.y - rect.top() - 22.0) / row_height) as usize;
+                        rows.get(index).cloned()
+                    });
+                    match row_hit {
+                        Some(row)
+                            if (modifiers.command || modifiers.shift)
+                                && row.selection.is_editable() =>
+                        {
+                            // Ctrl/Shift-click builds a multi-selection (Ctrl toggles).
+                            let mut multi = self.timeline_targets();
+                            if let Some(at) = multi.iter().position(|s| *s == row.selection) {
+                                if modifiers.command {
+                                    multi.remove(at);
+                                }
+                            } else {
+                                multi.push(row.selection.clone());
+                            }
+                            let n = multi.len();
+                            self.set_timeline_multi(multi);
+                            self.state.status = format!(
+                                "{n} timeline item(s) selected — drag to move, Ctrl+C/Ctrl+V, Delete."
+                            );
+                        }
+                        Some(row) => {
+                            self.set_timeline_multi(Vec::new());
+                            self.select_timeline_row(&row);
+                        }
+                        None => {
+                            if let Some(pos) = pos {
+                                self.state.current_frame = frame_at(pos.x);
+                                self.state.playing = false;
+                            }
+                        }
+                    }
+                } else if response.dragged() {
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        self.state.current_frame = frame_at(pos.x);
+                        self.state.playing = false;
                     }
                 }
             });
@@ -33349,33 +33851,69 @@ impl eframe::App for VisionaryApp {
             }
         }
 
-        // Advance playback
+        // Advance playback at the game's 60 frames per second (times the chosen speed). A slow
+        // editor frame advances several game frames so playback keeps real time, like the game.
+        self.fps_meter.tick(self.playback_frames);
         if self.state.playing {
             let now = std::time::Instant::now();
+            let step = 1.0 / (60.0 * self.playback_speed.clamp(0.05, 4.0));
             let elapsed = now.duration_since(self.last_frame_time).as_secs_f32();
-            if elapsed >= 1.0 / 24.0 {
-                if self.state.total_frames > 0 {
-                    self.state.current_frame =
-                        if self.state.current_frame >= self.state.total_frames {
-                            FIRST_GAME_FRAME
-                        } else {
-                            self.state.current_frame + 1
-                        };
-                } else {
-                    // Keep the timeline moving even when only live capture data is loaded.
-                    self.state.current_frame = (self.state.current_frame + 1).min(9999);
+            if elapsed >= step {
+                // After a pause or a long hitch, resume from here instead of jumping ahead.
+                let frames = if elapsed > 0.25 { 1 } else { (elapsed / step) as u32 };
+                for _ in 0..frames {
+                    if self.state.total_frames > 0 {
+                        self.state.current_frame =
+                            if self.state.current_frame >= self.state.total_frames {
+                                FIRST_GAME_FRAME
+                            } else {
+                                self.state.current_frame + 1
+                            };
+                    } else {
+                        // Keep the timeline moving even when only live capture data is loaded.
+                        self.state.current_frame = (self.state.current_frame + 1).min(9999);
+                    }
                 }
-                self.last_frame_time = now;
+                self.playback_frames += frames;
+                self.last_frame_time = if elapsed > 0.25 {
+                    now
+                } else {
+                    self.last_frame_time + std::time::Duration::from_secs_f32(frames as f32 * step)
+                };
             }
-            // Keep character animation and timeline overlays moving during playback.
-            let next = std::time::Duration::from_secs_f32((1.0 / 24.0 - elapsed).max(0.0));
-            ctx.request_repaint_after(next);
+            let since = now.duration_since(self.last_frame_time).as_secs_f32();
+            ctx.request_repaint_after(std::time::Duration::from_secs_f32((step - since).max(0.0)));
         }
 
         // History is captured only after background loading and playback have settled.  This
         // keeps navigation and animation state out of the edit stack while still covering every
         // main-window editor, the Visual effects tab included.
+        // Timeline copy / paste / multi-delete while no text field has focus. egui turns
+        // Ctrl+C / Ctrl+V into Copy / Paste events rather than key presses.
+        if !ctx.wants_keyboard_input() {
+            let (copy, paste, delete, escape) = ctx.input(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Paste(_))),
+                    i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if copy {
+                self.copy_timeline_selection(&ctx);
+            }
+            if paste {
+                self.paste_timeline_clipboard();
+            }
+            if delete && self.timeline_multi_current().len() > 1 {
+                self.delete_timeline_selection();
+            }
+            if escape && self.timeline_drag.is_none() {
+                self.timeline_multi.clear();
+            }
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
+            self.timeline_drag = None;
             self.apply_history_action(HistoryAction::Undo);
             self.history_suppress_frame = true;
         } else if ctx.input_mut(|i| {
