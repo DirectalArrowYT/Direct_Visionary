@@ -8346,6 +8346,48 @@ impl VisionaryApp {
                 action = doc.ui(ui, *kind, name, labels, current_frame, total_frames);
             }
         });
+        match &action {
+            Action::Added(hash, name) => {
+                let template = self.state.selected_move.clone();
+                self.move_list.push(MoveEntry {
+                    name: name.clone(),
+                    hash: *hash,
+                    frame_count: 0,
+                    anim_path: template.and_then(|m| m.anim_path),
+                });
+                self.move_list.sort_by(|a, b| a.name.cmp(&b.name));
+                self.state.status = format!("Added motion {name} (unsaved).");
+            }
+            Action::Removed(hash) => {
+                self.move_list.retain(|m| m.hash != *hash);
+                self.state.status = "Removed the motion from the list (unsaved).".into();
+            }
+            Action::Reverted => {
+                // Kinds added since the last save go; removed ones come back.
+                if let Some(doc) = &self.motion_list_doc {
+                    let kinds: std::collections::HashSet<u64> =
+                        doc.list.list.keys().map(|k| k.0).collect();
+                    self.move_list.retain(|m| kinds.contains(&m.hash));
+                    let have: std::collections::HashSet<u64> =
+                        self.move_list.iter().map(|m| m.hash).collect();
+                    for kind in kinds.difference(&have) {
+                        self.move_list.push(MoveEntry {
+                            name: self
+                                .state
+                                .labels
+                                .get(kind)
+                                .cloned()
+                                .unwrap_or_else(|| format!("{kind:#018x}")),
+                            hash: *kind,
+                            frame_count: 0,
+                            anim_path: None,
+                        });
+                    }
+                    self.move_list.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+            }
+            _ => {}
+        }
         if let Action::Save = action {
             if let Some(doc) = self.motion_list_doc.as_mut() {
                 match doc.save(&self.state.labels) {

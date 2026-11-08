@@ -92,12 +92,20 @@ pub struct Doc {
     /// Text being typed into a hash field, by field id, until it is committed.
     bufs: HashMap<String, String>,
     bufs_kind: u64,
+    /// The name typed into "Add motion".
+    new_kind: String,
     pub status: Option<String>,
 }
 
 pub enum Action {
     None,
     Save,
+    /// A new motion kind was added (a copy of the open one): its hash and name.
+    Added(u64, String),
+    /// The open motion kind was removed from the list.
+    Removed(u64),
+    /// Every unsaved change was thrown away (kinds may have come back or gone).
+    Reverted,
 }
 
 impl Doc {
@@ -109,6 +117,7 @@ impl Doc {
             targets,
             bufs: HashMap::new(),
             bufs_kind: 0,
+            new_kind: String::new(),
             status: None,
         }
     }
@@ -184,6 +193,7 @@ impl Doc {
                     .clicked()
                 {
                     self.revert();
+                    action = Action::Reverted;
                 }
             });
         });
@@ -203,6 +213,9 @@ impl Doc {
             ui.label("This motion is not in the list.");
             return action;
         };
+        let new_kind = &mut self.new_kind;
+        let mut add = None;
+        let mut remove_kind = false;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             egui::Grid::new("mlist_main").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -274,7 +287,52 @@ impl Doc {
             if ui.small_button("+ Script").clicked() {
                 m.scripts.push(Hash40(0));
             }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(RichText::new("Motion kinds").strong());
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(new_kind)
+                        .hint_text("new motion kind, e.g. special_n_custom")
+                        .desired_width(220.0),
+                );
+                let parsed = parse_hash(new_kind).filter(|(h, _)| h.0 != 0);
+                let ok = parsed.is_some();
+                if ui
+                    .add_enabled(ok, egui::Button::new("Add as copy"))
+                    .on_hover_text("Add a motion kind with this one's script, flags, animations and scripts")
+                    .clicked()
+                {
+                    add = parsed;
+                }
+            });
+            if ui
+                .button("Remove this motion")
+                .on_hover_text("Drop this motion kind from the list (Revert brings it back until you save)")
+                .clicked()
+            {
+                remove_kind = true;
+            }
         });
+
+        if let Some((hash, name)) = add {
+            if self.list.list.contains_key(&hash) {
+                self.status = Some(format!("{} is already in the list.", new_kind_label(hash, &name)));
+            } else {
+                let copy = self.list.list[&Hash40(kind)].clone();
+                self.list.list.insert(hash, copy);
+                let name = name.unwrap_or_else(|| format!("0x{:010x}", hash.0));
+                labels.insert(hash.0, name.clone());
+                self.new_kind.clear();
+                self.status = Some(format!("Added {name}."));
+                action = Action::Added(hash.0, name);
+            }
+        } else if remove_kind {
+            self.list.list.shift_remove(&Hash40(kind));
+            self.status = Some(format!("Removed {name}."));
+            action = Action::Removed(kind);
+        }
         action
     }
 
@@ -370,6 +428,10 @@ fn hash_field(
         // The value changed underneath (revert, undo): follow it.
         *buf = shown;
     }
+}
+
+fn new_kind_label(h: Hash40, name: &Option<String>) -> String {
+    name.clone().unwrap_or_else(|| format!("0x{:010x}", h.0))
 }
 
 fn display(h: Hash40, labels: &HashMap<u64, String>) -> String {
