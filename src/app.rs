@@ -3050,6 +3050,9 @@ pub struct VisionaryApp {
     /// The costume's motion list, editable in the Motion List window.
     motion_list_doc: Option<crate::motion_list_editor::Doc>,
     show_motion_list: bool,
+    /// Lists with unsaved edits, by the file they were read from, set aside on a fighter
+    /// switch and handed back when that list is loaded again.
+    motion_list_stash: std::collections::HashMap<PathBuf, crate::motion_list_editor::Doc>,
     /// A project resume first loads its fighter, then waits for that fighter's asynchronous
     /// motion list before selecting the saved move through the normal interactive path.
     pending_project_move_selection: Option<(String, String)>,
@@ -3552,6 +3555,7 @@ impl VisionaryApp {
             move_list_receiver: None,
             motion_list_doc: None,
             show_motion_list: false,
+            motion_list_stash: std::collections::HashMap::new(),
             pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
@@ -4115,7 +4119,7 @@ impl VisionaryApp {
             self.state.playing = false;
             self.move_list.clear();
             self.move_list_receiver = None;
-            self.motion_list_doc = None;
+            self.stash_motion_list();
             self.acmd_receiver = None;
             self.pending_project_script = None;
             self.pending_capture = None;
@@ -4707,7 +4711,7 @@ impl VisionaryApp {
         self.state.total_frames = 0;
         self.move_list.clear();
         self.move_list_receiver = None;
-        self.motion_list_doc = None;
+        self.stash_motion_list();
         // A fetch from the previous fighter may complete after this selection. Drop it rather
         // than letting its script repopulate the new fighter's per-move state and hurtbox events.
         self.acmd_receiver = None;
@@ -8295,6 +8299,18 @@ impl VisionaryApp {
             });
         self.capture_debug_kind = selected;
         self.show_capture_debug = open;
+    }
+
+    /// Set the current motion list aside if it has unsaved edits, so a fighter switch
+    /// doesn't throw them away.
+    fn stash_motion_list(&mut self) {
+        if let Some(doc) = self.motion_list_doc.take() {
+            if doc.dirty() {
+                if let Some(from) = doc.read_from.clone() {
+                    self.motion_list_stash.insert(from, doc);
+                }
+            }
+        }
     }
 
     /// The Motion List window: the open move's entry in the costume's motion list.
@@ -34326,6 +34342,44 @@ If you step every basis for a                          type and NONE of them mat
                 }
             }
 
+            // Motion list: intangibility window as a band along the bottom, cancel frame
+            // (FAF) as a green line.
+            if let Some(extra) = self
+                .state
+                .selected_move
+                .as_ref()
+                .and_then(|m| self.motion_list_doc.as_ref()?.extra(m.hash))
+            {
+                if extra.xlu_start > 0 && extra.xlu_end >= extra.xlu_start {
+                    let band = egui::Rect::from_min_max(
+                        egui::pos2(frame_start_to_x(extra.xlu_start as u32), rect.bottom() - 5.0),
+                        egui::pos2(frame_end_to_x(extra.xlu_end as u32), rect.bottom()),
+                    );
+                    painter.rect_filled(
+                        band,
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(120, 170, 255, 170),
+                    );
+                }
+                if extra.cancel_frame > 0 {
+                    let cx = frame_start_to_x(extra.cancel_frame as u32);
+                    let green = egui::Color32::from_rgb(90, 220, 120);
+                    painter.extend(egui::Shape::dashed_line(
+                        &[egui::pos2(cx, rect.top()), egui::pos2(cx, rect.bottom())],
+                        egui::Stroke::new(1.5, green),
+                        4.0,
+                        3.0,
+                    ));
+                    painter.text(
+                        egui::pos2(cx + 3.0, rect.top() + 10.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("FAF {}", extra.cancel_frame),
+                        egui::FontId::monospace(9.0),
+                        green,
+                    );
+                }
+            }
+
             // Playhead
             let px = frame_start_to_x(current);
             painter.line_segment(
@@ -34465,7 +34519,15 @@ impl eframe::App for VisionaryApp {
         if let Some(rx) = &self.move_list_receiver {
             if let Ok((moves, yml_labels, doc)) = rx.try_recv() {
                 let count = moves.len();
-                self.motion_list_doc = doc;
+                self.motion_list_doc = doc.map(|doc| {
+                    match doc.read_from.as_ref().and_then(|p| self.motion_list_stash.remove(p)) {
+                        Some(mut kept) => {
+                            kept.status = Some("Unsaved edits from earlier are still here.".into());
+                            kept
+                        }
+                        None => doc,
+                    }
+                });
                 self.state.labels.extend(yml_labels);
                 if let Some(kind) = self.current_fighter_kind() {
                     self.capture_motion_names.extend(

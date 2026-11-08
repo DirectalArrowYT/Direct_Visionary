@@ -113,6 +113,11 @@ impl Doc {
         }
     }
 
+    /// The extra block (cancel frame, intangibility) of motion `kind`, as edited.
+    pub fn extra(&self, kind: u64) -> Option<&Extra> {
+        self.list.list.get(&Hash40(kind))?.extra.as_ref()
+    }
+
     pub fn dirty(&self) -> bool {
         self.list.motion_path != self.saved.motion_path || self.list.list != self.saved.list
     }
