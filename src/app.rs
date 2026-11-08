@@ -3040,8 +3040,16 @@ pub struct VisionaryApp {
     // Background move list loading
     /// Background move-list result: the moves, plus names a `motion_list.yml` spelled out
     /// (merged into the label table so custom motions and their scripts resolve by name).
-    move_list_receiver:
-        Option<std::sync::mpsc::Receiver<(Vec<MoveEntry>, std::collections::HashMap<u64, String>)>>,
+    move_list_receiver: Option<
+        std::sync::mpsc::Receiver<(
+            Vec<MoveEntry>,
+            std::collections::HashMap<u64, String>,
+            Option<crate::motion_list_editor::Doc>,
+        )>,
+    >,
+    /// The costume's motion list, editable in the Motion List window.
+    motion_list_doc: Option<crate::motion_list_editor::Doc>,
+    show_motion_list: bool,
     /// A project resume first loads its fighter, then waits for that fighter's asynchronous
     /// motion list before selecting the saved move through the normal interactive path.
     pending_project_move_selection: Option<(String, String)>,
@@ -3542,6 +3550,8 @@ impl VisionaryApp {
             sound_enabled: load_config_flag("timeline_sound"),
             sound_player: crate::sound_bank::SoundPlayer::default(),
             move_list_receiver: None,
+            motion_list_doc: None,
+            show_motion_list: false,
             pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
@@ -4105,6 +4115,7 @@ impl VisionaryApp {
             self.state.playing = false;
             self.move_list.clear();
             self.move_list_receiver = None;
+            self.motion_list_doc = None;
             self.acmd_receiver = None;
             self.pending_project_script = None;
             self.pending_capture = None;
@@ -4513,6 +4524,9 @@ impl VisionaryApp {
         ui.checkbox(&mut self.show_acmd_src, "ACMD Source").on_hover_text(
             "Read and edit ACMD scripts from your own smashline project, instead of the online archive of vanilla scripts",
         );
+        ui.checkbox(&mut self.show_motion_list, "Motion List").on_hover_text(
+            "Edit the open move's motion_list entry: flags, blend frames, cancel frame, intangibility, animations and scripts",
+        );
         ui.checkbox(&mut self.show_workspace, "Project Files").on_hover_text(
             "Where every edit lives: what Visionary models vs the manual romfs overlay for models, animations, and other unsupported files",
         );
@@ -4693,6 +4707,7 @@ impl VisionaryApp {
         self.state.total_frames = 0;
         self.move_list.clear();
         self.move_list_receiver = None;
+        self.motion_list_doc = None;
         // A fetch from the previous fighter may complete after this selection. Drop it rather
         // than letting its script repopulate the new fighter's per-move state and hurtbox events.
         self.acmd_receiver = None;
@@ -4897,17 +4912,38 @@ impl VisionaryApp {
             .as_deref()
             .and_then(crate::motion_yml::find);
         let base_slot = resolved_motion_slot;
+        // Edits to a list from the game dump are saved into the project overlay, and read back
+        // from there so they survive a reload.
+        let dump_root = self.state.data_root.clone();
+        let overlay_bin = self.project_path.as_deref().and_then(Path::parent).map(|ws| {
+            crate::project_hub::workspace_romfs(ws)
+                .join("fighter")
+                .join(&name)
+                .join("motion")
+                .join("body")
+                .join(format!("c{slot:02}"))
+                .join("motion_list.bin")
+        });
         let (tx, rx) = std::sync::mpsc::channel();
         self.move_list_receiver = Some(rx);
         self.state.status = "Loading moves...".to_string();
 
         std::thread::spawn(move || {
-            let motion_list_path = motion_dir.join("motion_list.bin");
+            let mut motion_list_path = motion_dir.join("motion_list.bin");
+            let from_dump = dump_root.as_deref().is_some_and(|root| {
+                let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                canon(&motion_dir).starts_with(canon(root))
+            });
+            if let Some(overlay) = overlay_bin.as_ref().filter(|p| from_dump && p.is_file()) {
+                println!("[moves] motion list from the project overlay: {}", overlay.display());
+                motion_list_path = overlay.clone();
+            }
             // `motion_list.yml` names a modded character's own motions. Its names are always
             // merged into the labels; it is the list itself only when there is no `.bin`
             // (the binary is what the game reads, so it stays authoritative when both exist).
-            let yml = crate::motion_yml::find(&motion_dir).or(project_yml).and_then(|path| {
-                match crate::motion_yml::load(&path) {
+            let yml_path = crate::motion_yml::find(&motion_dir).or(project_yml);
+            let yml = yml_path.as_deref().and_then(|path| {
+                match crate::motion_yml::load(path) {
                     Ok(yml) => {
                         println!(
                             "[moves] {}: {} motions, {} names",
@@ -4923,11 +4959,16 @@ impl VisionaryApp {
                     }
                 }
             });
-            let (mlist, mut yml_labels) = match (motion_lib::open(&motion_list_path), yml) {
-                (Ok(mlist), yml) => (mlist, yml.map(|y| y.labels).unwrap_or_default()),
-                (Err(_), Some(yml)) => (yml.list, yml.labels),
-                (Err(_), None) => return,
-            };
+            let (mlist, mut yml_labels, bin_path) =
+                match (motion_lib::open(&motion_list_path), yml) {
+                    (Ok(mlist), yml) => (
+                        mlist,
+                        yml.map(|y| y.labels).unwrap_or_default(),
+                        Some(motion_list_path.clone()),
+                    ),
+                    (Err(_), Some(yml)) => (yml.list, yml.labels, None),
+                    (Err(_), None) => return,
+                };
             for (hash, label) in &yml_labels {
                 labels.insert(*hash, label.clone());
             }
@@ -5027,7 +5068,18 @@ impl VisionaryApp {
                 .collect();
 
             moves.sort_by(|a, b| a.name.cmp(&b.name));
-            let _ = tx.send((moves, yml_labels));
+            let loaded = crate::motion_list_editor::Loaded {
+                list: mlist,
+                bin: bin_path,
+                yml: yml_path,
+            };
+            let targets = crate::motion_list_editor::Targets::decide(
+                &loaded,
+                dump_root.as_deref(),
+                overlay_bin,
+            );
+            let doc = crate::motion_list_editor::Doc::new(loaded, targets);
+            let _ = tx.send((moves, yml_labels, Some(doc)));
         });
     }
 
@@ -8243,6 +8295,73 @@ impl VisionaryApp {
             });
         self.capture_debug_kind = selected;
         self.show_capture_debug = open;
+    }
+
+    /// The Motion List window: the open move's entry in the costume's motion list.
+    fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
+        use crate::motion_list_editor::Action;
+        let mut open = self.show_motion_list;
+        let saved = self.window_geometry.get("motion_list").copied();
+        let mut window = egui::Window::new("Motion List")
+            .open(&mut open)
+            .resizable(true)
+            .default_size(saved.map_or([440.0, 560.0], |g| [g.w, g.h]));
+        if let Some(g) = saved {
+            window = window.default_pos([g.x, g.y]);
+        }
+        let selected = self
+            .state
+            .selected_move
+            .as_ref()
+            .map(|m| (m.hash, m.name.clone()));
+        let current_frame = self.state.current_frame;
+        let total_frames = self.state.total_frames;
+        let doc = &mut self.motion_list_doc;
+        let labels = &mut self.state.labels;
+        let mut action = Action::None;
+        let response = window.show(ctx, |ui| match (doc.as_mut(), &selected) {
+            (None, _) => {
+                ui.label("No motion list is loaded for this fighter.");
+            }
+            (Some(_), None) => {
+                ui.label("Select a move to edit its motion list entry.");
+            }
+            (Some(doc), Some((kind, name))) => {
+                action = doc.ui(ui, *kind, name, labels, current_frame, total_frames);
+            }
+        });
+        if let Action::Save = action {
+            if let Some(doc) = self.motion_list_doc.as_mut() {
+                match doc.save(&self.state.labels) {
+                    Ok(paths) => {
+                        let msg = format!(
+                            "Saved {}",
+                            paths
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        doc.status = Some(msg.clone());
+                        self.state.status = msg;
+                    }
+                    Err(e) => doc.status = Some(format!("Save failed: {e}")),
+                }
+            }
+        }
+        if let Some(response) = response {
+            let rect = response.response.rect;
+            self.remember_geometry(
+                "motion_list",
+                WindowGeometry {
+                    x: rect.min.x,
+                    y: rect.min.y,
+                    w: rect.width(),
+                    h: rect.height(),
+                },
+            );
+        }
+        self.show_motion_list = open;
     }
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
@@ -34344,8 +34463,9 @@ impl eframe::App for VisionaryApp {
         }
         // Poll background move list loader
         if let Some(rx) = &self.move_list_receiver {
-            if let Ok((moves, yml_labels)) = rx.try_recv() {
+            if let Ok((moves, yml_labels, doc)) = rx.try_recv() {
                 let count = moves.len();
+                self.motion_list_doc = doc;
                 self.state.labels.extend(yml_labels);
                 if let Some(kind) = self.current_fighter_kind() {
                     self.capture_motion_names.extend(
@@ -34570,6 +34690,12 @@ impl eframe::App for VisionaryApp {
             let t = self.perf.start();
             self.draw_acmd_source_window(&ctx);
             self.perf.end("acmd_source_window", t);
+        }
+
+        if self.show_motion_list {
+            let t = self.perf.start();
+            self.draw_motion_list_window(&ctx);
+            self.perf.end("motion_list_window", t);
         }
 
         if self.show_capture_debug {

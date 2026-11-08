@@ -95,6 +95,93 @@ pub fn parse(text: &str) -> Result<MotionYml, String> {
     Ok(MotionYml { list, labels })
 }
 
+/// The YAML for `list`, in the layout `parse` reads and yamlist writes: every field spelled out,
+/// names where `labels` knows them (and they hash back to the same value), `0x…` otherwise.
+/// Motions keep their order. Comments of a hand-written file are not kept.
+pub fn write(list: &MList, labels: &HashMap<u64, String>) -> String {
+    use std::fmt::Write as _;
+    let name = |h: Hash40| -> String {
+        match labels.get(&h.0) {
+            Some(n) if hash40::hash40(n) == h && plain(n) => n.clone(),
+            _ => format!("0x{:010x}", h.0),
+        }
+    };
+    let mut out = String::new();
+    let _ = writeln!(out, "motion_path: {}", name(list.motion_path));
+    let _ = writeln!(out, "list:");
+    for (kind, m) in &list.list {
+        let _ = writeln!(out, "  {}:", name(*kind));
+        let _ = writeln!(out, "    game_script: {}", name(m.game_script));
+        let _ = writeln!(out, "    flags:");
+        for (field, on) in flag_fields(&m.flags) {
+            let _ = writeln!(out, "      {field}: {on}");
+        }
+        let _ = writeln!(out, "    blend_frames: {}", m.blend_frames);
+        if m.animations.is_empty() {
+            let _ = writeln!(out, "    animations: []");
+        } else {
+            let _ = writeln!(out, "    animations:");
+            for a in &m.animations {
+                let _ = writeln!(out, "    - name: {}", name(a.name));
+                let _ = writeln!(out, "      unk: {}", a.unk);
+            }
+        }
+        if m.scripts.is_empty() {
+            let _ = writeln!(out, "    scripts: []");
+        } else {
+            let _ = writeln!(out, "    scripts:");
+            for s in &m.scripts {
+                let _ = writeln!(out, "    - {}", name(*s));
+            }
+        }
+        match &m.extra {
+            None => {
+                let _ = writeln!(out, "    extra: null");
+            }
+            Some(e) => {
+                let _ = writeln!(out, "    extra:");
+                let _ = writeln!(out, "      xlu_start: {}", e.xlu_start);
+                let _ = writeln!(out, "      xlu_end: {}", e.xlu_end);
+                let _ = writeln!(out, "      cancel_frame: {}", e.cancel_frame);
+                let _ = writeln!(out, "      no_stop_intp: {}", e.no_stop_intp);
+            }
+        }
+    }
+    out
+}
+
+/// A name YAML reads back as the same string without quotes.
+fn plain(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with("0x")
+        && !name.starts_with("0X")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | '-'))
+        && !name.chars().all(|c| c.is_ascii_digit())
+        && !matches!(name, "true" | "false" | "null" | "yes" | "no" | "on" | "off" | "y" | "n" | "~")
+}
+
+/// The flag fields in bit order, with their YAML names.
+pub fn flag_fields(f: &motion_lib::mlist::Flags) -> [(&'static str, bool); 14] {
+    [
+        ("turn", f.turn),
+        ("loop", f.r#loop),
+        ("move", f.r#move),
+        ("fix_trans", f.fix_trans),
+        ("fix_rot", f.fix_rot),
+        ("fix_scale", f.fix_scale),
+        ("unk_40", f.unk_40),
+        ("unk_80", f.unk_80),
+        ("unk_100", f.unk_100),
+        ("unk_200", f.unk_200),
+        ("unk_400", f.unk_400),
+        ("unk_800", f.unk_800),
+        ("unk_1000", f.unk_1000),
+        ("unk_2000", f.unk_2000),
+    ]
+}
+
 /// A hash40 field: `0x…` hex stays a hash, anything else is a name (hashed and remembered).
 fn hash(value: &Value, labels: &mut HashMap<u64, String>) -> Option<Hash40> {
     let text = match value {
@@ -177,5 +264,36 @@ list:
             "effect_wait"
         );
         assert!(!parsed.labels.contains_key(&0x0123456789));
+    }
+
+    #[test]
+    fn write_round_trips() {
+        let mut parsed = parse(SAMPLE).unwrap();
+        let wait = parsed.list.list.get_mut(&hash40::hash40("wait")).unwrap();
+        wait.flags.turn = true;
+        wait.flags.unk_2000 = true;
+        wait.extra = Some(motion_lib::mlist::Extra {
+            xlu_start: 3,
+            xlu_end: 9,
+            cancel_frame: 27,
+            no_stop_intp: true,
+        });
+        // a label that doesn't hash back, and one YAML would read as something else
+        parsed.labels.insert(hash40::hash40("game_wait").0, "not_it".into());
+        parsed.labels.insert(hash40::hash40("true").0, "true".into());
+        let mut list = parsed.list.clone();
+        list.list.insert(hash40::hash40("true"), Motion::default());
+        let text = write(&list, &parsed.labels);
+        assert!(text.contains("game_script: 0x"), "{text}");
+        assert!(text.contains("  special_n_custom:\n"), "{text}");
+        let again = parse(&text).unwrap();
+        assert_eq!(again.list.motion_path, list.motion_path);
+        assert_eq!(
+            again.list.list.keys().collect::<Vec<_>>(),
+            list.list.keys().collect::<Vec<_>>()
+        );
+        for (k, m) in &list.list {
+            assert_eq!(&again.list.list[k], m, "{k:?}");
+        }
     }
 }

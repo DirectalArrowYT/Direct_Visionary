@@ -32,6 +32,7 @@ mod mod_export;
 mod mod_import;
 mod mod_project;
 mod motion_guess;
+mod motion_list_editor;
 mod sound_bank;
 mod motion_yml;
 mod move_kinds;
