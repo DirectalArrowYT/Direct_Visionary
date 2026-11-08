@@ -95,6 +95,18 @@ pub struct Doc {
     /// The name typed into "Add motion".
     new_kind: String,
     pub status: Option<String>,
+    /// Lists before each finished edit, newest last; and the ones undone, for redo.
+    undo: Vec<MList>,
+    redo: Vec<MList>,
+    /// The list as it was when the edit in progress (a drag, a held click) began.
+    pending: Option<MList>,
+}
+
+/// How many edits Undo can step back through.
+const UNDO_DEPTH: usize = 100;
+
+fn same(a: &MList, b: &MList) -> bool {
+    a.motion_path == b.motion_path && a.list == b.list
 }
 
 pub enum Action {
@@ -104,8 +116,11 @@ pub enum Action {
     Added(u64, String),
     /// The open motion kind was removed from the list.
     Removed(u64),
-    /// Every unsaved change was thrown away (kinds may have come back or gone).
+    /// The list changed wholesale (Revert, Undo, Redo): kinds may have come back or gone.
     Reverted,
+    /// The Undo / Redo buttons (handled inside `ui`, never returned from it).
+    Undo,
+    Redo,
 }
 
 impl Doc {
@@ -119,6 +134,9 @@ impl Doc {
             bufs_kind: 0,
             new_kind: String::new(),
             status: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            pending: None,
         }
     }
 
@@ -128,7 +146,50 @@ impl Doc {
     }
 
     pub fn dirty(&self) -> bool {
-        self.list.motion_path != self.saved.motion_path || self.list.list != self.saved.list
+        !same(&self.list, &self.saved)
+    }
+
+    /// Close an edit still in progress so it can be undone.
+    fn settle(&mut self) {
+        if let Some(before) = self.pending.take() {
+            if !same(&before, &self.list) {
+                self.undo.push(before);
+                if self.undo.len() > UNDO_DEPTH {
+                    self.undo.remove(0);
+                }
+                self.redo.clear();
+            }
+        }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty() || self.pending.as_ref().is_some_and(|p| !same(p, &self.list))
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Step back one edit. False when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        self.settle();
+        let Some(prev) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(std::mem::replace(&mut self.list, prev));
+        self.bufs.clear();
+        true
+    }
+
+    /// Re-apply the last undone edit. False when there is nothing to redo.
+    pub fn redo(&mut self) -> bool {
+        self.settle();
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(std::mem::replace(&mut self.list, next));
+        self.bufs.clear();
+        true
     }
 
     /// Write every target. On success the written list becomes the saved state.
@@ -158,8 +219,43 @@ impl Doc {
         self.bufs.clear();
     }
 
-    /// The window body for motion `kind` (`name` is its display name).
+    /// The window body for motion `kind` (`name` is its display name). Every change made in it
+    /// becomes one undo step once the gesture ends (mouse released, no text field focused), so
+    /// a drag is one step rather than one per frame.
     pub fn ui(
+        &mut self,
+        ui: &mut Ui,
+        kind: u64,
+        name: &str,
+        labels: &mut HashMap<u64, String>,
+        current_frame: u32,
+        total_frames: u32,
+    ) -> Action {
+        let before = self.list.clone();
+        let action = self.ui_inner(ui, kind, name, labels, current_frame, total_frames);
+        match action {
+            Action::Undo => {
+                self.undo();
+                return Action::Reverted;
+            }
+            Action::Redo => {
+                self.redo();
+                return Action::Reverted;
+            }
+            _ => {}
+        }
+        if self.pending.is_none() && !same(&before, &self.list) {
+            self.pending = Some(before);
+        }
+        let busy = ui.ctx().input(|i| i.pointer.any_down())
+            || ui.ctx().memory(|m| m.focused().is_some());
+        if !busy {
+            self.settle();
+        }
+        action
+    }
+
+    fn ui_inner(
         &mut self,
         ui: &mut Ui,
         kind: u64,
@@ -194,6 +290,20 @@ impl Doc {
                 {
                     self.revert();
                     action = Action::Reverted;
+                }
+                if ui
+                    .add_enabled(self.can_redo(), egui::Button::new("Redo"))
+                    .on_hover_text("Redo a motion list edit (Ctrl+Y with the pointer over this window)")
+                    .clicked()
+                {
+                    action = Action::Redo;
+                }
+                if ui
+                    .add_enabled(self.can_undo(), egui::Button::new("Undo"))
+                    .on_hover_text("Undo a motion list edit (Ctrl+Z with the pointer over this window)")
+                    .clicked()
+                {
+                    action = Action::Undo;
                 }
             });
         });
@@ -553,6 +663,37 @@ mod tests {
         let back = crate::motion_yml::parse(&text).unwrap().list;
         assert_eq!(back.motion_path, list.motion_path);
         assert!(back.list.iter().eq(list.list.iter()));
+    }
+
+    #[test]
+    fn undo_steps_through_settled_edits() {
+        let mut list = MList::default();
+        list.list.insert(hash40::hash40("wait"), Motion::default());
+        let mut doc = Doc::new(Loaded { list, bin: None, yml: None }, Targets::default());
+        let wait = hash40::hash40("wait");
+        // a drag: several frames of change, one step
+        doc.pending = Some(doc.list.clone());
+        doc.list.list[&wait].blend_frames = 1;
+        doc.list.list[&wait].blend_frames = 2;
+        doc.settle();
+        doc.pending = Some(doc.list.clone());
+        doc.list.list[&wait].flags.r#loop = true;
+        // still in progress: undo settles it first
+        assert!(doc.undo());
+        assert!(!doc.list.list[&wait].flags.r#loop);
+        assert_eq!(doc.list.list[&wait].blend_frames, 2);
+        assert!(doc.undo());
+        assert_eq!(doc.list.list[&wait].blend_frames, 0);
+        assert!(!doc.undo());
+        assert!(doc.redo() && doc.redo());
+        assert!(doc.list.list[&wait].flags.r#loop);
+        assert!(!doc.redo());
+        // a new edit drops the redo history
+        doc.undo();
+        doc.pending = Some(doc.list.clone());
+        doc.list.list[&wait].blend_frames = 9;
+        doc.settle();
+        assert!(!doc.can_redo());
     }
 
     #[test]

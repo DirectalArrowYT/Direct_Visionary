@@ -3053,6 +3053,8 @@ pub struct VisionaryApp {
     /// Lists with unsaved edits, by the file they were read from, set aside on a fighter
     /// switch and handed back when that list is loaded again.
     motion_list_stash: std::collections::HashMap<PathBuf, crate::motion_list_editor::Doc>,
+    /// Where the Motion List window was last frame: Ctrl+Z / Ctrl+Y over it undo its edits.
+    motion_list_rect: Option<egui::Rect>,
     /// A project resume first loads its fighter, then waits for that fighter's asynchronous
     /// motion list before selecting the saved move through the normal interactive path.
     pending_project_move_selection: Option<(String, String)>,
@@ -3556,6 +3558,7 @@ impl VisionaryApp {
             motion_list_doc: None,
             show_motion_list: false,
             motion_list_stash: std::collections::HashMap::new(),
+            motion_list_rect: None,
             pending_project_move_selection: None,
             acmd_receiver: None,
             move_source_cache: HashMap::new(),
@@ -8313,6 +8316,35 @@ impl VisionaryApp {
         }
     }
 
+    /// After the motion list changed wholesale (Revert, Undo, Redo): kinds no longer in it
+    /// leave the move list, kinds back in it return.
+    fn sync_move_list_with_motion_list(&mut self) {
+        let Some(doc) = &self.motion_list_doc else {
+            return;
+        };
+        let kinds: std::collections::HashSet<u64> = doc.list.list.keys().map(|k| k.0).collect();
+        self.move_list.retain(|m| kinds.contains(&m.hash));
+        let have: std::collections::HashSet<u64> = self.move_list.iter().map(|m| m.hash).collect();
+        let missing: Vec<u64> = kinds.difference(&have).copied().collect();
+        if missing.is_empty() {
+            return;
+        }
+        for kind in missing {
+            self.move_list.push(MoveEntry {
+                name: self
+                    .state
+                    .labels
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_else(|| format!("{kind:#018x}")),
+                hash: kind,
+                frame_count: 0,
+                anim_path: None,
+            });
+        }
+        self.move_list.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
     /// The Motion List window: the open move's entry in the costume's motion list.
     fn draw_motion_list_window(&mut self, ctx: &egui::Context) {
         use crate::motion_list_editor::Action;
@@ -8362,30 +8394,7 @@ impl VisionaryApp {
                 self.move_list.retain(|m| m.hash != *hash);
                 self.state.status = "Removed the motion from the list (unsaved).".into();
             }
-            Action::Reverted => {
-                // Kinds added since the last save go; removed ones come back.
-                if let Some(doc) = &self.motion_list_doc {
-                    let kinds: std::collections::HashSet<u64> =
-                        doc.list.list.keys().map(|k| k.0).collect();
-                    self.move_list.retain(|m| kinds.contains(&m.hash));
-                    let have: std::collections::HashSet<u64> =
-                        self.move_list.iter().map(|m| m.hash).collect();
-                    for kind in kinds.difference(&have) {
-                        self.move_list.push(MoveEntry {
-                            name: self
-                                .state
-                                .labels
-                                .get(kind)
-                                .cloned()
-                                .unwrap_or_else(|| format!("{kind:#018x}")),
-                            hash: *kind,
-                            frame_count: 0,
-                            anim_path: None,
-                        });
-                    }
-                    self.move_list.sort_by(|a, b| a.name.cmp(&b.name));
-                }
-            }
+            Action::Reverted => self.sync_move_list_with_motion_list(),
             _ => {}
         }
         if let Action::Save = action {
@@ -8407,6 +8416,7 @@ impl VisionaryApp {
                 }
             }
         }
+        self.motion_list_rect = response.as_ref().map(|r| r.response.rect);
         if let Some(response) = response {
             let rect = response.response.rect;
             self.remember_geometry(
@@ -8420,6 +8430,9 @@ impl VisionaryApp {
             );
         }
         self.show_motion_list = open;
+        if !open {
+            self.motion_list_rect = None;
+        }
     }
 
     /// The ACMD Source window: link a project, read the open move's script out of it, edit
@@ -34767,6 +34780,33 @@ impl eframe::App for VisionaryApp {
             // H hides / shows the selected effect calls in the viewport (view only)
             if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
                 self.toggle_hide_selected_effects();
+            }
+        }
+        // Over the Motion List window, Ctrl+Z / Ctrl+Y step through its own edits.
+        let over_motion_list = self.motion_list_doc.is_some()
+            && self
+                .motion_list_rect
+                .zip(ctx.pointer_hover_pos())
+                .is_some_and(|(rect, pos)| rect.contains(pos));
+        if over_motion_list {
+            let undo = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
+            let redo = !undo
+                && ctx.input_mut(|i| {
+                    i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::Z)
+                        || i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)
+                });
+            let changed = match self.motion_list_doc.as_mut() {
+                Some(doc) if undo => doc.undo(),
+                Some(doc) if redo => doc.redo(),
+                _ => false,
+            };
+            if changed {
+                self.sync_move_list_with_motion_list();
+                self.state.status = if undo {
+                    "Undid a motion list edit.".to_string()
+                } else {
+                    "Redid a motion list edit.".to_string()
+                };
             }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z)) {
