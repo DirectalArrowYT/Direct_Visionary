@@ -86,6 +86,10 @@ pub struct HitboxRenderState {
     pub renderer: SsbhRenderer,
     pub shared_data: SharedRenderData,
     pub render_models: Vec<RenderModel>,
+    /// How many of `render_models` are the fighter itself; weapon instances follow.
+    body_model_count: usize,
+    /// Weapon instances after the body models, reused across frames by model folder.
+    article_slots: Vec<ArticleSlot>,
     #[allow(dead_code)]
     pub render_settings: RenderSettings,
     pub model_render_options: ModelRenderOptions,
@@ -349,6 +353,8 @@ impl HitboxRenderState {
             renderer,
             shared_data,
             render_models: Vec::new(),
+            body_model_count: 0,
+            article_slots: Vec::new(),
             render_settings,
             model_render_options: ModelRenderOptions::default(),
             camera: Camera::default(),
@@ -383,6 +389,8 @@ impl HitboxRenderState {
 
     pub fn load_model(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, model_dir: &Path) {
         self.render_models.clear();
+        self.body_model_count = 0;
+        self.article_slots.clear();
         self.weapon_skels.clear();
         if !model_dir.exists() {
             eprintln!("[MODEL] model directory does not exist: {:?}", model_dir);
@@ -392,6 +400,7 @@ impl HitboxRenderState {
         let render_model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
         eprintln!("[MODEL] loaded from {:?}", model_dir);
         self.render_models.push(render_model);
+        self.body_model_count = self.render_models.len();
 
         // Scan sibling directories for weapon skeletons.
         // model_dir is e.g. fighter/link/model/body/c00
@@ -483,7 +492,7 @@ impl HitboxRenderState {
         let anim = self.cached_anim.as_ref().map(|(_, a)| a);
         let skel = self.cached_skel.as_ref().map(|(_, s)| s);
 
-        for render_model in &mut self.render_models {
+        for render_model in &mut self.render_models[..self.body_model_count] {
             // RenderModel applies animations in iterator order. Put the default eyelid layer
             // first so a selected move's visibility tracks take precedence over the baseline.
             let animations = animation_layers(
@@ -521,6 +530,58 @@ impl HitboxRenderState {
             }
         } else {
             self.cached_default_anim = None;
+        }
+    }
+
+    /// Show this frame's weapon instances. Models are kept per folder and hidden when unused,
+    /// so a weapon that comes and goes during a move is loaded from disk once.
+    pub fn sync_articles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, draws: &[ArticleDraw]) {
+        let base = self.body_model_count;
+        let mut used = vec![false; self.article_slots.len()];
+        for draw in draws {
+            let slot = match (0..self.article_slots.len())
+                .find(|&i| !used[i] && self.article_slots[i].model_dir == draw.model_dir)
+            {
+                Some(i) => i,
+                None => {
+                    let folder = ModelFolder::load_folder(&draw.model_dir);
+                    let model = RenderModel::from_folder(device, queue, &folder, &self.shared_data);
+                    eprintln!("[MODEL] weapon loaded from {:?}", draw.model_dir);
+                    self.render_models.insert(base + self.article_slots.len(), model);
+                    self.article_slots.push(ArticleSlot {
+                        model_dir: draw.model_dir.clone(),
+                        last: None,
+                    });
+                    used.push(false);
+                    self.article_slots.len() - 1
+                }
+            };
+            used[slot] = true;
+            let model = &mut self.render_models[base + slot];
+            model.is_visible = true;
+            let key = (
+                draw.frame.to_bits(),
+                draw.root.to_cols_array().map(f32::to_bits),
+                draw.anim.as_ref().map_or(0, |a| std::sync::Arc::as_ptr(a) as usize),
+            );
+            if self.article_slots[slot].last != Some(key) {
+                model.root_transform = draw.root;
+                model.apply_anims(
+                    queue,
+                    draw.anim.as_deref().into_iter(),
+                    draw.skel.as_deref(),
+                    None,
+                    None,
+                    &self.shared_data,
+                    draw.frame,
+                );
+                self.article_slots[slot].last = Some(key);
+            }
+        }
+        for (i, used) in used.iter().enumerate() {
+            if !used {
+                self.render_models[base + i].is_visible = false;
+            }
         }
     }
 
@@ -1211,6 +1272,22 @@ fn weapon_attach_bone(weapon_dir: &str) -> String {
         _ => "haver".to_string(),
     }
 }
+struct ArticleSlot {
+    model_dir: std::path::PathBuf,
+    /// (frame, root, anim) last applied, to skip re-skinning a weapon that did not move.
+    last: Option<(u32, [u32; 16], usize)>,
+}
+
+/// One weapon instance to draw this frame.
+pub struct ArticleDraw {
+    pub model_dir: std::path::PathBuf,
+    pub skel: Option<std::sync::Arc<ssbh_data::skel_data::SkelData>>,
+    pub anim: Option<std::sync::Arc<ssbh_data::anim_data::AnimData>>,
+    /// Zero-based frame into `anim`.
+    pub frame: f32,
+    pub root: glam::Mat4,
+}
+
 /// Paint callback for the animated character model. Hitbox, windbox, grab, and effect-spawn
 /// circles are drawn by egui on top of this viewport in `app.rs`.
 pub struct ViewportCallback {
@@ -1240,6 +1317,8 @@ pub struct ViewportCallback {
     )>,
     /// Emitters drawn with the game's own shaders (not also in the batches).
     pub game_draws: Vec<crate::eff_game::GameDraw>,
+    /// Weapons the move has out this frame.
+    pub article_draws: Vec<ArticleDraw>,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -1288,6 +1367,7 @@ impl egui_wgpu::CallbackTrait for ViewportCallback {
                 state.last_default_anim_path = self.default_anim_path.clone();
                 state.last_skel_path = self.skel_path.clone();
             }
+            state.sync_articles(device, queue, &self.article_draws);
 
             // Effect particles. Uploads first, then staging: `prepare` skips a batch whose
             // texture is not resident, so a texture arriving in the same frame as the batch

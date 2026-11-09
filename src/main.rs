@@ -3,6 +3,7 @@ mod acmd;
 mod acmd_src;
 mod acmd_verify;
 mod app;
+mod articles;
 mod app_icon;
 mod asset_snapshots;
 mod carrier_motion;

@@ -7,6 +7,7 @@ use std::hash::Hash;
 /// VISIONARY_PREVIEW_TEST_MOVE: frames waited for the selected move's effects (0 = not waiting)
 static PREVIEW_TEST_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// VISIONARY_PREVIEW_TEST_MOVE: the move was picked
+static PREVIEW_SHOT_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static PREVIEW_TEST_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// VISIONARY_PREVIEW_TEST_MOVE: the profile's fighter and costume were picked
 static PREVIEW_TEST_PICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -919,6 +920,47 @@ impl TimelineFilters {
 
 /// Effect rotations are stored X, Y, Z, the same order the ACMD spawn macros carry them in.
 const EFFECT_ROTATION_AXIS_LABELS: [&str; 3] = ["X", "Y", "Z"];
+
+/// Live effects on script frame `frame` from a list of effect calls, as the runtime wants them.
+/// See [`VisionaryApp::live_effect_spawns`]; weapon scripts go through the same rules.
+fn live_effects_from_calls<'a>(
+    calls: impl Iterator<Item = &'a crate::data::EffectCall>,
+    frame: u32,
+) -> Vec<crate::eff_runtime::LiveEffect> {
+    calls
+        .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
+        .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
+        // EFFECT_OFF_KIND without fading ends it on its frame; with fading (and for one that does not follow, which
+        // plays out after its frame) its particles say when it is over
+        .filter(|call| {
+            frame >= call.active_start
+                && (frame <= call.active_end || (!call.follows_bone && call.off_fade != Some(false)) || call.off_fade == Some(true))
+        })
+        .map(|call| crate::eff_runtime::LiveEffect {
+            name: call.effect_name.clone(),
+            bone: call.bone_name.clone(),
+            tint: call.tint.unwrap_or([1.0, 1.0, 1.0]),
+            alpha: call.alpha.unwrap_or(1.0),
+            // Age since this call fired, which is what the emitter data is written in
+            // terms of.
+            age: frame.saturating_sub(call.active_start) as f32,
+            // Scripts place effects off the joint constantly -- a flash at a sword tip,
+            // smoke under a foot -- so this is not usually zero.
+            offset: glam::Vec3::from(call.offset),
+            // How the script aims the effect. The same explosion points along the punch or
+            // up off the ground purely by this.
+            rotation: glam::Vec3::from(call.rotation),
+            // The spawn macro's `size` argument. Scripts lean on it hard -- a moveset's tilts
+            // both spawn the shared arc at 0.75 -- so an effect drawn at 1.0 regardless is
+            // the wrong size on every call that is not already 1.0.
+            scale: call.scale,
+            follows: call.follows_bone,
+            // emitters stop at the kill (with fading; one without is filtered out above)
+            stopped: (call.off_fade.is_some() && call.active_end < crate::data::OPEN_ENDED_EFFECT_FRAME)
+                .then(|| call.active_end.saturating_sub(call.active_start) as f32),
+        })
+        .collect()
+}
 
 /// Convert a game-frame playhead to the zero-based frame index stored in `.nuanmb` animations.
 fn animation_frame_for_game_frame(frame: u32) -> f32 {
@@ -3050,6 +3092,9 @@ pub struct VisionaryApp {
     /// The costume's motion list, editable in the Motion List window.
     motion_list_doc: Option<crate::motion_list_editor::Doc>,
     show_motion_list: bool,
+    /// The Weapons window: weapons the open move spawns and how the preview places them.
+    show_articles: bool,
+    articles: crate::articles::ArticlePreview,
     /// Lists with unsaved edits, by the file they were read from, set aside on a fighter
     /// switch and handed back when that list is loaded again.
     motion_list_stash: std::collections::HashMap<PathBuf, crate::motion_list_editor::Doc>,
@@ -3557,6 +3602,8 @@ impl VisionaryApp {
             move_list_receiver: None,
             motion_list_doc: None,
             show_motion_list: false,
+            show_articles: false,
+            articles: Default::default(),
             motion_list_stash: std::collections::HashMap::new(),
             motion_list_rect: None,
             pending_project_move_selection: None,
@@ -4130,6 +4177,7 @@ impl VisionaryApp {
             self.current_anim_path = None;
             self.current_default_eyelid_path = None;
             self.current_skel_path = None;
+            self.articles.set_fighter(None, &[]);
             self.pending_model_load = None;
             self.current_eff_path = None;
             self.bone_names.clear();
@@ -4531,6 +4579,9 @@ impl VisionaryApp {
         ui.checkbox(&mut self.show_acmd_src, "ACMD Source").on_hover_text(
             "Read and edit ACMD scripts from your own smashline project, instead of the online archive of vanilla scripts",
         );
+        ui.checkbox(&mut self.show_articles, "Weapons").on_hover_text(
+            "Weapons (articles) the open move spawns: which motion they play, where they attach, and their own hitboxes and effects",
+        );
         ui.checkbox(&mut self.show_motion_list, "Motion List").on_hover_text(
             "Edit the open move's motion_list entry: flags, blend frames, cancel frame, intangibility, animations and scripts",
         );
@@ -4626,45 +4677,15 @@ impl VisionaryApp {
         if self.hide_effects {
             return Vec::new();
         }
-        let frame = self.state.current_frame;
-        self.state
-            .effects
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !self.effect_call_hidden(*i))
-            .map(|(_, call)| call)
-            .filter(|call| !call.disabled && call.color.is_none() && call.control.is_none())
-            .filter(|call| !call.effect_name.is_empty() && call.effect_name != "null")
-            // EFFECT_OFF_KIND without fading ends it on its frame; with fading (and for one that does not follow, which
-            // plays out after its frame) its particles say when it is over
-            .filter(|call| {
-                frame >= call.active_start
-                    && (frame <= call.active_end || (!call.follows_bone && call.off_fade != Some(false)) || call.off_fade == Some(true))
-            })
-            .map(|call| crate::eff_runtime::LiveEffect {
-                name: call.effect_name.clone(),
-                bone: call.bone_name.clone(),
-                tint: call.tint.unwrap_or([1.0, 1.0, 1.0]),
-                alpha: call.alpha.unwrap_or(1.0),
-                // Age since this call fired, which is what the emitter data is written in
-                // terms of.
-                age: frame.saturating_sub(call.active_start) as f32,
-                // Scripts place effects off the joint constantly -- a flash at a sword tip,
-                // smoke under a foot -- so this is not usually zero.
-                offset: glam::Vec3::from(call.offset),
-                // How the script aims the effect. The same explosion points along the punch or
-                // up off the ground purely by this.
-                rotation: glam::Vec3::from(call.rotation),
-                // The spawn macro's `size` argument. Scripts lean on it hard -- a moveset's tilts
-                // both spawn the shared arc at 0.75 -- so an effect drawn at 1.0 regardless is
-                // the wrong size on every call that is not already 1.0.
-                scale: call.scale,
-                follows: call.follows_bone,
-                // emitters stop at the kill (with fading; one without is filtered out above)
-                stopped: (call.off_fade.is_some() && call.active_end < crate::data::OPEN_ENDED_EFFECT_FRAME)
-                    .then(|| call.active_end.saturating_sub(call.active_start) as f32),
-            })
-            .collect()
+        live_effects_from_calls(
+            self.state
+                .effects
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !self.effect_call_hidden(*i))
+                .map(|(_, call)| call),
+            self.state.current_frame,
+        )
     }
 
     fn select_fighter(&mut self, idx: usize) {
@@ -4827,6 +4848,7 @@ impl VisionaryApp {
             .flatten()
             .map(|s| s.bones.into_iter().map(|b| b.name).collect())
             .unwrap_or_default();
+        let body_bone_names = loaded_bone_names.clone();
 
         // Also collect weapon bone names from sibling model dirs (sword, hammer, etc.)
         // model_root = fighter/{name}/model, each part holding cNN subdirs.
@@ -4862,6 +4884,15 @@ impl VisionaryApp {
         self.hurtbox_warnings = hurtbox_result.warnings;
         self.add_bone = self.add_bone.to_ascii_lowercase();
         self.current_model_dir = Some(model_dir.clone());
+        self.articles.set_fighter(
+            Some(crate::articles::ArticleContext {
+                fighter: name.clone(),
+                model_root: model_root.clone(),
+                motion_root: motion_fighter_dir.join("motion"),
+                slot: resolved_model_slot,
+            }),
+            &body_bone_names,
+        );
 
         // Queue model load for wgpu (done in update where we have device/queue access)
         self.pending_model_load = Some(model_dir.clone());
@@ -7817,6 +7848,12 @@ impl VisionaryApp {
         body: Result<String, String>,
         source_label: &str,
     ) {
+        self.articles.set_move(
+            move_name,
+            body.as_deref().unwrap_or(""),
+            self.acmd_src.as_ref(),
+            &self.state.labels,
+        );
         match body {
             Ok(body) => {
                 // Keep the exact merged, unedited body as the move's persistent baseline. The
@@ -8343,6 +8380,200 @@ impl VisionaryApp {
             });
         }
         self.move_list.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// The Weapons window: what the open move spawns and how the preview places it.
+    fn draw_articles_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_articles;
+        let mut window = egui::Window::new("Weapons")
+            .open(&mut open)
+            .resizable(true)
+            .default_size([420.0, 480.0]);
+        if let Some(g) = self.window_geometry.get("articles").copied() {
+            window = window.default_pos([g.x, g.y]).default_size([g.w, g.h]);
+        }
+        let current_frame = self.state.current_frame;
+        let bone_names = self.bone_names.clone();
+        let mut spawns: Vec<crate::articles::ArticleSpawn> = self.articles.spawns().to_vec();
+        let before = spawns.clone();
+        let mut reset = false;
+        let mut guess: Option<usize> = None;
+        let mut hide = self.articles.hide;
+        let response = window.show(ctx, |ui| {
+            let articles = &self.articles;
+            if articles.ctx.is_none() {
+                ui.label("Select a fighter.");
+                return;
+            }
+            if articles.available.is_empty() {
+                ui.label("This fighter has no weapon folders (model/<weapon> or motion/<weapon>).");
+                return;
+            }
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut hide, "Hide weapons");
+                if articles.is_customized()
+                    && ui
+                        .button("Reset to script")
+                        .on_hover_text("Forget your changes for this move and use what its script spawns")
+                        .clicked()
+                {
+                    reset = true;
+                }
+            });
+            if articles.move_name.is_empty() {
+                ui.label("Open a move.");
+                return;
+            }
+            for (frame, arg) in &articles.unresolved {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    format!("Frame {frame}: generate_article({arg}) names no weapon folder"),
+                );
+            }
+            if spawns.is_empty() {
+                ui.label(
+                    "The move's script spawns no weapon. Weapons generated from status code \
+                     (most specials) can be added here by hand.",
+                );
+            }
+            ui.separator();
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (i, spawn) in spawns.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        let assets = articles.assets(&spawn.article);
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut spawn.enabled, "");
+                            egui::ComboBox::from_id_salt("article")
+                                .selected_text(&spawn.article)
+                                .show_ui(ui, |ui| {
+                                    for name in &articles.available {
+                                        if ui
+                                            .selectable_value(&mut spawn.article, name.clone(), name)
+                                            .clicked()
+                                        {
+                                            guess = Some(i);
+                                        }
+                                    }
+                                });
+                            ui.label("frame");
+                            ui.add(egui::DragValue::new(&mut spawn.frame).range(1..=9999));
+                            if spawn.from_script {
+                                ui.weak("(script)");
+                            }
+                            if ui.small_button("Guess").on_hover_text("Guess motion, bone and rotation from the source again").clicked() {
+                                guess = Some(i);
+                            }
+                            if ui.small_button("✖").on_hover_text("Remove from the preview").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                        let motions: Vec<String> = assets
+                            .map(|a| a.motions.iter().map(|m| m.name.clone()).collect())
+                            .unwrap_or_default();
+                        ui.horizontal(|ui| {
+                            ui.label("Motion");
+                            egui::ComboBox::from_id_salt("motion")
+                                .selected_text(if spawn.motion.is_empty() { "(rest pose)" } else { spawn.motion.as_str() })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut spawn.motion, String::new(), "(rest pose)");
+                                    for name in &motions {
+                                        ui.selectable_value(&mut spawn.motion, name.clone(), name);
+                                    }
+                                });
+                            ui.label("Life");
+                            ui.add(egui::DragValue::new(&mut spawn.life).range(0..=9999))
+                                .on_hover_text("Frames it stays out. 0 = until its motion ends");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Attach");
+                            egui::ComboBox::from_id_salt("bone")
+                                .selected_text(if spawn.attach_bone.is_empty() { "(stays where spawned)" } else { spawn.attach_bone.as_str() })
+                                .height(320.0)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut spawn.attach_bone, String::new(), "(stays where spawned)");
+                                    for name in &bone_names {
+                                        ui.selectable_value(&mut spawn.attach_bone, name.clone(), name);
+                                    }
+                                });
+                        });
+                        let vec3 = |ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64| {
+                            ui.horizontal(|ui| {
+                                ui.label(label);
+                                for c in v.iter_mut() {
+                                    ui.add(egui::DragValue::new(c).speed(speed).max_decimals(2));
+                                }
+                            });
+                        };
+                        vec3(ui, "Offset", &mut spawn.offset, 0.1);
+                        vec3(ui, "Rotation", &mut spawn.rotation, 1.0);
+                        if spawn.attach_bone.is_empty() {
+                            vec3(ui, "Velocity", &mut spawn.velocity, 0.05);
+                        }
+                        match assets {
+                            None => {
+                                ui.colored_label(egui::Color32::YELLOW, "Weapon not loaded");
+                            }
+                            Some(a) => {
+                                let mut notes = Vec::new();
+                                if a.model_dir.is_none() {
+                                    notes.push("no model".to_string());
+                                }
+                                if a.scripts.is_empty() {
+                                    notes.push("no scripts in the linked source".to_string());
+                                } else {
+                                    notes.push(format!("{} script(s)", a.scripts.len()));
+                                }
+                                ui.weak(notes.join(", "));
+                            }
+                        }
+                        ui.separator();
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                spawns.remove(i);
+            }
+            if ui
+                .button(format!("Add weapon at frame {current_frame}"))
+                .on_hover_text("For weapons the status code generates, which the move's script does not show")
+                .clicked()
+            {
+                spawns.push(crate::articles::ArticleSpawn {
+                    article: articles.available[0].clone(),
+                    frame: current_frame.max(1),
+                    ..Default::default()
+                });
+                guess = Some(spawns.len() - 1);
+            }
+        });
+        if let Some(r) = response.as_ref() {
+            let rect = r.response.rect;
+            self.remember_geometry(
+                "articles",
+                WindowGeometry { x: rect.min.x, y: rect.min.y, w: rect.width(), h: rect.height() },
+            );
+        }
+        self.show_articles = open;
+        self.articles.hide = hide;
+        if reset {
+            self.articles.reset_move();
+            return;
+        }
+        if let Some(i) = guess {
+            let article = spawns[i].article.clone();
+            self.articles
+                .ensure_assets(&article, self.acmd_src.as_ref(), &self.state.labels);
+            let nth = spawns[..i]
+                .iter()
+                .filter(|s| s.article == article && s.frame == spawns[i].frame)
+                .count();
+            self.articles.auto_settings(&mut spawns[i], nth);
+        }
+        if spawns != before {
+            *self.articles.spawns_mut() = spawns;
+            self.articles.save();
+        }
     }
 
     /// The Motion List window: the open move's entry in the costume's motion list.
@@ -34566,8 +34797,68 @@ impl eframe::App for VisionaryApp {
                     self.acmd_error,
                     self.state.selected_fighter.map(|i| self.state.fighters[i].name.clone()),
                 );
+                eprintln!(
+                    "[preview] test: weapons available {:?}, spawns {:?}, unresolved {:?}",
+                    self.articles.available,
+                    self.articles.spawns(),
+                    self.articles.unresolved,
+                );
+                let frame_now = self.state.current_frame;
+                let instances = match frame.wgpu_render_state().map(|w| w.renderer.read()) {
+                    Some(renderer) => match renderer.callback_resources.get::<HitboxRenderState>() {
+                        Some(rs) => self.articles.instances(frame_now, &|f| rs.bone_world_matrices_at(f)),
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+                for inst in &instances {
+                    let live: Vec<String> = live_effects_from_calls(inst.scripts.effects.iter(), inst.script_frame)
+                        .iter()
+                        .map(|e| format!("{} on {}", e.name, e.bone))
+                        .collect();
+                    eprintln!(
+                        "[preview] test: weapon {} anim frame {} of {:?}, {} bones, {} hitbox(es), {} effect call(s), live {live:?}",
+                        inst.article,
+                        inst.anim_frame,
+                        inst.anim.as_ref().map(|a| a.final_frame_index),
+                        inst.bones.len(),
+                        inst.scripts.hitboxes.len(),
+                        inst.scripts.effects.len(),
+                    );
+                }
+                // VISIONARY_PREVIEW_SHOT=<png>: screenshot the window once the preview settles
+                // (VISIONARY_PREVIEW_EXIT=1 closes the app after).
+                if std::env::var_os("VISIONARY_PREVIEW_SHOT").is_some() {
+                    self.show_articles = true;
+                    PREVIEW_SHOT_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
+                }
             } else {
                 PREVIEW_TEST_WAIT.store(wait + 1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let shot_wait = PREVIEW_SHOT_WAIT.load(std::sync::atomic::Ordering::Relaxed);
+        if shot_wait > 0 {
+            PREVIEW_SHOT_WAIT.store(shot_wait + 1, std::sync::atomic::Ordering::Relaxed);
+            if shot_wait == 40 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            }
+            let shot = ctx.input(|i| {
+                i.raw.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let (Some(image), Ok(path)) = (shot, std::env::var("VISIONARY_PREVIEW_SHOT")) {
+                PREVIEW_SHOT_WAIT.store(0, std::sync::atomic::Ordering::Relaxed);
+                let [w, h] = image.size;
+                let bytes: Vec<u8> = image.pixels.iter().flat_map(|c| c.to_array()).collect();
+                match image::RgbaImage::from_raw(w as u32, h as u32, bytes).map(|img| img.save(&path)) {
+                    Some(Ok(())) => eprintln!("[preview] screenshot {path}"),
+                    other => eprintln!("[preview] screenshot failed: {other:?}"),
+                }
+                if std::env::var_os("VISIONARY_PREVIEW_EXIT").is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
         // Poll background move list loader
@@ -34834,6 +35125,10 @@ impl eframe::App for VisionaryApp {
             let t = self.perf.start();
             self.draw_acmd_source_window(&ctx);
             self.perf.end("acmd_source_window", t);
+        }
+
+        if self.show_articles {
+            self.draw_articles_window(&ctx);
         }
 
         if self.show_motion_list {
@@ -35586,6 +35881,20 @@ impl eframe::App for VisionaryApp {
                 // which effects the timeline has live. It reads the same bone matrices the
                 // hitbox overlay does, at the same requested frame, so particles and hitboxes
                 // cannot disagree about where a bone is.
+                // Weapons the move has out on this frame, placed against the body's bones.
+                let article_instances = match frame
+                    .wgpu_render_state()
+                    .map(|w| w.renderer.read())
+                {
+                    Some(renderer) => match renderer.callback_resources.get::<HitboxRenderState>() {
+                        Some(rs) => self.articles.instances(self.state.current_frame, &|f| {
+                            rs.bone_world_matrices_at(f)
+                        }),
+                        None => Vec::new(),
+                    },
+                    None => Vec::new(),
+                };
+
                 let mut newly_undecodable: Vec<crate::eff_render::TextureKey> = Vec::new();
                 let t_fx = self.perf.start();
                 let frame_effects = {
@@ -35634,6 +35943,63 @@ impl eframe::App for VisionaryApp {
                     }
                 };
 
+                // Effects from the weapons' own scripts, on the weapons' bones.
+                let mut frame_effects = frame_effects;
+                if !self.hide_effects && !article_instances.is_empty() {
+                    if let Some(wgpu_state) = frame.wgpu_render_state() {
+                        let renderer = wgpu_state.renderer.read();
+                        if let Some(rs) = renderer.callback_resources.get::<HitboxRenderState>() {
+                            let body_bones = |f: f32| rs.bone_world_matrices_at(f);
+                            let current = self.state.current_frame;
+                            for inst in &article_instances {
+                                let live = live_effects_from_calls(
+                                    inst.scripts.effects.iter(),
+                                    inst.script_frame,
+                                );
+                                if live.is_empty() {
+                                    continue;
+                                }
+                                let resident = |key: &crate::eff_render::TextureKey| {
+                                    rs.particles.as_ref().is_some_and(|p| p.has_texture(key))
+                                };
+                                let mesh_resident = |key: &crate::eff_mesh::MeshKey| {
+                                    rs.particles.as_ref().is_some_and(|p| p.has_mesh(key))
+                                };
+                                let failed_before = self.undecodable_textures.clone();
+                                let was_failed = move |key: &crate::eff_render::TextureKey| {
+                                    failed_before.contains(key)
+                                };
+                                let articles = &self.articles;
+                                let (more, undecodable) = crate::eff_runtime::build_particle_batches(
+                                    &mut self.effect_resolver,
+                                    &resident,
+                                    &was_failed,
+                                    &mesh_resident,
+                                    &mut self.effect_meshes,
+                                    self.effect_quad_planes,
+                                    &inst.bones,
+                                    &|back| articles.bones_before(inst, current, back, &body_bones),
+                                    &live,
+                                );
+                                newly_undecodable.extend(undecodable);
+                                frame_effects.batches.extend(more.batches);
+                                frame_effects.mesh_batches.extend(more.mesh_batches);
+                                frame_effects.game_draws.extend(more.game_draws);
+                                for texture in more.pending_textures {
+                                    if !frame_effects.pending_textures.iter().any(|t| t.key == texture.key) {
+                                        frame_effects.pending_textures.push(texture);
+                                    }
+                                }
+                                for (key, mesh) in more.pending_meshes {
+                                    if !frame_effects.pending_meshes.iter().any(|(k, _)| *k == key) {
+                                        frame_effects.pending_meshes.push((key, mesh));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.perf.end("effects_build", t_fx);
                 // Remember textures that would not decode, so the attempt is not repeated
                 // every frame for the whole time the effect is live.
@@ -35657,6 +36023,18 @@ impl eframe::App for VisionaryApp {
                             .collect(),
                         pending_meshes: frame_effects.pending_meshes,
                         game_draws: frame_effects.game_draws,
+                        article_draws: article_instances
+                            .iter()
+                            .filter_map(|inst| {
+                                Some(crate::renderer::ArticleDraw {
+                                    model_dir: inst.model_dir.clone()?,
+                                    skel: inst.skel.clone(),
+                                    anim: inst.anim.clone(),
+                                    frame: inst.anim_frame,
+                                    root: inst.root,
+                                })
+                            })
+                            .collect(),
                     },
                 );
                 ui.painter().add(callback);
@@ -35670,7 +36048,23 @@ impl eframe::App for VisionaryApp {
                         // `last_frame` is one paint behind. Evaluate the requested frame
                         // directly to keep moving bones/root motion and grabboxes synchronized.
                         let t = self.perf.start();
-                        let bone_matrices = rs.bone_world_matrices_at(animation_frame);
+                        let mut bone_matrices = rs.bone_world_matrices_at(animation_frame);
+                        // A live weapon's bones replace the rest-pose copy of its skeleton that
+                        // hangs off the hand, so body scripts naming them land on the weapon.
+                        if !article_instances.is_empty() {
+                            let body: std::collections::HashSet<String> = rs
+                                .bone_names()
+                                .into_iter()
+                                .flat_map(|n| [n.to_ascii_lowercase(), n])
+                                .collect();
+                            for inst in &article_instances {
+                                for (name, m) in &inst.bones {
+                                    if !body.contains(name) && !is_system_bone(name) {
+                                        bone_matrices.insert(name.clone(), *m);
+                                    }
+                                }
+                            }
+                        }
                         self.perf.end("bone_matrices", t);
                         // Keep a positions map for debug display
                         let bone_positions: std::collections::HashMap<String, glam::Vec3> =
@@ -35716,6 +36110,67 @@ impl eframe::App for VisionaryApp {
                                         egui::FontId::monospace(8.0),
                                         egui::Color32::from_rgb(0, 220, 0),
                                     );
+                                }
+                            }
+                        }
+
+                        // Weapon hitboxes, from the weapons' own game scripts.
+                        if !self.hide_hitboxes {
+                            for inst in &article_instances {
+                                for hb in &inst.scripts.hitboxes {
+                                    if hb.category == crate::data::CAT_ABS
+                                        || hb.category == crate::data::CAT_ATTACK_FP
+                                        || hb.wind.is_some()
+                                    {
+                                        continue;
+                                    }
+                                    let active = hb.active_frames_empty()
+                                        || (inst.script_frame >= hb.active_start
+                                            && inst.script_frame <= hb.active_end);
+                                    if !active {
+                                        continue;
+                                    }
+                                    let bone_mat = inst
+                                        .bones
+                                        .get(&hb.bone_name)
+                                        .or_else(|| inst.bones.get(&hb.bone_name.to_lowercase()))
+                                        .copied()
+                                        .unwrap_or(inst.root);
+                                    let bone_mat = if is_system_bone(&hb.bone_name) {
+                                        glam::Mat4::from_translation(bone_mat.col(3).truncate())
+                                    } else {
+                                        bone_mat
+                                    };
+                                    let world_pos = bone_mat.transform_point3(glam::Vec3::new(
+                                        hb.offset_x,
+                                        hb.offset_y,
+                                        hb.offset_z,
+                                    ));
+                                    let world_end = hb
+                                        .capsule_end
+                                        .map(|e| bone_mat.transform_point3(glam::Vec3::from(e)));
+                                    let color = hitbox_display_color(hb);
+                                    let (stroke, fill) = hitbox_viewport_style(color, false);
+                                    if let Some(label_pos) = draw_projected_capsule(
+                                        ui.painter(),
+                                        rs,
+                                        rect,
+                                        ProjectedCapsule {
+                                            world_start: world_pos,
+                                            world_end,
+                                            world_radius: hb.size,
+                                            stroke,
+                                            fill,
+                                        },
+                                    ) {
+                                        ui.painter().text(
+                                            label_pos + egui::vec2(6.0, 0.0),
+                                            egui::Align2::LEFT_CENTER,
+                                            format!("{} #{} {:.0}", inst.article, hb.id, hb.damage),
+                                            egui::FontId::monospace(11.0),
+                                            color,
+                                        );
+                                    }
                                 }
                             }
                         }

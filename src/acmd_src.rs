@@ -693,6 +693,55 @@ impl SourceIndex {
     /// mirror alone. Any single category is enough for `Some`: what the project does not
     /// define is filled from the mirror by [`crate::acmd::merge_project_over_mirror`], which
     /// is why the coverage list has to come back with the text.
+    /// Text of every indexed file that names `agent` in a string literal (`"clone_a_spike"`).
+    ///
+    /// Weapon agents are often installed through a helper that takes the name as a parameter,
+    /// so the index cannot always attribute their scripts; the literal still appears in the
+    /// file that does the install.
+    pub fn agent_sources(&self, agent: &str) -> Vec<(PathBuf, String)> {
+        let quoted = format!("\"{}\"", agent.to_ascii_lowercase());
+        self.files
+            .iter()
+            .filter_map(|file| {
+                let text = std::fs::read_to_string(file).ok()?;
+                text.to_ascii_lowercase()
+                    .contains(&quoted)
+                    .then(|| (file.clone(), text))
+            })
+            .collect()
+    }
+
+    /// Script name → function text (header renamed to the script) for a weapon `agent`.
+    ///
+    /// Indexed scripts for the agent come first; registrations in files naming the agent fill
+    /// in the rest.
+    pub fn agent_scripts(&self, agent: &str) -> HashMap<String, String> {
+        let mut out: HashMap<String, String> = HashMap::new();
+        if let Some(table) = self.fighters.get(&normalize_fighter(agent)) {
+            for (name, site) in &table.scripts {
+                if let Ok(text) = std::fs::read_to_string(&site.file) {
+                    if let Some(source) = text.get(site.span.clone()) {
+                        out.insert(name.clone(), header_named(source, name));
+                    }
+                }
+            }
+        }
+        for (_, text) in self.agent_sources(agent) {
+            let functions = scan_acmd_functions(&text);
+            for (script, function) in scan_acmd_registrations(&text) {
+                if out.contains_key(script) {
+                    continue;
+                }
+                if let Some(found) = functions.iter().find(|f| f.name == function) {
+                    if let Some(source) = text.get(found.span.clone()) {
+                        out.insert(script.to_string(), header_named(source, script));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub fn script_source(&self, fighter: &str, move_name: &str) -> Option<ProjectScript> {
         let mut body = String::new();
         let mut covers: Vec<&'static str> = Vec::new();

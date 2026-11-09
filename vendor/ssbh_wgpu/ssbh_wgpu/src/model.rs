@@ -35,6 +35,10 @@ pub struct RenderModel {
     pub is_visible: bool,
     /// Outline all the meshes in this model when `true` regardless of which meshes are selected.
     pub is_selected: bool,
+    /// World placement applied on top of the animated skeleton in [RenderModel::apply_anims].
+    /// Identity for a model drawn at the origin. Lets one scene hold several models at
+    /// different spots (a fighter and the weapons it spawns).
+    pub root_transform: glam::Mat4,
 
     transforms: TransformBuffers,
     material_data_by_label: HashMap<String, Material>,
@@ -234,6 +238,18 @@ impl RenderModel {
                 hlpb,
                 current_frame,
             );
+
+            if self.root_transform != glam::Mat4::IDENTITY {
+                let root = self.root_transform;
+                let count = skel.bones.len().min(crate::animation::MAX_BONE_COUNT);
+                let t = &mut self.animation_transforms;
+                for i in 0..count {
+                    t.world_transforms[i] = root * t.world_transforms[i];
+                    let m = root * t.animated_world_transforms.transforms[i];
+                    t.animated_world_transforms.transforms[i] = m;
+                    t.animated_world_transforms.transforms_inv_transpose[i] = m.inverse().transpose();
+                }
+            }
 
             queue.write_data(
                 &self.transforms.skinning_transforms,

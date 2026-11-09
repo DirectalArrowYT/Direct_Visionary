@@ -141,6 +141,7 @@ impl<'a> RenderMeshSharedData<'a> {
         RenderModel {
             is_visible: true,
             is_selected: false,
+            root_transform: glam::Mat4::IDENTITY,
             meshes,
             transforms: mesh_buffers,
             material_data_by_label,
