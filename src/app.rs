@@ -8,6 +8,7 @@ use std::hash::Hash;
 static PREVIEW_TEST_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// VISIONARY_PREVIEW_TEST_MOVE: the move was picked
 static PREVIEW_SHOT_WAIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PREVIEW_TEST_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 static PREVIEW_TEST_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// VISIONARY_PREVIEW_TEST_MOVE: the profile's fighter and costume were picked
 static PREVIEW_TEST_PICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4677,7 +4678,7 @@ impl VisionaryApp {
         if self.hide_effects {
             return Vec::new();
         }
-        live_effects_from_calls(
+        let mut live = live_effects_from_calls(
             self.state
                 .effects
                 .iter()
@@ -4685,7 +4686,10 @@ impl VisionaryApp {
                 .filter(|(i, _)| !self.effect_call_hidden(*i))
                 .map(|(_, call)| call),
             self.state.current_frame,
-        )
+        );
+        // Effects the mod's code spawns, which no effect script shows.
+        live.extend(self.articles.live_code_effects(self.state.current_frame));
+        live
     }
 
     fn select_fighter(&mut self, idx: usize) {
@@ -8399,18 +8403,18 @@ impl VisionaryApp {
         let mut reset = false;
         let mut guess: Option<usize> = None;
         let mut hide = self.articles.hide;
+        let mut code_fx: Vec<crate::articles::CodeEffect> = self.articles.code_effects().to_vec();
+        let code_fx_before = code_fx.clone();
+        let mut reset_fx = false;
         let response = window.show(ctx, |ui| {
             let articles = &self.articles;
             if articles.ctx.is_none() {
                 ui.label("Select a fighter.");
                 return;
             }
-            if articles.available.is_empty() {
-                ui.label("This fighter has no weapon folders (model/<weapon> or motion/<weapon>).");
-                return;
-            }
+            let no_weapons = articles.available.is_empty();
             ui.horizontal(|ui| {
-                ui.checkbox(&mut hide, "Hide weapons");
+                ui.checkbox(&mut hide, "Hide weapons and code effects");
                 if articles.is_customized()
                     && ui
                         .button("Reset to script")
@@ -8430,7 +8434,9 @@ impl VisionaryApp {
                     format!("Frame {frame}: generate_article({arg}) names no weapon folder"),
                 );
             }
-            if spawns.is_empty() {
+            if no_weapons {
+                ui.weak("This fighter has no weapon folders (model/<weapon> or motion/<weapon>).");
+            } else if spawns.is_empty() {
                 ui.label(
                     "The move's script spawns no weapon. Weapons generated from status code \
                      (most specials) can be added here by hand.",
@@ -8534,10 +8540,11 @@ impl VisionaryApp {
             if let Some(i) = remove {
                 spawns.remove(i);
             }
-            if ui
-                .button(format!("Add weapon at frame {current_frame}"))
-                .on_hover_text("For weapons the status code generates, which the move's script does not show")
-                .clicked()
+            if !no_weapons
+                && ui
+                    .button(format!("Add weapon at frame {current_frame}"))
+                    .on_hover_text("For weapons the status code generates, which the move's script does not show")
+                    .clicked()
             {
                 spawns.push(crate::articles::ArticleSpawn {
                     article: articles.available[0].clone(),
@@ -8545,6 +8552,86 @@ impl VisionaryApp {
                     ..Default::default()
                 });
                 guess = Some(spawns.len() - 1);
+            }
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.heading("Effects from code");
+                if articles.code_effects_customized()
+                    && ui
+                        .button("Reset to source")
+                        .on_hover_text("Forget your changes and use what the source spawns")
+                        .clicked()
+                {
+                    reset_fx = true;
+                }
+            });
+            ui.weak(
+                "EffectModule::req calls the move reaches through the mod's own functions. \
+                 Positions come from code Visionary does not run, so check them against the game.",
+            );
+            let mut remove_fx: Option<usize> = None;
+            for (i, fx) in code_fx.iter_mut().enumerate() {
+                ui.push_id(("code_fx", i), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut fx.enabled, "");
+                        ui.add(egui::TextEdit::singleline(&mut fx.name).desired_width(170.0));
+                        ui.label("frame");
+                        ui.add(egui::DragValue::new(&mut fx.frame).range(1..=9999));
+                        if ui.small_button("✖").on_hover_text("Remove from the preview").clicked() {
+                            remove_fx = Some(i);
+                        }
+                    });
+                    if !fx.source.is_empty() {
+                        ui.weak(format!("from {}", fx.source));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Bone");
+                        egui::ComboBox::from_id_salt("fx_bone")
+                            .selected_text(fx.bone.as_str())
+                            .height(320.0)
+                            .show_ui(ui, |ui| {
+                                for name in &bone_names {
+                                    ui.selectable_value(&mut fx.bone, name.clone(), name);
+                                }
+                            });
+                        ui.checkbox(&mut fx.follows, "Follows");
+                        ui.label("Life");
+                        ui.add(egui::DragValue::new(&mut fx.life).range(0..=9999))
+                            .on_hover_text("Frames it stays out. 0 = until the move ends");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Scale");
+                        ui.add(egui::DragValue::new(&mut fx.scale).speed(0.05).max_decimals(3));
+                        ui.label("Ring");
+                        ui.add(egui::DragValue::new(&mut fx.ring_count).range(1..=64))
+                            .on_hover_text("Copies around a horizontal circle; 1 = a single effect");
+                        if fx.ring_count > 1 {
+                            ui.label("radius");
+                            ui.add(egui::DragValue::new(&mut fx.ring_radius).speed(0.1).max_decimals(2));
+                        }
+                    });
+                    let vec3 = |ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            for c in v.iter_mut() {
+                                ui.add(egui::DragValue::new(c).speed(speed).max_decimals(2));
+                            }
+                        });
+                    };
+                    vec3(ui, "Offset", &mut fx.offset, 0.1);
+                    vec3(ui, "Rotation", &mut fx.rotation, 1.0);
+                    ui.separator();
+                });
+            }
+            if let Some(i) = remove_fx {
+                code_fx.remove(i);
+            }
+            if ui.button(format!("Add effect at frame {current_frame}")).clicked() {
+                code_fx.push(crate::articles::CodeEffect {
+                    frame: current_frame.max(1),
+                    ..Default::default()
+                });
             }
         });
         if let Some(r) = response.as_ref() {
@@ -8559,6 +8646,14 @@ impl VisionaryApp {
         if reset {
             self.articles.reset_move();
             return;
+        }
+        if reset_fx {
+            self.articles.reset_code_effects();
+            return;
+        }
+        if code_fx != code_fx_before {
+            *self.articles.code_effects_mut() = code_fx;
+            self.articles.save();
         }
         if let Some(i) = guess {
             let article = spawns[i].article.clone();
@@ -21011,6 +21106,15 @@ If you step every basis for a                          type and NONE of them mat
                     }
                 });
             });
+        // VISIONARY_PREVIEW_SOURCE_CHOICE=saved|current|cancel (tests): answer this prompt
+        if choice.is_none() && std::env::var_os("VISIONARY_PREVIEW_TEST_MOVE").is_some() {
+            choice = match std::env::var("VISIONARY_PREVIEW_SOURCE_CHOICE").as_deref() {
+                Ok("saved") => Some("saved"),
+                Ok("current") => Some("current"),
+                Ok("cancel") => Some("cancel"),
+                _ => None,
+            };
+        }
         let Some(choice) = choice else {
             return;
         };
@@ -34753,6 +34857,13 @@ impl eframe::App for VisionaryApp {
             // resuming the project replaces the fighter and costume the profile variables picked: pick them again
             let want = std::env::var("VISIONARY_PROFILE_FIGHTER").unwrap_or_default();
             if !PREVIEW_TEST_PICKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // VISIONARY_PREVIEW_SOURCE=<dir>: index that source for this run only (not saved to the project)
+                if let Some(root) = std::env::var_os("VISIONARY_PREVIEW_SOURCE").map(PathBuf::from) {
+                    match crate::acmd_src::SourceIndex::build(&root) {
+                        Ok(index) => self.acmd_src = Some(index),
+                        Err(e) => eprintln!("[preview] test: source {}: {e}", root.display()),
+                    }
+                }
                 if let Some(i) = self.state.fighters.iter().position(|f| f.name.eq_ignore_ascii_case(&want)) {
                     self.select_fighter(i);
                     if let Some(slot) = std::env::var("VISIONARY_PROFILE_COSTUME").ok().and_then(|s| s.trim().parse().ok()) {
@@ -34778,6 +34889,7 @@ impl eframe::App for VisionaryApp {
                 {
                     self.select_move(entry);
                     self.state.current_frame = at;
+                    PREVIEW_TEST_FRAME.store(at, std::sync::atomic::Ordering::Relaxed);
                     PREVIEW_TEST_WAIT.store(1, std::sync::atomic::Ordering::Relaxed);
                     PREVIEW_TEST_DONE.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -34786,7 +34898,12 @@ impl eframe::App for VisionaryApp {
         // the move's effects arrive after it is selected: report once they do (or after ~10 s without)
         let wait = PREVIEW_TEST_WAIT.load(std::sync::atomic::Ordering::Relaxed);
         if wait > 0 {
-            if !self.state.effects.is_empty() || wait > 100 {
+            let target = PREVIEW_TEST_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+            if (!self.state.effects.is_empty() || wait > 100) && self.state.current_frame != target && wait < 200 {
+                // loading the move puts the playhead on its first event: back to the asked frame
+                self.state.current_frame = target;
+                PREVIEW_TEST_WAIT.store(wait.max(101) + 1, std::sync::atomic::Ordering::Relaxed);
+            } else if !self.state.effects.is_empty() || wait > 100 {
                 PREVIEW_TEST_WAIT.store(0, std::sync::atomic::Ordering::Relaxed);
                 let live: Vec<String> = self.live_effect_spawns().iter().map(|e| format!("{} on {} age {}", e.name, e.bone, e.age)).collect();
                 eprintln!(
@@ -34798,10 +34915,11 @@ impl eframe::App for VisionaryApp {
                     self.state.selected_fighter.map(|i| self.state.fighters[i].name.clone()),
                 );
                 eprintln!(
-                    "[preview] test: weapons available {:?}, spawns {:?}, unresolved {:?}",
+                    "[preview] test: weapons available {:?}, spawns {:?}, unresolved {:?}, code effects {:?}",
                     self.articles.available,
                     self.articles.spawns(),
                     self.articles.unresolved,
+                    self.articles.code_effects(),
                 );
                 let frame_now = self.state.current_frame;
                 let instances = match frame.wgpu_render_state().map(|w| w.renderer.read()) {

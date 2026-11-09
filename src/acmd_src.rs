@@ -398,6 +398,9 @@ pub struct SourceIndex {
     pub files: Vec<PathBuf>,
     /// Duplicate script identities that were found but deliberately not selected.
     pub conflicts: Vec<ScriptConflict>,
+    /// Clone Engine clone → base fighter (`Manifest::new(clone, base)`). Scripts are indexed
+    /// under the base; a lookup by the clone's own name lands there too.
+    pub clone_bases: HashMap<String, String>,
 }
 
 /// A script registration found anywhere in the selected project. The owning fighter is retained
@@ -525,6 +528,7 @@ impl SourceIndex {
         }
         index.apply_aliases(aliases);
         index.files = files;
+        index.clone_bases = clone_bases;
         Ok(index)
     }
 
@@ -590,8 +594,17 @@ impl SourceIndex {
     /// `game_attacks3s` (the motion's spelling) finds a project that defines
     /// `game_attacks3` (the game's spelling for most fighters), and vice versa
     /// for Ryu/Ken.
+    /// The key a fighter's scripts are indexed under: its own name, or a clone's base.
+    pub fn fighter_key(&self, fighter: &str) -> String {
+        let name = normalize_fighter(fighter);
+        if self.fighters.contains_key(&name) {
+            return name;
+        }
+        self.clone_bases.get(&name).cloned().unwrap_or(name)
+    }
+
     pub fn script(&self, fighter: &str, script_name: &str) -> Option<&ScriptSite> {
-        let fighter = normalize_fighter(fighter);
+        let fighter = self.fighter_key(fighter);
         let table = self
             .fighters
             .get(&fighter)
@@ -611,7 +624,7 @@ impl SourceIndex {
     /// alias-aware [`Self::script`] there would find the alias while reporting
     /// the requested spelling.
     fn script_exact(&self, fighter: &str, script_name: &str) -> Option<&ScriptSite> {
-        let fighter = normalize_fighter(fighter);
+        let fighter = self.fighter_key(fighter);
         self.fighters
             .get(&fighter)
             .or_else(|| self.unattributed_scripts())?
@@ -632,7 +645,7 @@ impl SourceIndex {
     /// Whether a selected fighter can use this index, including a single, explicitly
     /// unlabelled source set.
     pub fn has_fighter(&self, fighter: &str) -> bool {
-        self.fighters.contains_key(&normalize_fighter(fighter))
+        self.fighters.contains_key(&self.fighter_key(fighter))
             || self.unattributed_scripts().is_some()
     }
 
@@ -646,7 +659,7 @@ impl SourceIndex {
     /// Alias-aware like [`Self::script`]: a duplicate `game_attacks3s` blocks the
     /// move even when the project also defines the `game_attacks3` spelling.
     pub fn conflict(&self, fighter: &str, script_name: &str) -> Option<&ScriptConflict> {
-        let fighter = normalize_fighter(fighter);
+        let fighter = self.fighter_key(fighter);
         for candidate in crate::acmd::script_name_aliases(script_name) {
             if let Some(found) = self
                 .conflicts
@@ -670,7 +683,7 @@ impl SourceIndex {
 
     /// Exact-only conflict lookup, without alias fallback. See [`Self::script_exact`].
     fn conflict_exact(&self, fighter: &str, script_name: &str) -> Option<&ScriptConflict> {
-        let fighter = normalize_fighter(fighter);
+        let fighter = self.fighter_key(fighter);
         self.conflicts
             .iter()
             .find(|conflict| conflict.fighter == fighter && conflict.script == script_name)
@@ -1399,7 +1412,7 @@ pub fn create_script(
 /// category at all still has *somewhere* for this fighter, and that is enough to know the file,
 /// the fighter attribution and the registration style.
 fn find_anchor(index: &SourceIndex, fighter: &str, script_name: &str) -> Option<Anchor> {
-    let scripts = &index.fighters.get(&normalize_fighter(fighter))?.scripts;
+    let scripts = &index.fighters.get(&index.fighter_key(fighter))?.scripts;
     let mut order: Vec<String> = Vec::new();
     if let Some((_, suffix)) = script_name.split_once('_') {
         for prefix in crate::acmd::SCRIPT_PREFIXES {
@@ -9414,7 +9427,7 @@ pub fn install(agent: &mut smashline::Agent) {
     }
 
     /// A Clone Engine project's scripts sit on the clone's agent (`Agent::new("clone_a")`) and are
-    /// looked up under the base fighter its manifest names; a plain project is unaffected.
+    /// indexed under the base fighter its manifest names, and found by the clone's name as well.
     #[test]
     fn clone_engine_scripts_are_found_under_the_base_fighter() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9436,7 +9449,9 @@ pub fn install(agent: &mut smashline::Agent) {
         );
         let index = SourceIndex::build(tmp.path()).unwrap();
         assert!(index.script_source("pit", "attack_11").is_some());
-        assert!(index.script_source("clone_a", "attack_11").is_none());
+        // The clone listed as its own fighter finds the same scripts.
+        assert!(index.script_source("clone_a", "attack_11").is_some());
+        assert!(index.script_source("clone_b", "attack_11").is_none());
         assert_eq!(
             scan_clone_bases("Manifest::new( \"fighter_clone_a\" , \"pit\" )"),
             vec![("clone_a".to_string(), "pit".to_string())]

@@ -55,10 +55,57 @@ impl Default for ArticleSpawn {
     }
 }
 
+/// An effect the mod's own code spawns (`EffectModule::req*`), which no effect script shows.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CodeEffect {
+    pub name: String,
+    /// Body script frame it is spawned on.
+    pub frame: u32,
+    /// Bone it is placed against; `top` for a world position at the fighter's feet.
+    pub bone: String,
+    pub offset: [f32; 3],
+    /// Degrees, X Y Z.
+    pub rotation: [f32; 3],
+    pub scale: f32,
+    /// Moves with its bone rather than staying where it was spawned.
+    pub follows: bool,
+    /// Frames it lives. 0 = until the move ends.
+    pub life: u32,
+    /// Copies around a horizontal circle (a ring of flames); 1 = a single effect.
+    pub ring_count: u32,
+    pub ring_radius: f32,
+    pub enabled: bool,
+    /// Where in the source it was found (`module::function`), empty when added by hand.
+    pub source: String,
+}
+
+impl Default for CodeEffect {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            frame: 1,
+            bone: "top".into(),
+            offset: [0.0; 3],
+            rotation: [0.0; 3],
+            scale: 1.0,
+            follows: false,
+            life: 0,
+            ring_count: 1,
+            ring_radius: 0.0,
+            enabled: true,
+            source: String::new(),
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct FighterPrefs {
     /// Move name → its spawns, once the user has changed anything for that move.
     moves: BTreeMap<String, Vec<ArticleSpawn>>,
+    /// Move name → its code-spawned effects, once the user has changed any.
+    effects: BTreeMap<String, Vec<CodeEffect>>,
 }
 
 /// A motion in a weapon's motion list.
@@ -148,6 +195,8 @@ pub struct ArticlePreview {
     anims: HashMap<PathBuf, Option<Arc<AnimData>>>,
     parsed: HashMap<(String, u64), Arc<ParsedScripts>>,
     pub hide: bool,
+    /// Code-spawned effects found by following the move's calls into the source.
+    pub detected_effects: Vec<CodeEffect>,
 }
 
 fn prefs_path(fighter: &str) -> PathBuf {
@@ -205,8 +254,12 @@ impl ArticlePreview {
         self.move_name = move_name.to_string();
         self.detected.clear();
         self.unresolved.clear();
+        self.detected_effects.clear();
         if self.ctx.is_none() {
             return;
+        }
+        if let Some(index) = index {
+            self.detected_effects = detect_code_effects(body, &index.files);
         }
         let calls = detect_generate_calls(body);
         let mut per_frame: HashMap<(u32, String), usize> = HashMap::new();
@@ -310,6 +363,69 @@ impl ArticlePreview {
     pub fn reset_move(&mut self) {
         self.prefs.moves.remove(&self.move_name);
         self.save();
+    }
+
+    /// The code-spawned effects the current move previews.
+    pub fn code_effects(&self) -> &[CodeEffect] {
+        self.prefs
+            .effects
+            .get(&self.move_name)
+            .map(Vec::as_slice)
+            .unwrap_or(&self.detected_effects)
+    }
+
+    pub fn code_effects_customized(&self) -> bool {
+        self.prefs.effects.contains_key(&self.move_name)
+    }
+
+    pub fn code_effects_mut(&mut self) -> &mut Vec<CodeEffect> {
+        let detected = self.detected_effects.clone();
+        self.prefs
+            .effects
+            .entry(self.move_name.clone())
+            .or_insert(detected)
+    }
+
+    pub fn reset_code_effects(&mut self) {
+        self.prefs.effects.remove(&self.move_name);
+        self.save();
+    }
+
+    /// The code-spawned effects alive on `frame`, ready for the effect renderer.
+    pub fn live_code_effects(&self, frame: u32) -> Vec<crate::eff_runtime::LiveEffect> {
+        let mut out = Vec::new();
+        if self.hide {
+            return out;
+        }
+        for fx in self.code_effects() {
+            if !fx.enabled || fx.name.is_empty() || frame < fx.frame {
+                continue;
+            }
+            if fx.life > 0 && frame >= fx.frame + fx.life {
+                continue;
+            }
+            let count = fx.ring_count.max(1);
+            for k in 0..count {
+                let mut offset = glam::Vec3::from(fx.offset);
+                if count > 1 {
+                    let angle = std::f32::consts::TAU * k as f32 / count as f32;
+                    offset += glam::Vec3::new(angle.cos(), 0.0, angle.sin()) * fx.ring_radius;
+                }
+                out.push(crate::eff_runtime::LiveEffect {
+                    name: fx.name.clone(),
+                    bone: if fx.bone.is_empty() { "top".into() } else { fx.bone.clone() },
+                    tint: [1.0; 3],
+                    alpha: 1.0,
+                    age: (frame - fx.frame) as f32,
+                    offset,
+                    rotation: glam::Vec3::from(fx.rotation),
+                    scale: fx.scale,
+                    follows: fx.follows,
+                    stopped: None,
+                });
+            }
+        }
+        out
     }
 
     pub fn save(&self) {
@@ -799,9 +915,323 @@ fn split_top_level(args: &str) -> Vec<&str> {
     out
 }
 
+/// Effects a move's script reaches through the mod's own functions.
+///
+/// Follows each `crate::module::function(` call in the body (at the frame the script is on) into
+/// the project's source, then same-file helpers it calls, collecting `EffectModule::req*` calls.
+/// Names, joints and sizes resolve through string/float consts and simple `let`s; a request in
+/// a `for _ in 0..N` loop that places with `cos`/`sin` reads as a ring of N.
+pub fn detect_code_effects(body: &str, files: &[PathBuf]) -> Vec<CodeEffect> {
+    let mut out = Vec::new();
+    let mut frame = 1.0f32;
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
+    for line in body.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        if code.contains("fn ") && code.contains('(') {
+            frame = 1.0;
+        }
+        if let Some(v) = call_number(code, "frame") {
+            frame = v.max(1.0);
+        }
+        if let Some(v) = call_number(code, "wait") {
+            frame += v;
+        }
+        let mut search = 0;
+        while let Some(rel) = code[search..].find("crate::") {
+            let at = search + rel;
+            search = at + 7;
+            let path: String = code[at + 7..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                .collect();
+            if !code[at + 7 + path.len()..].starts_with('(') {
+                continue;
+            }
+            let segs: Vec<&str> = path.split("::").filter(|s| !s.is_empty()).collect();
+            let [modules @ .., func] = segs.as_slice() else { continue };
+            let Some(module) = modules.last() else { continue };
+            let Some(file) = module_file(files, module) else { continue };
+            let text = texts
+                .entry(file.clone())
+                .or_insert_with(|| std::fs::read_to_string(&file).ok())
+                .clone();
+            let Some(text) = text else { continue };
+            let mut seen = HashSet::new();
+            collect_fn_effects(&text, module, func, frame.round() as u32, 0, &mut seen, &mut out);
+        }
+    }
+    out
+}
+
+/// The source file for `crate::...::<module>`: `<module>.rs` or `<module>/mod.rs`.
+fn module_file(files: &[PathBuf], module: &str) -> Option<PathBuf> {
+    files
+        .iter()
+        .find(|f| {
+            let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            let parent = f
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            stem == module || (stem == "mod" && parent == module)
+        })
+        .cloned()
+}
+
+/// The text inside `fn <name>`'s braces.
+fn fn_body<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let pat = format!("fn {name}");
+    let mut search = 0;
+    while let Some(rel) = text[search..].find(&pat) {
+        let at = search + rel;
+        search = at + pat.len();
+        let after = &text[at + pat.len()..];
+        if !(after.starts_with('(') || after.starts_with('<')) {
+            continue;
+        }
+        let open = at + text[at..].find('{')?;
+        return block_end(text, open).map(|end| &text[open + 1..end]);
+    }
+    None
+}
+
+/// Index of the `}` matching the `{` at `open`.
+fn block_end(text: &str, open: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in text[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn collect_fn_effects(
+    text: &str,
+    module: &str,
+    func: &str,
+    frame: u32,
+    depth: u32,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<CodeEffect>,
+) {
+    if depth > 3 || !seen.insert(func.to_string()) {
+        return;
+    }
+    let Some(body) = fn_body(text, func) else { return };
+    // `for _ in 0..N {` spans, to tell a ring from a single request.
+    let mut loops: Vec<(usize, usize, u32)> = Vec::new();
+    let mut search = 0;
+    while let Some(rel) = body[search..].find("for ") {
+        let at = search + rel;
+        search = at + 4;
+        let Some(open_rel) = body[at..].find('{') else { break };
+        let header = &body[at..at + open_rel];
+        let Some(range) = header.split(" in ").nth(1) else { continue };
+        let Some(bound) = range.trim().strip_prefix("0..") else { continue };
+        let Some(n) = eval_number(text, body, bound.trim()) else { continue };
+        let open = at + open_rel;
+        let end = block_end(body, open).unwrap_or(body.len());
+        loops.push((open, end, n.max(1.0) as u32));
+    }
+    let mut search = 0;
+    while let Some(rel) = body[search..].find("EffectModule::req") {
+        let at = search + rel;
+        search = at + 17;
+        let kind: String = body[at + 17..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let Some(open) = body[at..].find('(') else { continue };
+        let args = split_top_level(&body[at + open + 1..]);
+        let (name_at, joint_at, scale_at) = match kind.as_str() {
+            "" => (1, None, 4),
+            "_on_joint" | "_follow" => (1, Some(2), 5),
+            _ => continue,
+        };
+        let Some(name) = args.get(name_at).and_then(|a| hash_arg(text, a)) else { continue };
+        let mut fx = CodeEffect {
+            name,
+            frame,
+            source: format!("{module}::{func}"),
+            follows: kind == "_follow",
+            ..Default::default()
+        };
+        if let Some(bone) = joint_at.and_then(|j| args.get(j)).and_then(|a| hash_arg(text, a)) {
+            fx.bone = bone;
+        }
+        if let Some(v) = args.get(scale_at).and_then(|a| eval_number(text, body, a.trim())) {
+            fx.scale = v;
+        }
+        if let Some((_, _, n)) = loops.iter().find(|(s, e, _)| at > *s && at < *e) {
+            if *n > 1 && body.contains(".cos()") {
+                fx.ring_count = *n;
+                fx.ring_radius = const_named(text, "RADIUS").unwrap_or(10.0);
+            }
+        }
+        out.push(fx);
+    }
+    // Same-file helpers this function calls.
+    let mut search = 0;
+    while let Some(rel) = body[search..].find('(') {
+        let at = search + rel;
+        search = at + 1;
+        let start = body[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let ident = &body[start..at];
+        if ident.is_empty() || body[..start].ends_with(':') || body[..start].ends_with('.') {
+            continue;
+        }
+        if text.contains(&format!("fn {ident}(")) {
+            collect_fn_effects(text, module, ident, frame, depth + 1, seen, out);
+        }
+    }
+}
+
+/// `Hash40::new("x")` / `Hash40::new(CONST)` → the name.
+fn hash_arg(text: &str, arg: &str) -> Option<String> {
+    let inner = arg
+        .trim()
+        .strip_prefix("Hash40::new(")?
+        .trim_end()
+        .strip_suffix(')')?
+        .trim();
+    if let Some(lit) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return Some(lit.to_string());
+    }
+    let pat = format!("const {inner}:");
+    let at = text.find(&pat)?;
+    let rest = &text[at..];
+    let q = rest.find('"')?;
+    let end = rest[q + 1..].find('"')?;
+    Some(rest[q + 1..q + 1 + end].to_string())
+}
+
+/// A number literal, a `const`, or a `let` in the function (its first term, so a charge-scaled
+/// size reads as its uncharged value).
+fn eval_number(text: &str, body: &str, expr: &str) -> Option<f32> {
+    let expr = expr.trim().trim_end_matches(';').trim();
+    let first: String = expr
+        .trim_start_matches('(')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '-')
+        .collect();
+    let first = strip_num_suffix(&first);
+    if let Ok(v) = first.parse::<f32>() {
+        return Some(v);
+    }
+    let last = first.rsplit('.').next().unwrap_or(first);
+    if let Some(v) = const_value(text, last) {
+        return Some(v);
+    }
+    let pat = format!("let {last} = ");
+    if let Some(at) = body.find(&pat) {
+        let stmt = body[at + pat.len()..].split(';').next().unwrap_or("");
+        let first_word: String = stmt
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if first_word != last {
+            return eval_number(text, body, stmt);
+        }
+    }
+    None
+}
+
+fn strip_num_suffix(s: &str) -> &str {
+    for suffix in ["_f32", "_usize", "_u32", "_i32"] {
+        if let Some(v) = s.strip_suffix(suffix) {
+            return v;
+        }
+    }
+    s
+}
+
+fn const_value(text: &str, name: &str) -> Option<f32> {
+    let pat = format!("const {name}:");
+    let at = text.find(&pat)?;
+    let rest = &text[at + pat.len()..];
+    let eq = rest.find('=')?;
+    let val = rest[eq + 1..].split(';').next()?.trim();
+    strip_num_suffix(val).parse().ok()
+}
+
+/// The first numeric const whose name ends with `suffix`.
+fn const_named(text: &str, suffix: &str) -> Option<f32> {
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("const ") {
+        let at = search + rel;
+        search = at + 6;
+        let name: String = text[at + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.ends_with(suffix) {
+            if let Some(v) = const_value(text, &name) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ZONE_SOURCE: &str = r#"
+pub const RADIUS: f32 = 12.0;
+const EDGE: &str = "clone_a_zone_edge";
+const SPARK: &str = "clone_a_spark";
+const COUNT: usize = 6;
+pub unsafe fn cast(boma: *mut B) {
+    let radius = RADIUS + (20.0 - RADIUS) * charge;
+    let edge = EffectModule::req(boma, Hash40::new(EDGE), &pos, &rot, radius, 0, -1, false, 0);
+    light(boma);
+}
+unsafe fn light(boma: *mut B) {
+    for i in 0..COUNT {
+        let angle = TAU * i as f32 / COUNT as f32;
+        let at = Vector3f { x: r * angle.cos(), y: 0.0, z: r * angle.sin() };
+        EffectModule::req(boma, Hash40::new(SPARK), &at, &rot, 0.5, 0, -1, false, 0);
+    }
+    EffectModule::req_on_joint(boma, Hash40::new("clone_a_glow"), Hash40::new("handr"), &a, &b, 2.0, &c, &d, false, 0, 0, 0);
+}
+"#;
+
+    #[test]
+    fn follows_calls_into_code_effects() {
+        let dir = std::env::temp_dir().join(format!("vis_code_fx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("zone.rs");
+        std::fs::write(&file, ZONE_SOURCE).unwrap();
+        let body = "unsafe extern \"C\" fn game_x(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 14.0);\n    if is_excute(agent) {\n        crate::zone::cast(boma, entry);\n    }\n}\n";
+        let found = detect_code_effects(body, &[file]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[0].name, "clone_a_zone_edge");
+        assert_eq!(found[0].frame, 14);
+        assert_eq!(found[0].scale, 12.0);
+        assert_eq!(found[1].name, "clone_a_spark");
+        assert_eq!(found[1].ring_count, 6);
+        assert_eq!(found[1].ring_radius, 12.0);
+        assert_eq!(found[1].scale, 0.5);
+        assert_eq!(found[2].bone, "handr");
+        assert_eq!(found[2].scale, 2.0);
+        assert_eq!(found[2].ring_count, 1);
+    }
+
 
     #[test]
     fn finds_generate_calls_with_frames() {
