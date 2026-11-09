@@ -8502,6 +8502,20 @@ impl VisionaryApp {
                                         ui.selectable_value(&mut spawn.attach_bone, name.clone(), name);
                                     }
                                 });
+                            if spawn.attach_bone.is_empty() {
+                                ui.label("from");
+                                egui::ComboBox::from_id_salt("start_bone")
+                                    .selected_text(if spawn.start_bone.is_empty() { "top" } else { spawn.start_bone.as_str() })
+                                    .height(320.0)
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut spawn.start_bone, String::new(), "top");
+                                        for name in &bone_names {
+                                            ui.selectable_value(&mut spawn.start_bone, name.clone(), name);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text("Where it launches from: this bone on its spawn frame");
+                            }
                         });
                         let vec3 = |ui: &mut egui::Ui, label: &str, v: &mut [f32; 3], speed: f64| {
                             ui.horizontal(|ui| {
@@ -8526,7 +8540,10 @@ impl VisionaryApp {
                                     notes.push("no model".to_string());
                                 }
                                 if a.scripts.is_empty() {
-                                    notes.push("no scripts in the linked source".to_string());
+                                    notes.push("scripts from the game dump".to_string());
+                                    if a.params.is_some() {
+                                        notes.push("speed and life from vl.prc".to_string());
+                                    }
                                 } else {
                                     notes.push(format!("{} script(s)", a.scripts.len()));
                                 }
@@ -38787,20 +38804,26 @@ fn fetch_move_index(fighter: &str) -> anyhow::Result<Vec<String>> {
     let body = match std::fs::read_to_string(&cache) {
         Ok(b) => b,
         Err(_) => {
-            let url = format!(
-                "https://api.github.com/repos/WuBoytH/SSBU-Dumped-Scripts/contents/smashline/lua2cpp_{fighter}/{fighter}"
-            );
-            let b = crate::acmd::http_client()
-                .get(&url)
-                .header("User-Agent", "visionary")
-                .send()?
-                .text()?;
-            // Only cache real listings (the API returns an object on error).
-            if b.trim_start().starts_with('[') {
-                let _ = std::fs::create_dir_all(&dir);
-                let _ = std::fs::write(&cache, &b);
+            let mut last = String::new();
+            for agent_dir in crate::acmd::dump_agent_dirs(fighter, fighter) {
+                let url = format!(
+                    "https://api.github.com/repos/WuBoytH/SSBU-Dumped-Scripts/contents/{agent_dir}"
+                );
+                let b = crate::acmd::http_client()
+                    .get(&url)
+                    .header("User-Agent", "visionary")
+                    .send()?
+                    .text()?;
+                // Only cache real listings (the API returns an object on error).
+                if b.trim_start().starts_with('[') {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(&cache, &b);
+                    last = b;
+                    break;
+                }
+                last = b;
             }
-            b
+            last
         }
     };
     let entries: Vec<serde_json::Value> = serde_json::from_str(&body)?;

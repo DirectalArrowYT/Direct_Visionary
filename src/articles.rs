@@ -26,6 +26,8 @@ pub struct ArticleSpawn {
     pub motion: String,
     /// Body bone the weapon's root follows. Empty = stays where it spawned.
     pub attach_bone: String,
+    /// Body bone a free weapon launches from (where it is on the spawn frame). Empty = `top`.
+    pub start_bone: String,
     pub offset: [f32; 3],
     /// Degrees, X Y Z like the ACMD spawn macros.
     pub rotation: [f32; 3],
@@ -45,6 +47,7 @@ impl Default for ArticleSpawn {
             frame: 1,
             motion: String::new(),
             attach_bone: String::new(),
+            start_bone: String::new(),
             offset: [0.0; 3],
             rotation: [0.0; 3],
             velocity: [0.0; 3],
@@ -131,6 +134,80 @@ pub struct ArticleAssets {
     pub rot_offsets: Vec<(String, [f32; 3])>,
     /// The installer constrains the weapon to its owner (`set_model_constraint_*`, `LinkModule::link`).
     pub constrained: bool,
+    /// Launch numbers from the fighter's `vl.prc` (`param_<weapon>`), for weapons the status
+    /// code moves.
+    pub params: Option<WeaponParams>,
+}
+
+/// What a weapon's `param_<weapon>` struct says about how it flies.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeaponParams {
+    /// Units per frame along its launch angle.
+    pub speed: Option<f32>,
+    /// Degrees up from straight ahead.
+    pub angle: f32,
+    pub life: Option<u32>,
+    /// Spawn point ahead of / above the fighter (`offset_x`, `offset_y`).
+    pub offset: Option<[f32; 2]>,
+}
+
+impl WeaponParams {
+    /// Read `param_<weapon>` from a fighter's `vl.prc`. Matches the struct name with or without
+    /// underscores; a list of structs reads its first entry.
+    pub fn read(vl_prc: &Path, weapon: &str) -> Option<Self> {
+        let root = prc::open(vl_prc).ok()?;
+        let want = norm(weapon);
+        let names = [format!("param_{weapon}"), format!("param_{want}")];
+        let hashes: Vec<u64> = names.iter().map(|n| hash40::hash40(n).0).collect();
+        let st = root.0.iter().find_map(|(h, v)| {
+            if !hashes.contains(&h.0) {
+                return None;
+            }
+            match v {
+                prc::ParamKind::Struct(s) => Some(s.clone()),
+                prc::ParamKind::List(l) => match l.0.first() {
+                    Some(prc::ParamKind::Struct(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        })?;
+        let num = |key: &str| -> Option<f32> {
+            let want = hash40::hash40(key).0;
+            st.0.iter().find(|(h, _)| h.0 == want).and_then(|(_, v)| match v {
+                prc::ParamKind::Float(f) => Some(*f),
+                prc::ParamKind::I32(i) => Some(*i as f32),
+                prc::ParamKind::U32(i) => Some(*i as f32),
+                prc::ParamKind::I16(i) => Some(*i as f32),
+                prc::ParamKind::U16(i) => Some(*i as f32),
+                prc::ParamKind::I8(i) => Some(*i as f32),
+                prc::ParamKind::U8(i) => Some(*i as f32),
+                _ => None,
+            })
+        };
+        let first = |keys: &[&str]| keys.iter().find_map(|k| num(k));
+        // Uncharged / full-health spellings first; a charge range starts at its min.
+        let speed = first(&["speed", "speed_x", "max_speed_x", "min_speed", "speed_min_x", "start_speed", "init_speed"]);
+        let life = first(&["life", "max_life", "min_life", "life_max"]).map(|v| v.max(0.0) as u32);
+        let offset = match (num("offset_x"), num("offset_y")) {
+            (None, None) => None,
+            (x, y) => Some([x.unwrap_or(0.0), y.unwrap_or(0.0)]),
+        };
+        let params = Self {
+            speed,
+            angle: num("angle").unwrap_or(0.0),
+            life,
+            offset,
+        };
+        (params != Self::default()).then_some(params)
+    }
+
+    /// Velocity in the preview's space: +Z ahead, +Y up.
+    pub fn velocity(&self) -> Option<[f32; 3]> {
+        let speed = self.speed?;
+        let a = self.angle.to_radians();
+        Some([0.0, speed * a.sin(), speed * a.cos()])
+    }
 }
 
 impl ArticleAssets {
@@ -262,6 +339,12 @@ impl ArticlePreview {
             self.detected_effects = detect_code_effects(body, &index.files);
         }
         let calls = detect_generate_calls(body);
+        // Motions the move sets on its weapons, which beat a guess from the move's name.
+        let motion_changes: Vec<(String, String)> = detect_motion_changes(body)
+            .into_iter()
+            .filter_map(|(arg, motion)| Some((self.resolve_article(&arg)?, motion)))
+            .collect();
+        let effect_bones = detect_effect_bones(body);
         let mut per_frame: HashMap<(u32, String), usize> = HashMap::new();
         for (frame, arg) in calls {
             let Some(article) = self.resolve_article(&arg) else {
@@ -281,6 +364,18 @@ impl ArticlePreview {
                 ..Default::default()
             };
             self.auto_settings(&mut spawn, nth);
+            // A free weapon with no spawn offset of its own leaves the hand the move's effect
+            // marks on that frame (Mario's fireball: `mario_fb_shoot` on `havel`).
+            if spawn.attach_bone.is_empty() && spawn.offset == [0.0; 3] {
+                if let Some(b) = launch_bone(&effect_bones, frame, &self.body_bones) {
+                    spawn.start_bone = b;
+                }
+            }
+            if let Some((_, motion)) = motion_changes.iter().find(|(a, _)| *a == article) {
+                if self.assets.get(&article).is_some_and(|a| a.motion(motion).is_some()) {
+                    spawn.motion = motion.clone();
+                }
+            }
             self.detected.push(spawn);
         }
         // Saved spawns may name weapons the script does not.
@@ -302,6 +397,20 @@ impl ArticlePreview {
             return;
         };
         spawn.motion = pick_motion(assets, &self.move_name).unwrap_or_default();
+        // No source says how it moves: a vanilla weapon flies by its params.
+        if assets.scripts.is_empty() && !assets.constrained {
+            if let Some(params) = assets.params {
+                if let Some(v) = params.velocity() {
+                    spawn.velocity = v;
+                }
+                if let Some(life) = params.life {
+                    spawn.life = life;
+                }
+                if let Some([x, y]) = params.offset {
+                    spawn.offset = [0.0, y, x];
+                }
+            }
+        }
         if assets.constrained && !assets.bone_literals.is_empty() {
             spawn.attach_bone = assets.bone_literals[nth % assets.bone_literals.len()].clone();
             // The preview faces right, so a right-facing offset wins.
@@ -330,11 +439,33 @@ impl ArticlePreview {
             }
         };
         let raw = raw.to_ascii_lowercase();
-        self.available
-            .iter()
-            .find(|a| **a == raw)
-            .or_else(|| self.available.iter().find(|a| norm(a) == norm(&raw)))
-            .cloned()
+        let exact = |raw: &str| {
+            self.available
+                .iter()
+                .find(|a| **a == raw)
+                .or_else(|| self.available.iter().find(|a| norm(a) == norm(raw)))
+                .cloned()
+        };
+        exact(&raw)
+            // `ITEM_BANANA` is the `banana` folder.
+            .or_else(|| raw.strip_prefix("item_").and_then(|r| exact(r)))
+            // `DAIKON` is `peachdaikon`: a folder that only adds the fighter's name in front.
+            .or_else(|| {
+                let fighter = self.ctx.as_ref().map(|c| norm(&c.fighter)).unwrap_or_default();
+                let want = norm(&raw);
+                let mut ends: Vec<&String> = self
+                    .available
+                    .iter()
+                    .filter(|a| {
+                        let a = norm(a);
+                        a.ends_with(&want) && (a.len() == fighter.len() + want.len() && a.starts_with(&fighter))
+                    })
+                    .collect();
+                if ends.is_empty() {
+                    ends = self.available.iter().filter(|a| norm(a).ends_with(&want)).collect();
+                }
+                (ends.len() == 1 && want.len() >= 4).then(|| ends[0].clone())
+            })
     }
 
     /// The spawns the current move previews: the saved list if the user changed it, else the
@@ -505,6 +636,12 @@ impl ArticlePreview {
                     }
                 }
             }
+            // No linked source for this weapon: a vanilla one's scripts come from the dump.
+            if body.is_empty() && assets.scripts.is_empty() && !motion.name.starts_with("0x") {
+                if let Some(ctx) = &self.ctx {
+                    body = crate::acmd::fetch_weapon_script_cached(&ctx.fighter, article, &motion.name);
+                }
+            }
         }
         let parsed = if body.is_empty() {
             ParsedScripts::default()
@@ -644,7 +781,9 @@ fn spawn_root_at(spawn: &ArticleSpawn, frame: f32, body_bones: BodyBones) -> gla
     }
     let start = spawn.frame.max(1) as f32;
     let bones = body_bones(start - 1.0);
-    let base = bone(&bones, "top")
+    let from = if spawn.start_bone.is_empty() { "top" } else { spawn.start_bone.as_str() };
+    let base = bone(&bones, from)
+        .or_else(|| bone(&bones, "top"))
         .map(|m| m.col(3).truncate())
         .unwrap_or(glam::Vec3::ZERO);
     let age = (frame - start).max(0.0);
@@ -668,6 +807,12 @@ fn pick_motion(assets: &ArticleAssets, move_name: &str) -> Option<String> {
         .or_else(|| prefixed.first())
     {
         return Some(found.to_string());
+    }
+    // A thrown weapon's launch motion, ahead of held/landing ones that sort first.
+    for launch in ["fly", "shoot", "regular", "move", "start"] {
+        if let Some(found) = names.iter().find(|n| **n == launch) {
+            return Some(found.to_string());
+        }
     }
     names.first().map(|n| n.to_string())
 }
@@ -787,7 +932,14 @@ fn load_assets(
         }
     }
     scripts.retain(|_, text| !text.is_empty());
+    let params = ctx
+        .model_root
+        .parent()
+        .map(|f| f.join("param").join("vl.prc"))
+        .filter(|p| p.is_file())
+        .and_then(|p| WeaponParams::read(&p, article));
     ArticleAssets {
+        params,
         model_dir,
         skel,
         motions,
@@ -857,7 +1009,10 @@ pub fn detect_generate_calls(body: &str) -> Vec<(u32, String)> {
         if let Some(v) = call_number(code, "wait") {
             frame += v;
         }
-        if let Some(at) = code.find("generate_article") {
+        if let Some(at) = code.find("generate_article").filter(|at| {
+            // `generate_article_enable` etc. are not spawns.
+            code[at + "generate_article".len()..].trim_start().starts_with('(')
+        }) {
             let args = &code[at..];
             let Some(open) = args.find('(') else { continue };
             let args = &args[open + 1..];
@@ -866,6 +1021,65 @@ pub fn detect_generate_calls(body: &str) -> Vec<(u32, String)> {
                 out.push((frame.round() as u32, arg.trim().to_string()));
             }
         }
+    }
+    out
+}
+
+/// (frame, bone) of each effect macro in a script: `EFFECT*(agent, Hash40::new("name"),
+/// Hash40::new("bone"), ...)`.
+pub fn detect_effect_bones(body: &str) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    let mut frame = 1.0f32;
+    for line in body.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        if code.contains("fn ") && code.contains('(') {
+            frame = 1.0;
+        }
+        if let Some(v) = call_number(code, "frame") {
+            frame = v.max(1.0);
+        }
+        if let Some(v) = call_number(code, "wait") {
+            frame += v;
+        }
+        let Some(at) = code.find("EFFECT") else { continue };
+        let Some(open) = code[at..].find('(') else { continue };
+        let args = split_top_level(&code[at + open + 1..]);
+        let Some(bone) = args.get(2).and_then(|a| {
+            let a = a.trim().strip_prefix("Hash40::new(\"")?;
+            Some(a[..a.find('"')?].to_ascii_lowercase())
+        }) else {
+            continue;
+        };
+        out.push((frame.round() as u32, bone));
+    }
+    out
+}
+
+/// The hand-like body bone an effect marks closest to `frame` (within 4 frames).
+fn launch_bone(effects: &[(u32, String)], frame: u32, body_bones: &HashSet<String>) -> Option<String> {
+    effects
+        .iter()
+        .filter(|(f, b)| {
+            f.abs_diff(frame) <= 4
+                && (b.starts_with("have") || b.starts_with("hand") || b.starts_with("arm"))
+                && (body_bones.is_empty() || body_bones.contains(b.as_str()))
+        })
+        .min_by_key(|(f, _)| f.abs_diff(frame))
+        .map(|(_, b)| b.clone())
+}
+
+/// `ArticleModule::change_motion(boma, <weapon>, Hash40::new("<motion>"), ...)` calls:
+/// (weapon argument text, motion name).
+pub fn detect_motion_changes(body: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        let Some(at) = code.find("ArticleModule::change_motion(") else { continue };
+        let args = split_top_level(&code[at + "ArticleModule::change_motion(".len()..]);
+        let (Some(weapon), Some(motion)) = (args.get(1), args.get(2)) else { continue };
+        let Some(q) = motion.find('"') else { continue };
+        let Some(end) = motion[q + 1..].find('"') else { continue };
+        out.push((weapon.trim().to_string(), motion[q + 1..q + 1 + end].to_string()));
     }
     out
 }
@@ -1209,6 +1423,56 @@ unsafe fn light(boma: *mut B) {
     EffectModule::req_on_joint(boma, Hash40::new("clone_a_glow"), Hash40::new("handr"), &a, &b, 2.0, &c, &d, false, 0, 0, 0);
 }
 "#;
+
+    #[test]
+    fn reads_vanilla_weapon_params() {
+        // Needs a game dump; skipped without one.
+        let vl = Path::new("D:/Documents/SmashArc/fighter/link/param/vl.prc");
+        if !vl.is_file() {
+            return;
+        }
+        let beam = WeaponParams::read(vl, "swordbeam").expect("param_swordbeam");
+        assert_eq!(beam.speed, Some(3.4));
+        assert_eq!(beam.life, Some(40));
+        assert_eq!(beam.offset, Some([11.0, 6.0]));
+        let boomerang = WeaponParams::read(vl, "boomerang").expect("param_boomerang");
+        assert_eq!(boomerang.speed, Some(2.4));
+        assert_eq!(boomerang.life, Some(129));
+        assert!(WeaponParams::read(vl, "navy").is_none());
+        let v = WeaponParams { speed: Some(2.0), angle: 90.0, ..Default::default() }.velocity().unwrap();
+        assert!(v[1] > 1.99 && v[2].abs() < 1e-5);
+    }
+
+    #[test]
+    fn vanilla_generate_constants_and_motions() {
+        let body = "unsafe extern \"C\" fn game_attacks4(agent: &mut L2CAgentBase) {\n    frame(agent.lua_state_agent, 12.0);\n    if macros::is_excute(agent) {\n        ArticleModule::generate_article(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_SWORD_BEAM, false, -1);\n        ArticleModule::generate_article_enable(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_SWORD_BEAM, false, -1);\n        ArticleModule::change_motion(agent.module_accessor, *FIGHTER_LINK_GENERATE_ARTICLE_SWORD_BEAM, Hash40::new(\"fly\"), false, -1.0);\n    }\n}\n";
+        let calls = detect_generate_calls(body);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].0, 12);
+        let preview = ArticlePreview {
+            available: vec!["boomerang".into(), "swordbeam".into()],
+            ..Default::default()
+        };
+        assert_eq!(preview.resolve_article(&calls[0].1).as_deref(), Some("swordbeam"));
+        let preview = ArticlePreview {
+            available: vec!["banana".into(), "kinopio".into(), "peachdaikon".into()],
+            ..Default::default()
+        };
+        assert_eq!(preview.resolve_article("*FIGHTER_X_GENERATE_ARTICLE_ITEM_BANANA").as_deref(), Some("banana"));
+        assert_eq!(preview.resolve_article("*FIGHTER_X_GENERATE_ARTICLE_DAIKON").as_deref(), Some("peachdaikon"));
+        assert_eq!(preview.resolve_article("*FIGHTER_X_GENERATE_ARTICLE_STUFF"), None);
+        let fx = "    frame(agent.lua_state_agent, 13.0);
+    macros::EFFECT(agent, Hash40::new(\"x_shoot\"), Hash40::new(\"havel\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+    macros::EFFECT(agent, Hash40::new(\"x_smoke\"), Hash40::new(\"top\"), 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, true);
+";
+        let marks = detect_effect_bones(fx);
+        assert_eq!(marks, vec![(13, "havel".to_string()), (13, "top".to_string())]);
+        assert_eq!(launch_bone(&marks, 14, &HashSet::new()).as_deref(), Some("havel"));
+        assert_eq!(launch_bone(&marks, 30, &HashSet::new()), None);
+        let changes = detect_motion_changes(body);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].1, "fly");
+    }
 
     #[test]
     fn follows_calls_into_code_effects() {

@@ -170,8 +170,70 @@ pub fn http_client() -> &'static reqwest::blocking::Client {
     &HTTP
 }
 
+/// The dump repo's folder for one agent of `fighter`, newest layout first.
+///
+/// On 2026-10-28 upstream moved `smashline/lua2cpp_<fighter>/<agent>/` to
+/// `smashline/<fighter>/<agent>/`; the old spelling is still tried in case it comes back or a
+/// mirror keeps it.
+pub fn dump_agent_dirs(fighter: &str, agent: &str) -> [String; 2] {
+    [
+        format!("smashline/{fighter}/{agent}"),
+        format!("smashline/lua2cpp_{fighter}/{agent}"),
+    ]
+}
+
+/// One dumped script file (`<Pascal>.txt`) for an agent: its source, or empty when the dump has
+/// none in either layout. Errors only when the network does.
+fn fetch_dump_file(fighter: &str, agent: &str, pascal: &str) -> anyhow::Result<String> {
+    for dir in dump_agent_dirs(fighter, agent) {
+        let url = format!("https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/{dir}/{pascal}.txt");
+        let response = HTTP.get(&url).send()?;
+        if !response.status().is_success() {
+            continue;
+        }
+        let body = script_source_from_body(&response.text()?);
+        if !body.is_empty() {
+            return Ok(body);
+        }
+    }
+    Ok(String::new())
+}
+
+/// Once per run: forget cached misses written while the dump's layout moved under us (every
+/// fetch 404ed then, and a miss is cached forever). Hits are kept.
+fn purge_stale_misses() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let root = crate::scratch_dirs::app_storage_root().join("script-cache");
+        let marker = root.join(".dump-layout-2");
+        if marker.exists() || !root.is_dir() {
+            let _ = std::fs::create_dir_all(&root);
+            let _ = std::fs::write(&marker, "");
+            return;
+        }
+        let mut removed = 0usize;
+        for dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            if !dir.path().is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+                let path = file.path();
+                let empty = file.metadata().is_ok_and(|m| m.is_file() && m.len() == 0);
+                if empty && path.extension().is_some_and(|e| e == "txt") && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            println!("[acmd] forgot {removed} cached script miss(es) from the old dump layout");
+        }
+        let _ = std::fs::write(&marker, "");
+    });
+}
+
 /// Disk path a fighter+move's cached script body lives at.
 fn script_cache_path(fighter: &str, move_name: &str) -> std::path::PathBuf {
+    purge_stale_misses();
     crate::scratch_dirs::app_storage_root()
         .join("script-cache")
         .join(fighter)
@@ -294,15 +356,7 @@ pub(crate) fn cached_script_body_at(path: &std::path::Path) -> Option<String> {
 /// for them because it is tried first.
 pub fn fetch_script_body(fighter: &str, move_name: &str) -> anyhow::Result<String> {
     for alias in move_script_aliases(move_name) {
-        let pascal = move_name_to_pascal(&alias);
-        let url = format!(
-            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
-        );
-        let response = HTTP.get(&url).send()?;
-        if !response.status().is_success() {
-            continue;
-        }
-        let body = script_source_from_body(&response.text()?);
+        let body = fetch_dump_file(fighter, fighter, &move_name_to_pascal(&alias))?;
         if !body.is_empty() {
             return Ok(body);
         }
@@ -330,16 +384,7 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
         }
         // Normalised before it is stored *and* before it is returned, so the cold path and the warm
         // path cannot disagree: what goes on disk is exactly what a later read gives back.
-        let pascal = move_name_to_pascal(&alias);
-        let url = format!(
-            "https://raw.githubusercontent.com/WuBoytH/SSBU-Dumped-Scripts/main/smashline/lua2cpp_{fighter}/{fighter}/{pascal}.txt"
-        );
-        let response = HTTP.get(&url).send()?;
-        let body = if !response.status().is_success() {
-            String::new()
-        } else {
-            script_source_from_body(&response.text()?)
-        };
+        let body = fetch_dump_file(fighter, fighter, &move_name_to_pascal(&alias))?;
         let path = script_cache_path(fighter, &alias);
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -350,6 +395,30 @@ pub fn fetch_script_body_cached(fighter: &str, move_name: &str) -> anyhow::Resul
         }
     }
     Ok(String::new())
+}
+
+/// A vanilla weapon's script for one motion (`game_fly`, `effect_fly`, ... in one file), from the
+/// dump's `<fighter>/<fighter>_<weapon>/<Motion>.txt`, cached like body scripts under
+/// `script-cache/<fighter>_<weapon>/` (a miss is an empty file). Empty when there is none or
+/// the network is down.
+pub fn fetch_weapon_script_cached(fighter: &str, weapon: &str, motion: &str) -> String {
+    let agent = format!("{fighter}_{weapon}");
+    if agent.contains(['/', '\\']) || motion.is_empty() || motion.contains(['/', '\\']) {
+        return String::new();
+    }
+    let path = script_cache_path(&agent, motion);
+    if let Some(body) = cached_script_body_at(&path) {
+        return body;
+    }
+    let Ok(body) = fetch_dump_file(fighter, &agent, &move_name_to_pascal(motion)) else {
+        // Not cached: the network may come back.
+        return String::new();
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, &body);
+    body
 }
 
 pub fn parse_acmd_script(source: &str) -> AcmdScript {
