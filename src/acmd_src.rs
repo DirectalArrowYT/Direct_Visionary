@@ -468,8 +468,21 @@ impl SourceIndex {
         let mut fighter_scopes: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut project_wide: Vec<String> = Vec::new();
         let mut project_registrations: HashMap<String, Vec<RegisteredScript>> = HashMap::new();
+        // A Clone Engine project (`Manifest::new("clone_a", "pit")`) registers its scripts on the
+        // clone's own agent. Visionary previews them on the base fighter's costumes, so the
+        // clone's name is read as the base's.
+        let clone_bases: HashMap<String, String> = sources
+            .iter()
+            .flat_map(|(_, text)| scan_clone_bases(text))
+            .collect();
         for (file, text) in &sources {
-            let names = scan_fighter_names(text);
+            let mut names: Vec<String> = Vec::new();
+            for name in scan_fighter_names(text) {
+                let name = clone_bases.get(&name).cloned().unwrap_or(name);
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
             for name in &names {
                 if !project_wide.contains(name) {
                     project_wide.push(name.clone());
@@ -1095,6 +1108,36 @@ fn scan_fighter_names(text: &str) -> Vec<String> {
         }
     }
     names
+}
+
+/// `(clone, base)` for every Clone Engine `Manifest::new("clone", "base")` a file makes.
+fn scan_clone_bases(text: &str) -> Vec<(String, String)> {
+    fn quoted(rest: &str) -> Option<(&str, &str)> {
+        let rest = rest.trim_start().strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some((&rest[..end], &rest[end + 1..]))
+    }
+    let mut out = Vec::new();
+    let marker = "Manifest::new(";
+    let mut search = 0;
+    while let Some(rel) = text[search..].find(marker) {
+        let at = search + rel + marker.len();
+        search = at;
+        let Some((clone, rest)) = quoted(&text[at..]) else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix(',') else {
+            continue;
+        };
+        let Some((base, _)) = quoted(rest) else {
+            continue;
+        };
+        let (clone, base) = (normalize_fighter(clone), normalize_fighter(base));
+        if !clone.is_empty() && !base.is_empty() && clone != base {
+            out.push((clone, base));
+        }
+    }
+    out
 }
 
 /// `(script_name, function_name)` for every `agent.acmd("…", fn, …)`-style registration, and
@@ -9319,6 +9362,37 @@ pub fn install(agent: &mut smashline::Agent) {
         let sites = motion_rate_sites(text);
         assert_eq!(sites.len(), 1, "only the plain form is a rate site");
         assert_eq!(sites[0].arg(text, 1).map(str::trim), Some("0.6"));
+    }
+
+    /// A Clone Engine project's scripts sit on the clone's agent (`Agent::new("clone_a")`) and are
+    /// looked up under the base fighter its manifest names; a plain project is unaffected.
+    #[test]
+    fn clone_engine_scripts_are_found_under_the_base_fighter() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn main() { let manifest = Manifest::new(\"clone_a\", \"pit\")
+    .costumes(8); }",
+        );
+        write(
+            tmp.path(),
+            "src/pit/mod.rs",
+            "pub fn install() { let agent = &mut smashline::Agent::new(\"clone_a\");
+                 agent.acmd(\"game_attack11\", game_attack11, Priority::Low); }
+             unsafe extern \"C\" fn game_attack11(agent: &mut L2CAgentBase) {
+                 frame(agent.lua_state_agent, 3.0);
+             }
+",
+        );
+        let index = SourceIndex::build(tmp.path()).unwrap();
+        assert!(index.script_source("pit", "attack_11").is_some());
+        assert!(index.script_source("clone_a", "attack_11").is_none());
+        assert_eq!(
+            scan_clone_bases("Manifest::new( \"fighter_clone_a\" , \"pit\" )"),
+            vec![("clone_a".to_string(), "pit".to_string())]
+        );
+        assert!(scan_clone_bases("Manifest::new(NAME, \"pit\")").is_empty());
     }
 
     fn write(root: &Path, rel: &str, body: &str) -> PathBuf {
